@@ -18,19 +18,32 @@ import (
 	"github.com/otaviocarvalho/volta/internal/state"
 )
 
+// ObservationLookup resolves a tmux window to additional observing topics.
+// Returns (topicID, chatID) pairs for topics observing the agent that owns this window.
+// Implementations should look up the agent by window, then look up observing topics.
+type ObservationLookup func(windowID string) []ObservingTopic
+
+// ObservingTopic represents a topic that is observing an agent's output.
+type ObservingTopic struct {
+	TopicID int64
+	ChatID  int64
+	UserID  int64
+}
+
 // Monitor polls Claude Code JSONL transcript files and routes entries to the message queue.
 type Monitor struct {
-	config         *config.Config
-	state          *state.State
-	monitorState   *state.MonitorState
-	queue          *queue.Queue
-	pendingTools   map[string]PendingTool
-	fileMtimes     map[string]time.Time
-	lastSessionMap map[string]state.SessionMapEntry
-	pollInterval   time.Duration
-	turnStarts     sync.Map // windowID → time.Time
-	PlanHandler    func(userID int64, threadID int, chatID int64, planJSON string)
-	planBuffers    map[string]string // windowID → partial plan text
+	config             *config.Config
+	state              *state.State
+	monitorState       *state.MonitorState
+	queue              *queue.Queue
+	pendingTools       map[string]PendingTool
+	fileMtimes         map[string]time.Time
+	lastSessionMap     map[string]state.SessionMapEntry
+	pollInterval       time.Duration
+	turnStarts         sync.Map // windowID → time.Time
+	PlanHandler        func(userID int64, threadID int, chatID int64, planJSON string)
+	planBuffers        map[string]string // windowID → partial plan text
+	ObservationLookup  ObservationLookup // optional: resolve window → observing topics
 }
 
 // New creates a new Monitor.
@@ -197,7 +210,7 @@ func (m *Monitor) processSession(sessionKey, sessionID, windowID, jsonlPath stri
 	// Parse entries with tool pairing
 	parsed := ParseEntries(entries, m.pendingTools)
 
-	// Route to users
+	// Route to directly bound users (existing behavior)
 	users := m.state.FindUsersForWindow(windowID)
 	for _, ut := range users {
 		chatID, ok := m.state.GetGroupChatID(ut.UserID, ut.ThreadID)
@@ -209,6 +222,16 @@ func (m *Monitor) processSession(sessionKey, sessionID, windowID, jsonlPath stri
 
 		for _, pe := range parsed {
 			m.enqueueEntry(userID, threadID, chatID, windowID, pe)
+		}
+	}
+
+	// Route to observing topics (agent observation model)
+	if m.ObservationLookup != nil {
+		observers := m.ObservationLookup(windowID)
+		for _, obs := range observers {
+			for _, pe := range parsed {
+				m.enqueueEntry(obs.UserID, int(obs.TopicID), obs.ChatID, windowID, pe)
+			}
 		}
 	}
 
