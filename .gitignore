@@ -1,0 +1,27 @@
+# Binary
+volta
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+vendor/
+
+# Volta runtime
+.volta/
+
+# Docker volumes
+docker/pgdata/
