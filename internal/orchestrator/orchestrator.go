@@ -27,6 +27,9 @@ type Config struct {
 	// NotifyCh receives task events for immediate wake-up.
 	// When nil, the orchestrator only uses ticker-based polling.
 	NotifyCh <-chan struct{}
+	// NotifyFunc is called with status messages for external notification
+	// (e.g., sending to a Telegram topic). Can be nil.
+	NotifyFunc func(message string)
 }
 
 // Run implements the poll-dispatch-reconcile orchestrator loop.
@@ -121,6 +124,7 @@ func reconcile(cfg Config) error {
 	for _, a := range agents {
 		if !tmux.WindowExists(cfg.TmuxSession, a.TmuxWindow) {
 			log.Printf("Agent %s window dead, cleaning up", a.ID)
+			notify(cfg, fmt.Sprintf("Agent dead: %s (window gone)", a.ID))
 			if err := agent.Kill(cfg.Pool, cfg.TmuxSession, a.ID); err != nil {
 				log.Printf("Error killing dead agent %s: %v", a.ID, err)
 			}
@@ -164,6 +168,7 @@ func dispatch(cfg Config) (bool, error) {
 	}
 
 	log.Printf("Dispatched agent %s for task %s", a.ID, task.ID)
+	notify(cfg, fmt.Sprintf("Agent spawned: %s → task %s", a.ID, task.ID))
 	return true, nil
 }
 
@@ -180,6 +185,12 @@ func processMergeQueue(cfg Config) error {
 	// Merge processing is handled by the existing merge command infrastructure.
 	// The orchestrator just claims entries to signal they should be processed.
 	return nil
+}
+
+func notify(cfg Config, message string) {
+	if cfg.NotifyFunc != nil {
+		cfg.NotifyFunc(message)
+	}
 }
 
 func logStatus(cfg Config, agents []*db.Agent) {

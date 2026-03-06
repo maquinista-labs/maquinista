@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/otaviocarvalho/volta/internal/agent"
 	"github.com/otaviocarvalho/volta/internal/listener"
 	"github.com/otaviocarvalho/volta/internal/orchestrator"
@@ -24,6 +25,8 @@ var (
 	orchWorktrees    bool
 	orchRunner       string
 	orchStatus       bool
+	orchNotifyTopic  int
+	orchNotifyChat   int64
 )
 
 var orchestrateCmd = &cobra.Command{
@@ -98,6 +101,29 @@ var orchestrateCmd = &cobra.Command{
 			NotifyCh:     notifyCh,
 		}
 
+		// Set up Telegram notifications if --notify-topic is provided.
+		if orchNotifyTopic > 0 && orchNotifyChat != 0 {
+			token := os.Getenv("TELEGRAM_BOT_TOKEN")
+			if token != "" {
+				botAPI, botErr := tgbotapi.NewBotAPI(token)
+				if botErr != nil {
+					log.Printf("Warning: failed to create bot for notifications: %v", botErr)
+				} else {
+					cfg.NotifyFunc = func(message string) {
+						params := tgbotapi.Params{}
+						params.AddNonZero64("chat_id", orchNotifyChat)
+						params.AddNonEmpty("text", message)
+						params.AddNonZero("message_thread_id", orchNotifyTopic)
+						if _, err := botAPI.MakeRequest("sendMessage", params); err != nil {
+							log.Printf("Notify error: %v", err)
+						}
+					}
+				}
+			} else {
+				log.Println("Warning: --notify-topic set but TELEGRAM_BOT_TOKEN not found")
+			}
+		}
+
 		err = orchestrator.Run(ctx, cfg)
 
 		// Graceful shutdown: kill all spawned agents.
@@ -117,5 +143,7 @@ func init() {
 	orchestrateCmd.Flags().BoolVar(&orchWorktrees, "worktrees", false, "isolate agents in git worktrees")
 	orchestrateCmd.Flags().StringVar(&orchRunner, "runner", "claude", "agent runner to use")
 	orchestrateCmd.Flags().BoolVar(&orchStatus, "status", false, "show current status and exit")
+	orchestrateCmd.Flags().IntVar(&orchNotifyTopic, "notify-topic", 0, "Telegram thread ID for notifications")
+	orchestrateCmd.Flags().Int64Var(&orchNotifyChat, "notify-chat", 0, "Telegram chat ID for notifications")
 	rootCmd.AddCommand(orchestrateCmd)
 }
