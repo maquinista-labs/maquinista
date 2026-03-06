@@ -23,6 +23,7 @@ var (
 	orchPollInterval time.Duration
 	orchWorktrees    bool
 	orchRunner       string
+	orchStatus       bool
 )
 
 var orchestrateCmd = &cobra.Command{
@@ -37,6 +38,21 @@ var orchestrateCmd = &cobra.Command{
 		if proj == "" {
 			proj = os.Getenv("VOLTA_PROJECT")
 		}
+
+		// One-shot status query.
+		if orchStatus {
+			var projPtr *string
+			if proj != "" {
+				projPtr = &proj
+			}
+			status, err := orchestrator.Status(pool, projPtr)
+			if err != nil {
+				return err
+			}
+			fmt.Println(status)
+			return nil
+		}
+
 		if proj == "" {
 			return fmt.Errorf("--project is required")
 		}
@@ -100,5 +116,6 @@ func init() {
 	orchestrateCmd.Flags().DurationVar(&orchPollInterval, "poll-interval", 10*time.Second, "polling interval")
 	orchestrateCmd.Flags().BoolVar(&orchWorktrees, "worktrees", false, "isolate agents in git worktrees")
 	orchestrateCmd.Flags().StringVar(&orchRunner, "runner", "claude", "agent runner to use")
+	orchestrateCmd.Flags().BoolVar(&orchStatus, "status", false, "show current status and exit")
 	rootCmd.AddCommand(orchestrateCmd)
 }
