@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Write an observation to task context.
+set -euo pipefail
+
+TASK_ID="${1:?Usage: volta-observe <id> <note>}"
+NOTE="${2:?Usage: volta-observe <id> <note>}"
+DB="${DATABASE_URL:?DATABASE_URL not set}"
+
+QUOTED_NOTE=$(psql "$DB" -t -A -c "SELECT quote_literal(E'$(printf '%s' "$NOTE" | sed "s/'/''/g")')")
+
+psql "$DB" -c "
+  INSERT INTO task_context (task_id, agent_id, kind, content)
+  VALUES ('$TASK_ID', '${AGENT_ID:-unknown}', 'observation', $QUOTED_NOTE);
+"

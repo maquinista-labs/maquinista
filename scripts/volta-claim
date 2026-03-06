@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Atomically claim one ready task. Prints JSON or exits 0 with no output.
+# Usage: volta-claim [--project <name>]
+set -euo pipefail
+
+AGENT_ID="${AGENT_ID:?AGENT_ID not set}"
+DB="${DATABASE_URL:?DATABASE_URL not set}"
+
+# Parse optional --project flag.
+PROJECT=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project) PROJECT="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+
+# Build project filter clause.
+PROJECT_FILTER=""
+if [ -n "$PROJECT" ]; then
+  PROJECT_FILTER="AND project_id = '$PROJECT'"
+fi
+
+psql "$DB" -t -A -c "
+  WITH claimed AS (
+    UPDATE tasks
+    SET status='claimed', claimed_by='$AGENT_ID', claimed_at=NOW(),
+        attempt = attempt + 1
+    WHERE id=(
+      SELECT id FROM tasks
+      WHERE status='ready'
+        $PROJECT_FILTER
+        AND attempt < max_attempts
+      ORDER BY priority DESC, created_at ASC
+      LIMIT 1 FOR UPDATE SKIP LOCKED
+    )
+    RETURNING *
+  ),
+  inherited AS (
+    INSERT INTO task_context (task_id, agent_id, kind, content, source_task)
+    SELECT c.id, '$AGENT_ID', 'inherited', tc.content, tc.task_id
+    FROM claimed c
+    JOIN task_deps td ON td.task_id = c.id
+    JOIN task_context tc ON tc.task_id = td.depends_on
+      AND tc.kind IN ('result','observation','handoff','test_failure')
+    JOIN tasks dep ON dep.id = td.depends_on AND dep.status='done'
+    RETURNING task_id
+  ),
+  agent_upd AS (
+    UPDATE agents SET task_id=(SELECT id FROM claimed),
+      status='working', last_seen=NOW() WHERE id='$AGENT_ID'
+  )
+  SELECT row_to_json(t) FROM (
+    SELECT c.*,
+      (SELECT json_agg(tc ORDER BY tc.created_at)
+       FROM task_context tc WHERE tc.task_id = c.id) AS context
+    FROM claimed c
+  ) t;
+"
