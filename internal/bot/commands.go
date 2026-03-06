@@ -63,6 +63,12 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handlePlanCommand(msg)
 	case "plan":
 		b.handlePlannerCommand(msg)
+	case "observe":
+		b.handleObserveCommand(msg)
+	case "unobserve":
+		b.handleUnobserveCommand(msg)
+	case "watching":
+		b.handleWatchingCommand(msg)
 	default:
 		b.reply(msg.Chat.ID, getThreadID(msg), "Unknown command: /"+msg.Command())
 	}

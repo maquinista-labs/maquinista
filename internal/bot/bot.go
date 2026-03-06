@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/otaviocarvalho/volta/internal/config"
 	"github.com/otaviocarvalho/volta/internal/bridge"
 	"github.com/otaviocarvalho/volta/internal/queue"
@@ -44,6 +45,8 @@ type Bot struct {
 	minuanoBridge *bridge.Bridge
 	// Message queue (set after construction via SetQueue)
 	msgQueue *queue.Queue
+	// DB pool (optional, set via SetPool for observation commands)
+	pool *pgxpool.Pool
 }
 
 // New creates a new Bot instance.
