@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/otaviocarvalho/volta/internal/db"
 	"github.com/otaviocarvalho/volta/internal/git"
+	"github.com/otaviocarvalho/volta/internal/runner"
 	"github.com/otaviocarvalho/volta/internal/tmux"
 )
 
@@ -26,17 +27,25 @@ type Agent struct {
 }
 
 // Spawn registers an agent in the DB, creates a tmux window, and sends the bootstrap command.
-func Spawn(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env map[string]string) (*Agent, error) {
-	if err := db.RegisterAgent(pool, agentID, tmuxSession, agentID, nil, nil, "claude", nil); err != nil {
+func Spawn(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env map[string]string, r runner.AgentRunner) (*Agent, error) {
+	runnerName := "claude"
+	if r != nil {
+		runnerName = r.Name()
+	}
+
+	if err := db.RegisterAgent(pool, agentID, tmuxSession, agentID, nil, nil, runnerName, nil); err != nil {
 		return nil, fmt.Errorf("registering agent: %w", err)
 	}
 
-	if err := tmux.NewWindowWithDir(tmuxSession, agentID, ".", env); err != nil {
+	// Merge runner env overrides into the tmux window env.
+	mergedEnv := mergeEnv(env, r)
+
+	if err := tmux.NewWindowWithDir(tmuxSession, agentID, ".", mergedEnv); err != nil {
 		db.DeleteAgent(pool, agentID)
 		return nil, fmt.Errorf("creating tmux window: %w", err)
 	}
 
-	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, nil, nil)
+	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, nil, nil, r)
 
 	now := time.Now()
 	return &Agent{
@@ -50,7 +59,7 @@ func Spawn(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env ma
 }
 
 // SpawnWithWorktree registers an agent with an isolated git worktree.
-func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env map[string]string) (*Agent, error) {
+func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env map[string]string, r runner.AgentRunner) (*Agent, error) {
 	repoRoot, err := git.RepoRoot(".")
 	if err != nil {
 		return nil, fmt.Errorf("finding repo root: %w", err)
@@ -63,18 +72,26 @@ func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath st
 		return nil, fmt.Errorf("creating worktree: %w", err)
 	}
 
-	if err := db.RegisterAgent(pool, agentID, tmuxSession, agentID, &worktreeDir, &branch, "claude", nil); err != nil {
+	runnerName := "claude"
+	if r != nil {
+		runnerName = r.Name()
+	}
+
+	if err := db.RegisterAgent(pool, agentID, tmuxSession, agentID, &worktreeDir, &branch, runnerName, nil); err != nil {
 		git.WorktreeRemove(repoRoot, worktreeDir)
 		return nil, fmt.Errorf("registering agent: %w", err)
 	}
 
-	if err := tmux.NewWindowWithDir(tmuxSession, agentID, worktreeDir, env); err != nil {
+	// Merge runner env overrides into the tmux window env.
+	mergedEnv := mergeEnv(env, r)
+
+	if err := tmux.NewWindowWithDir(tmuxSession, agentID, worktreeDir, mergedEnv); err != nil {
 		db.DeleteAgent(pool, agentID)
 		git.WorktreeRemove(repoRoot, worktreeDir)
 		return nil, fmt.Errorf("creating tmux window: %w", err)
 	}
 
-	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, &worktreeDir, &branch)
+	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, &worktreeDir, &branch, r)
 
 	now := time.Now()
 	return &Agent{
@@ -89,7 +106,21 @@ func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath st
 	}, nil
 }
 
-func sendBootstrap(tmuxSession, agentID, claudeMDPath string, env map[string]string, worktreeDir, branch *string) {
+// mergeEnv merges runner env overrides into the base env map.
+func mergeEnv(base map[string]string, r runner.AgentRunner) map[string]string {
+	merged := make(map[string]string, len(base))
+	for k, v := range base {
+		merged[k] = v
+	}
+	if r != nil {
+		for k, v := range r.EnvOverrides() {
+			merged[k] = v
+		}
+	}
+	return merged
+}
+
+func sendBootstrap(tmuxSession, agentID, claudeMDPath string, env map[string]string, worktreeDir, branch *string, r runner.AgentRunner) {
 	scriptsDir := filepath.Join(filepath.Dir(claudeMDPath), "..", "scripts")
 	absScripts, _ := filepath.Abs(scriptsDir)
 
@@ -114,7 +145,17 @@ func sendBootstrap(tmuxSession, agentID, claudeMDPath string, env map[string]str
 		}
 	}
 
-	bootstrap = append(bootstrap, fmt.Sprintf("claude --dangerously-skip-permissions -p \"$(cat %s)\"", claudeMDArg))
+	prompt := fmt.Sprintf("$(cat %s)", claudeMDArg)
+	if r != nil {
+		cfg := runner.Config{Env: env}
+		if worktreeDir != nil {
+			cfg.WorkDir = *worktreeDir
+		}
+		bootstrap = append(bootstrap, r.InteractiveCommand(prompt, cfg))
+	} else {
+		// Fallback to hardcoded claude command.
+		bootstrap = append(bootstrap, fmt.Sprintf("claude --dangerously-skip-permissions -p \"%s\"", prompt))
+	}
 
 	for _, cmd := range bootstrap {
 		tmux.SendKeysWithDelay(tmuxSession, agentID, cmd, 100)

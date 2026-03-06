@@ -6,12 +6,14 @@ import (
 
 	"github.com/otaviocarvalho/volta/internal/agent"
 	"github.com/otaviocarvalho/volta/internal/git"
+	"github.com/otaviocarvalho/volta/internal/runner"
 	"github.com/otaviocarvalho/volta/internal/tmux"
 	"github.com/spf13/cobra"
 )
 
 var (
 	spawnWorktrees bool
+	spawnRunner    string
 )
 
 var spawnCmd = &cobra.Command{
@@ -42,6 +44,11 @@ var spawnCmd = &cobra.Command{
 			"DATABASE_URL": dbURL,
 		}
 
+		r, err := runner.Get(spawnRunner)
+		if err != nil {
+			return fmt.Errorf("unknown runner %q: %w", spawnRunner, err)
+		}
+
 		// Pre-flight checks for worktree mode.
 		if spawnWorktrees {
 			if _, err := git.RepoRoot("."); err != nil {
@@ -55,9 +62,9 @@ var spawnCmd = &cobra.Command{
 		name := args[0]
 		var a *agent.Agent
 		if spawnWorktrees {
-			a, err = agent.SpawnWithWorktree(pool, session, name, claudeMD, env)
+			a, err = agent.SpawnWithWorktree(pool, session, name, claudeMD, env, r)
 		} else {
-			a, err = agent.Spawn(pool, session, name, claudeMD, env)
+			a, err = agent.Spawn(pool, session, name, claudeMD, env, r)
 		}
 		if err != nil {
 			return fmt.Errorf("spawning %s: %w", name, err)
@@ -74,5 +81,6 @@ var spawnCmd = &cobra.Command{
 
 func init() {
 	spawnCmd.Flags().BoolVar(&spawnWorktrees, "worktrees", false, "isolate agent in a git worktree")
+	spawnCmd.Flags().StringVar(&spawnRunner, "runner", "claude", "agent runner to use")
 	rootCmd.AddCommand(spawnCmd)
 }

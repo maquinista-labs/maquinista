@@ -8,6 +8,7 @@ import (
 
 	"github.com/otaviocarvalho/volta/internal/agent"
 	"github.com/otaviocarvalho/volta/internal/git"
+	"github.com/otaviocarvalho/volta/internal/runner"
 	"github.com/otaviocarvalho/volta/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -17,6 +18,7 @@ var (
 	runNames     string
 	runAttach    bool
 	runWorktrees bool
+	runRunner    string
 )
 
 var runCmd = &cobra.Command{
@@ -46,6 +48,11 @@ var runCmd = &cobra.Command{
 			"DATABASE_URL": dbURL,
 		}
 
+		r, err := runner.Get(runRunner)
+		if err != nil {
+			return fmt.Errorf("unknown runner %q: %w", runRunner, err)
+		}
+
 		// Pre-flight checks for worktree mode.
 		if runWorktrees {
 			if _, err := git.RepoRoot("."); err != nil {
@@ -71,9 +78,9 @@ var runCmd = &cobra.Command{
 			var a *agent.Agent
 			var err error
 			if runWorktrees {
-				a, err = agent.SpawnWithWorktree(pool, session, name, claudeMD, env)
+				a, err = agent.SpawnWithWorktree(pool, session, name, claudeMD, env, r)
 			} else {
-				a, err = agent.Spawn(pool, session, name, claudeMD, env)
+				a, err = agent.Spawn(pool, session, name, claudeMD, env, r)
 			}
 			if err != nil {
 				return fmt.Errorf("spawning %s: %w", name, err)
@@ -98,6 +105,7 @@ func init() {
 	runCmd.Flags().StringVar(&runNames, "names", "", "comma-separated agent names")
 	runCmd.Flags().BoolVar(&runAttach, "attach", false, "attach to tmux session after spawning")
 	runCmd.Flags().BoolVar(&runWorktrees, "worktrees", false, "isolate each agent in a git worktree")
+	runCmd.Flags().StringVar(&runRunner, "runner", "claude", "agent runner to use")
 	rootCmd.AddCommand(runCmd)
 }
 
