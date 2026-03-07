@@ -190,6 +190,10 @@ func (b *Bot) handleUpdate(update tgbotapi.Update) {
 
 // isAuthorized checks if a user/chat is allowed.
 func (b *Bot) isAuthorized(userID, chatID int64) bool {
+	// Always allow messages from the bot itself.
+	if b.api != nil && userID == b.api.Self.ID {
+		return true
+	}
 	if !b.config.IsAllowedUser(userID) {
 		return false
 	}

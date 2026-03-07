@@ -24,8 +24,25 @@ var stopCmd = &cobra.Command{
 
 func runStop() error {
 	pid, err := readPIDFile()
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		log.Printf("Warning: reading PID file: %v", err)
+	}
+
+	// Best-effort cleanup: resolve config for tmux session name.
+	cfg, cfgErr := config.Load()
+
+	sessionName := "volta"
+	if cfgErr == nil {
+		sessionName = cfg.TmuxSessionName
+	}
+
+	hasSession := tmux.SessionExists(sessionName)
+
+	// If there's no PID, no tmux session — Volta is already stopped.
+	if pid == 0 && !hasSession {
+		removePIDFile() // clean up stale file if any
+		log.Println("Volta is not running.")
+		return nil
 	}
 
 	if pid != 0 && processAlive(pid) {
@@ -53,22 +70,12 @@ func runStop() error {
 		}
 	} else if pid != 0 {
 		log.Printf("PID %d is not running (stale PID file).", pid)
-	} else {
-		log.Println("No PID file found.")
 	}
 
 	// Clean up PID file.
 	removePIDFile()
 
-	// Best-effort cleanup: kill tmux session and DB agents.
-	cfg, cfgErr := config.Load()
-
-	sessionName := "volta"
-	if cfgErr == nil {
-		sessionName = cfg.TmuxSessionName
-	}
-
-	if tmux.SessionExists(sessionName) {
+	if hasSession {
 		log.Printf("Killing tmux session %q...", sessionName)
 		if err := tmux.KillSession(sessionName); err != nil {
 			log.Printf("Warning: killing tmux session: %v", err)
