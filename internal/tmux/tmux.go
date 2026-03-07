@@ -231,6 +231,19 @@ func CleanupInitWindow(session string) {
 	}
 }
 
+// KillSession kills an entire tmux session and all its windows.
+func KillSession(session string) error {
+	cmd := exec.Command("tmux", "kill-session", "-t", session)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		wrapped := fmt.Errorf("killing session %s: %s: %w", session, string(out), err)
+		if IsWindowDead(wrapped) {
+			return nil // session didn't exist
+		}
+		return wrapped
+	}
+	return nil
+}
+
 // KillWindow kills a tmux window. Returns nil if window doesn't exist.
 func KillWindow(session, windowID string) error {
 	target := session + ":" + windowID

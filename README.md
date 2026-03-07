@@ -66,11 +66,14 @@ make build
 ### 5. Run
 
 ```bash
-# Telegram bot only
-./volta serve
+# Start Telegram bot
+./volta start
 
-# Telegram bot + autonomous orchestrator
-./volta serve --orchestrate --orchestrate-project myproject
+# Start Telegram bot + autonomous orchestrator
+./volta start --orchestrate --orchestrate-project myproject
+
+# Stop Volta (kills bot, tmux session, DB agents)
+./volta stop
 
 # Standalone orchestrator (no Telegram)
 ./volta orchestrate --project myproject --max-agents 3
@@ -105,7 +108,8 @@ For automated work, the **orchestrator** polls the task queue, spawns agents for
 ### CLI
 
 ```
-volta serve          Start Telegram bot
+volta start          Start Telegram bot daemon
+volta stop           Stop Volta and clean up resources
 volta orchestrate    Run autonomous orchestrator loop
 volta run            Spawn agents in tmux
 volta spawn <name>   Spawn a single named agent
