@@ -130,15 +130,6 @@ func install(verbose bool) error {
 
 	hookCommand := exePath + " hook"
 
-	// Check if already installed
-	if isHookInstalled(settings, hookCommand) {
-		if verbose {
-			fmt.Println("Hook already installed.")
-		}
-		return nil
-	}
-
-	// Add hook entry
 	hooks, _ := settings["hooks"].(map[string]any)
 	if hooks == nil {
 		hooks = make(map[string]any)
@@ -146,17 +137,34 @@ func install(verbose bool) error {
 
 	sessionStart, _ := hooks["SessionStart"].([]any)
 
-	hookEntry := map[string]any{
-		"hooks": []any{
-			map[string]any{
-				"type":    "command",
-				"command": hookCommand,
-				"timeout": 5,
-			},
-		},
+	// Remove any invalid flat-format entries containing "volta hook"
+	// (these break Claude Code's settings parser and cause all settings to be skipped)
+	cleaned := removeInvalidEntries(sessionStart)
+
+	// Check if already installed in valid nested format
+	if isHookInstalled(settings, hookCommand) && len(cleaned) == len(sessionStart) {
+		if verbose {
+			fmt.Println("Hook already installed.")
+		}
+		return nil
 	}
 
-	sessionStart = append(sessionStart, hookEntry)
+	sessionStart = cleaned
+
+	// Add hook entry if not already present in nested format
+	if !isHookInstalled(settings, hookCommand) {
+		hookEntry := map[string]any{
+			"hooks": []any{
+				map[string]any{
+					"type":    "command",
+					"command": hookCommand,
+					"timeout": 5,
+				},
+			},
+		}
+		sessionStart = append(sessionStart, hookEntry)
+	}
+
 	hooks["SessionStart"] = sessionStart
 	settings["hooks"] = hooks
 
@@ -183,6 +191,22 @@ func expandHome(path string) string {
 		return filepath.Join(home, path[2:])
 	}
 	return path
+}
+
+// removeInvalidEntries removes SessionStart entries that lack a "hooks" array,
+// which would cause Claude Code to reject the entire settings file.
+func removeInvalidEntries(entries []any) []any {
+	var valid []any
+	for _, entry := range entries {
+		m, _ := entry.(map[string]any)
+		if m == nil {
+			continue
+		}
+		if _, ok := m["hooks"]; ok {
+			valid = append(valid, entry)
+		}
+	}
+	return valid
 }
 
 // isHookInstalled checks if a hook with the given command is already present.
