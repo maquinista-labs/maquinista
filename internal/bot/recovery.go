@@ -207,9 +207,6 @@ func (b *Bot) handleDeadWindow(msg *tgbotapi.Message, windowID, pendingText stri
 		b.saveState()
 	}
 
-	// Rename topic
-	b.renameForumTopic(chatID, threadIDInt, result.WindowName)
-
 	// Send pending text to new session
 	if pendingText != "" {
 		if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, result.WindowID, pendingText, 500); err != nil {

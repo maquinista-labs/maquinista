@@ -291,16 +291,16 @@ func (b *Bot) createWindowForDir(dir string, userID int64, chatID int64, threadI
 	b.state.BindThread(userIDStr, threadIDStr, windowID)
 	b.saveState()
 
-	// Get window name for topic rename
-	windowName := filepath.Base(dir)
-	if dn, ok := b.state.GetWindowDisplayName(windowID); ok {
-		windowName = dn
+	// Use topic name as display name (fall back to directory base name)
+	displayName := getTopicName(threadID)
+	if displayName == "" {
+		displayName = filepath.Base(dir)
+		if dn, ok := b.state.GetWindowDisplayName(windowID); ok {
+			displayName = dn
+		}
 	}
 
-	// Rename topic
-	b.renameForumTopic(chatID, threadID, windowName)
-
-	return &createWindowResult{WindowID: windowID, WindowName: windowName}, nil
+	return &createWindowResult{WindowID: windowID, WindowName: displayName}, nil
 }
 
 func (b *Bot) handleDirConfirm(cq *tgbotapi.CallbackQuery, bs *BrowseState, userID int64) {

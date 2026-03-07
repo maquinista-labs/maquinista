@@ -19,16 +19,28 @@ type ForumTopicClosed struct{}
 // The go-telegram-bot-api v5 library doesn't support forum topics, so we extract
 // these fields ourselves from the raw update JSON.
 var (
-	threadIDCache   = make(map[int]int) // message_id → thread_id
-	topicClosedSet  = make(map[int]bool) // message_id → is_topic_closed
+	threadIDCache   = make(map[int]int)    // message_id → thread_id
+	topicClosedSet  = make(map[int]bool)   // message_id → is_topic_closed
+	topicNameCache  = make(map[int]string) // thread_id → topic_name
 	threadCacheMu   sync.RWMutex
 )
 
+// ForumTopicCreated represents a service message about a forum topic being created.
+type ForumTopicCreated struct {
+	Name string `json:"name"`
+}
+
 // rawMessage is used to extract forum-topic fields from raw update JSON.
 type rawMessage struct {
-	MessageID        int               `json:"message_id"`
-	MessageThreadID  int               `json:"message_thread_id"`
-	ForumTopicClosed *ForumTopicClosed `json:"forum_topic_closed"`
+	MessageID        int                `json:"message_id"`
+	MessageThreadID  int                `json:"message_thread_id"`
+	ForumTopicClosed *ForumTopicClosed  `json:"forum_topic_closed"`
+	ReplyToMessage   *rawReplyMessage   `json:"reply_to_message"`
+}
+
+// rawReplyMessage extracts forum_topic_created from reply_to_message.
+type rawReplyMessage struct {
+	ForumTopicCreated *ForumTopicCreated `json:"forum_topic_created"`
 }
 
 type rawUpdate struct {
@@ -54,6 +66,11 @@ func extractForumFields(data []byte) {
 		}
 		if raw.Message.ForumTopicClosed != nil {
 			topicClosedSet[raw.Message.MessageID] = true
+		}
+		if raw.Message.MessageThreadID != 0 && raw.Message.ReplyToMessage != nil &&
+			raw.Message.ReplyToMessage.ForumTopicCreated != nil &&
+			raw.Message.ReplyToMessage.ForumTopicCreated.Name != "" {
+			topicNameCache[raw.Message.MessageThreadID] = raw.Message.ReplyToMessage.ForumTopicCreated.Name
 		}
 	}
 	if raw.CallbackQuery != nil && raw.CallbackQuery.Message != nil {
@@ -83,7 +100,16 @@ func isForumTopicClosed(msg *tgbotapi.Message) bool {
 	return topicClosedSet[msg.MessageID]
 }
 
+// getTopicName returns the cached topic name for a thread ID, if available.
+func getTopicName(threadID int) string {
+	threadCacheMu.RLock()
+	defer threadCacheMu.RUnlock()
+	return topicNameCache[threadID]
+}
+
 // cleanupCache removes entries for old message IDs to prevent unbounded growth.
+// Note: topicNameCache is keyed by thread_id (not message_id) and is not cleaned
+// here since thread IDs are long-lived and the cache is small.
 func cleanupCache(keepAbove int) {
 	threadCacheMu.Lock()
 	defer threadCacheMu.Unlock()

@@ -133,11 +133,14 @@ func (b *Bot) handleWinBind(cq *tgbotapi.CallbackQuery, wps *windowPickerState, 
 	b.state.SetWindowDisplayName(window.ID, window.Name)
 	b.saveState()
 
-	// Rename topic
-	b.renameForumTopic(chatID, threadID, window.Name)
+	// Use topic name as display name (fall back to window name)
+	displayName := getTopicName(threadID)
+	if displayName == "" {
+		displayName = window.Name
+	}
 
 	// Update picker message
-	b.editMessageText(chatID, messageID, fmt.Sprintf("Bound to: %s", window.Name))
+	b.editMessageText(chatID, messageID, fmt.Sprintf("Bound to: %s", displayName))
 
 	// Send pending text
 	if pendingText != "" {
