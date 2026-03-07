@@ -3,6 +3,7 @@ package hook
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -86,8 +87,18 @@ func Run() error {
 	})
 }
 
+// EnsureInstalled checks if the hook is installed and installs it if not.
+// Silent when the hook is already present.
+func EnsureInstalled() error {
+	return install(false)
+}
+
 // Install adds the volta hook to ~/.claude/settings.json.
 func Install() error {
+	return install(true)
+}
+
+func install(verbose bool) error {
 	exePath, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("getting executable path: %w", err)
@@ -124,7 +135,9 @@ func Install() error {
 
 	// Check if already installed
 	if isHookInstalled(settings, hookCommand) {
-		fmt.Println("Hook already installed.")
+		if verbose {
+			fmt.Println("Hook already installed.")
+		}
 		return nil
 	}
 
@@ -156,7 +169,7 @@ func Install() error {
 		return fmt.Errorf("writing settings: %w", err)
 	}
 
-	fmt.Println("Hook installed successfully.")
+	log.Println("Installed Claude Code SessionStart hook.")
 	return nil
 }
 

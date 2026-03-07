@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/otaviocarvalho/volta/hook"
 	"github.com/otaviocarvalho/volta/internal/bot"
 	"github.com/otaviocarvalho/volta/internal/config"
 	"github.com/otaviocarvalho/volta/internal/db"
@@ -112,6 +113,11 @@ func runStart() error {
 		}
 		log.Printf("Cleaning up stale PID file (PID %d is dead)", pid)
 		removePIDFile()
+	}
+
+	// Ensure the Claude Code SessionStart hook is registered.
+	if err := hook.EnsureInstalled(); err != nil {
+		log.Printf("Warning: failed to ensure hook is installed: %v", err)
 	}
 
 	cfg, err := config.Load()
