@@ -11,6 +11,7 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/otaviocarvalho/volta/internal/runner"
 	"github.com/otaviocarvalho/volta/internal/state"
 	"github.com/otaviocarvalho/volta/internal/tmux"
 )
@@ -247,8 +248,14 @@ func (b *Bot) createWindowForDir(dir string, userID int64, chatID int64, threadI
 	// Build Minuano environment if configured
 	env := b.buildMinuanoEnv(filepath.Base(dir))
 
+	// Build the agent command from the configured runner
+	agentCmd := b.config.ClaudeCommand // fallback
+	if r := b.DefaultRunner(); r != nil {
+		agentCmd = r.LaunchCommand(runner.Config{})
+	}
+
 	// Create new tmux window
-	windowID, err := tmux.NewWindow(b.config.TmuxSessionName, "", dir, b.config.ClaudeCommand, env)
+	windowID, err := tmux.NewWindow(b.config.TmuxSessionName, "", dir, agentCmd, env)
 	if err != nil {
 		return nil, fmt.Errorf("creating window: %w", err)
 	}

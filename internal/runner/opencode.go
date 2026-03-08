@@ -20,9 +20,17 @@ func init() {
 
 func (o *OpenCodeRunner) Name() string { return "opencode" }
 
+func (o *OpenCodeRunner) LaunchCommand(cfg Config) string {
+	return "opencode"
+}
+
 func (o *OpenCodeRunner) InteractiveCommand(prompt string, cfg Config) string {
 	escaped := strings.ReplaceAll(prompt, "\"", "\\\"")
 	return fmt.Sprintf("opencode run \"%s\"", escaped)
+}
+
+func (o *OpenCodeRunner) PlannerCommand(systemPromptPath string, cfg Config) string {
+	return fmt.Sprintf("opencode run --prompt \"$(cat %s)\"", systemPromptPath)
 }
 
 func (o *OpenCodeRunner) NonInteractiveArgs(prompt string, cfg Config) []string {

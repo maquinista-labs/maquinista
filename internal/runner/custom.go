@@ -33,8 +33,17 @@ type tplData struct {
 
 func (c *CustomRunner) Name() string { return "custom" }
 
+func (c *CustomRunner) LaunchCommand(cfg Config) string {
+	return c.Binary
+}
+
 func (c *CustomRunner) InteractiveCommand(prompt string, cfg Config) string {
 	return c.renderTemplate(c.InteractiveTpl, prompt)
+}
+
+func (c *CustomRunner) PlannerCommand(systemPromptPath string, cfg Config) string {
+	// Custom runners fall back to interactive command with the system prompt as the prompt.
+	return c.InteractiveCommand(fmt.Sprintf("$(cat %s)", systemPromptPath), cfg)
 }
 
 func (c *CustomRunner) NonInteractiveArgs(prompt string, cfg Config) []string {

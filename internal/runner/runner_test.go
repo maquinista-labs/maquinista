@@ -7,7 +7,8 @@ import (
 
 type mockRunner struct{}
 
-func (m *mockRunner) Name() string                          { return "mock" }
+func (m *mockRunner) Name() string                                { return "mock" }
+func (m *mockRunner) LaunchCommand(c Config) string                { return "mock" }
 func (m *mockRunner) InteractiveCommand(p string, c Config) string { return "mock " + p }
 func (m *mockRunner) NonInteractiveArgs(p string, c Config) []string {
 	return []string{"mock", "--prompt", p}
@@ -15,6 +16,7 @@ func (m *mockRunner) NonInteractiveArgs(p string, c Config) []string {
 func (m *mockRunner) RunNonInteractive(ctx context.Context, p string, c Config) (*Result, error) {
 	return &Result{ExitCode: 0, Output: "ok"}, nil
 }
+func (m *mockRunner) PlannerCommand(p string, c Config) string { return "mock --planner " + p }
 func (m *mockRunner) DetectInstallation() bool     { return true }
 func (m *mockRunner) EnvOverrides() map[string]string { return nil }
 

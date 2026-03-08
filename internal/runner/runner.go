@@ -27,9 +27,17 @@ type AgentRunner interface {
 	// Name returns the runner's identifier (e.g. "claude", "opencode").
 	Name() string
 
+	// LaunchCommand returns the shell command to start the interactive TUI
+	// without a prompt (for Telegram session binding).
+	LaunchCommand(cfg Config) string
+
 	// InteractiveCommand returns the shell command string to start an
 	// interactive agent session with the given prompt.
 	InteractiveCommand(prompt string, cfg Config) string
+
+	// PlannerCommand returns the shell command string to start an
+	// interactive planner session with a system prompt loaded from the given path.
+	PlannerCommand(systemPromptPath string, cfg Config) string
 
 	// NonInteractiveArgs returns the command and arguments for a
 	// non-interactive (headless) agent run.
