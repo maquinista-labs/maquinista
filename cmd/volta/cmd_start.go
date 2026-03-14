@@ -169,8 +169,12 @@ func runStart() error {
 	claudeSrc := monitor.NewClaudeSource(cfg, ms)
 	monitor.RegisterSource("claude", claudeSrc)
 
+	opencodeSrc := monitor.NewOpenCodeSource(cfg, ms)
+	monitor.RegisterSource("opencode", opencodeSrc)
+
 	mon := monitor.New(cfg, b.State(), ms, q)
 	mon.AddSource(claudeSrc)
+	mon.AddSource(opencodeSrc)
 	mon.PlanHandler = b.HandlePlanFromMonitor
 
 	sp := bot.NewStatusPoller(b, q, mon)
