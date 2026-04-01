@@ -4,12 +4,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/otaviocarvalho/volta/internal/db"
 	"github.com/otaviocarvalho/volta/internal/git"
 	"github.com/otaviocarvalho/volta/internal/runner"
+	"github.com/otaviocarvalho/volta/internal/state"
 	"github.com/otaviocarvalho/volta/internal/tmux"
 )
 
@@ -50,6 +52,11 @@ func Spawn(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env ma
 	}
 
 	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, nil, nil, r)
+
+	if r != nil && !r.HasSessionHook() {
+		workDir, _ := filepath.Abs(".")
+		writeSessionMapFallback(tmuxSession, agentID, workDir)
+	}
 
 	now := time.Now()
 	return &Agent{
@@ -102,6 +109,10 @@ func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath st
 
 	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, &worktreeDir, &branch, r)
 
+	if r != nil && !r.HasSessionHook() {
+		writeSessionMapFallback(tmuxSession, agentID, worktreeDir)
+	}
+
 	now := time.Now()
 	return &Agent{
 		ID:          agentID,
@@ -113,6 +124,40 @@ func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath st
 		WorktreeDir: &worktreeDir,
 		Branch:      &branch,
 	}, nil
+}
+
+// writeSessionMapFallback writes a preliminary session_map.json entry for runners
+// that have no SessionStart hook (e.g. OpenCode). It uses the agent ID as a stable
+// proxy for the session ID so bot handlers can route Telegram messages correctly.
+func writeSessionMapFallback(tmuxSession, agentID, workDir string) {
+	windowID, err := tmux.GetWindowID(tmuxSession, agentID)
+	if err != nil || windowID == "" {
+		return // tmux not available or window not found; skip silently
+	}
+
+	dir := os.Getenv("VOLTA_DIR")
+	if dir == "" {
+		dir = "~/.volta"
+	}
+	if strings.HasPrefix(dir, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			dir = filepath.Join(home, dir[2:])
+		}
+	}
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return
+	}
+
+	key := tmuxSession + ":" + windowID
+	sessionMapPath := filepath.Join(dir, "session_map.json")
+	_ = state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
+		data[key] = state.SessionMapEntry{
+			SessionID:  agentID,
+			CWD:        workDir,
+			WindowName: agentID,
+		}
+	})
 }
 
 // mergeEnv merges runner env overrides into the base env map.

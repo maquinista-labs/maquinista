@@ -300,6 +300,14 @@ func DisplayMessage(paneID, format string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// GetWindowID returns the tmux internal window ID (e.g. "@5") for a window
+// identified by session and name. Used to build session_map keys for runners
+// that lack a SessionStart hook.
+func GetWindowID(session, windowName string) (string, error) {
+	target := session + ":" + windowName
+	return DisplayMessage(target, "#{window_id}")
+}
+
 // RenameWindow renames a tmux window.
 func RenameWindow(session, windowID, newName string) error {
 	target := session + ":" + windowID
