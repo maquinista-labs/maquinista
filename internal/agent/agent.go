@@ -153,9 +153,10 @@ func writeSessionMapFallback(tmuxSession, agentID, workDir string) {
 	sessionMapPath := filepath.Join(dir, "session_map.json")
 	_ = state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
 		data[key] = state.SessionMapEntry{
-			SessionID:  agentID,
-			CWD:        workDir,
-			WindowName: agentID,
+			SessionID:       "",
+			CWD:             workDir,
+			WindowName:      agentID,
+			WindowCreatedAt: time.Now().UnixMilli(),
 		}
 	})
 }

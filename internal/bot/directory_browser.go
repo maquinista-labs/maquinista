@@ -316,8 +316,9 @@ func (b *Bot) createWindowForDir(dir string, userID int64, chatID int64, threadI
 		// Runner has no hook — write a preliminary session_map entry with CWD.
 		// The TranscriptSource discovers the session ID from its own database.
 		entry := state.SessionMapEntry{
-			CWD:        dir,
-			WindowName: filepath.Base(dir),
+			CWD:             dir,
+			WindowName:      filepath.Base(dir),
+			WindowCreatedAt: time.Now().UnixMilli(),
 		}
 		if err := state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
 			data[sessionKey] = entry

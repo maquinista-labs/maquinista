@@ -55,14 +55,31 @@ func (o *OpenCodeSource) ensureDB() error {
 		return nil
 	}
 	if _, err := os.Stat(o.dbPath); err != nil {
+		log.Printf("OpenCode DB not found at %s: %v", o.dbPath, err)
 		return fmt.Errorf("opencode db not found: %w", err)
 	}
 	db, err := sql.Open("sqlite", o.dbPath+"?mode=ro&_journal_mode=wal")
 	if err != nil {
+		log.Printf("OpenCode DB open failed (%s): %v", o.dbPath, err)
 		return fmt.Errorf("opening opencode db: %w", err)
 	}
+	// Verify the connection actually works — sql.Open may succeed lazily.
+	if err := db.Ping(); err != nil {
+		db.Close()
+		log.Printf("OpenCode DB ping failed (%s): %v", o.dbPath, err)
+		return fmt.Errorf("pinging opencode db: %w", err)
+	}
 	o.db = db
+	log.Printf("OpenCode DB opened: %s", o.dbPath)
 	return nil
+}
+
+// resetDB closes and clears the cached DB handle so the next ensureDB retries.
+func (o *OpenCodeSource) resetDB() {
+	if o.db != nil {
+		o.db.Close()
+		o.db = nil
+	}
 }
 
 func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
@@ -92,8 +109,9 @@ func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
 			continue
 		}
 
-		discovered, err := o.discoverSession(entry.CWD)
+		discovered, err := o.discoverSession(entry.CWD, entry.WindowCreatedAt)
 		if err != nil {
+			log.Printf("OpenCode: failed to discover session for %s (window %s): %v", entry.CWD, windowID, err)
 			continue
 		}
 		if discovered == entry.SessionID {
@@ -152,11 +170,27 @@ func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
 	return sessions
 }
 
-func (o *OpenCodeSource) discoverSession(directory string) (string, error) {
+// discoverSession finds the OpenCode session for a given directory.
+// If windowCreatedAt > 0 (Unix ms), it looks for the session created at or after that
+// timestamp, which isolates the session to the specific window that was spawned.
+// Falls back to the latest session if no time-scoped match is found.
+func (o *OpenCodeSource) discoverSession(directory string, windowCreatedAt int64) (string, error) {
 	if err := o.ensureDB(); err != nil {
 		return "", err
 	}
 	var sessionID string
+
+	if windowCreatedAt > 0 {
+		err := o.db.QueryRow(
+			`SELECT id FROM session WHERE directory = ? AND time_created >= ? ORDER BY time_created ASC LIMIT 1`,
+			directory, windowCreatedAt,
+		).Scan(&sessionID)
+		if err == nil {
+			return sessionID, nil
+		}
+		// No session found yet (OpenCode still starting) or timestamp unit mismatch — fall through.
+	}
+
 	err := o.db.QueryRow(
 		`SELECT id FROM session WHERE directory = ? ORDER BY time_created DESC LIMIT 1`,
 		directory,
@@ -186,6 +220,7 @@ func (o *OpenCodeSource) getCurrentTimeUpdated(sessionID string) int64 {
 
 func (o *OpenCodeSource) ReadNewEntries(session ActiveSession, lastOffset int64) ([]ParsedEntry, int64, error) {
 	if err := o.ensureDB(); err != nil {
+		log.Printf("OpenCode: DB unavailable for session %s: %v", session.Key, err)
 		return nil, lastOffset, nil
 	}
 
@@ -206,6 +241,7 @@ func (o *OpenCodeSource) ReadNewEntries(session ActiveSession, lastOffset int64)
 	`, entry.SessionID, lastTime)
 	if err != nil {
 		log.Printf("OpenCode poll error for session %s: %v", entry.SessionID, err)
+		o.resetDB() // connection may be stale; retry on next poll
 		return nil, lastOffset, nil
 	}
 	defer rows.Close()

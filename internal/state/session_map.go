@@ -9,9 +9,10 @@ import (
 
 // SessionMapEntry holds info written by the hook for each tmux window.
 type SessionMapEntry struct {
-	SessionID  string `json:"session_id"`
-	CWD        string `json:"cwd"`
-	WindowName string `json:"window_name"`
+	SessionID       string `json:"session_id"`
+	CWD             string `json:"cwd"`
+	WindowName      string `json:"window_name"`
+	WindowCreatedAt int64  `json:"window_created_at,omitempty"` // Unix ms when the tmux window was spawned
 }
 
 // LoadSessionMap reads session_map.json.

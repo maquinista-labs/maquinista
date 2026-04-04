@@ -39,6 +39,7 @@ type Monitor struct {
 	PlanHandler       func(userID int64, threadID int, chatID int64, planJSON string)
 	planBuffers       map[string]string // windowID → partial plan text
 	ObservationLookup ObservationLookup // optional: resolve window → observing topics
+	pollCount         int
 }
 
 // New creates a new Monitor.
@@ -77,8 +78,14 @@ func (m *Monitor) Run(ctx context.Context) {
 }
 
 func (m *Monitor) poll() {
+	m.pollCount++
+	logSummary := m.pollCount%30 == 0 // ~1 min at 2s interval
+
 	for _, src := range m.sources {
 		sessions := src.DiscoverSessions()
+		if logSummary {
+			log.Printf("Monitor: source %s discovered %d sessions", src.Name(), len(sessions))
+		}
 		for _, sess := range sessions {
 			// Check window is owned by this source
 			if m.state.GetWindowRunner(sess.WindowID) != src.Name() {
