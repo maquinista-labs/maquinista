@@ -112,19 +112,12 @@ func tick(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	// 3. DISPATCH: spawn executor agents for available slots.
-	maxAgents := cfg.GetMaxAgents()
-	slotsAvailable := maxAgents - executorCount
-	for i := 0; i < slotsAvailable; i++ {
-		dispatched, err := dispatch(cfg)
-		if err != nil {
-			log.Printf("Dispatch error: %v", err)
-			break
-		}
-		if !dispatched {
-			break // no more ready tasks
-		}
-	}
+	// 3. DISPATCH: retired in task 3.6. Task dispatch now flows through
+	// agent_inbox via the `maquinista task-scheduler` subcommand (§D.4)
+	// which claims ready tasks, calls orchestrator.EnsureAgent, and
+	// enqueues /work-on-task. The legacy volta-era direct-dispatch path
+	// (spawn agent → db.AtomicClaim → send keys into the pane) is gone.
+	_ = executorCount // slot-bookkeeping preserved for future policy hooks
 
 	// 4. MERGE: process merge queue.
 	if err := processMergeQueue(cfg); err != nil {
@@ -155,44 +148,11 @@ func reconcile(cfg Config) error {
 	return nil
 }
 
-func dispatch(cfg Config) (bool, error) {
-	agentID := fmt.Sprintf("orch-%d", time.Now().UnixNano())
-
-	env := map[string]string{
-		"DATABASE_URL": cfg.DatabaseURL,
-	}
-
-	var a *agent.Agent
-	var err error
-	if cfg.UseWorktrees {
-		a, err = agent.SpawnWithWorktree(cfg.Pool, cfg.TmuxSession, agentID, cfg.ClaudeMDPath, env, cfg.Runner, "executor")
-	} else {
-		a, err = agent.Spawn(cfg.Pool, cfg.TmuxSession, agentID, cfg.ClaudeMDPath, env, cfg.Runner, "executor")
-	}
-	if err != nil {
-		return false, fmt.Errorf("spawning agent: %w", err)
-	}
-
-	// Try to claim a task for this agent.
-	var projPtr *string
-	if cfg.ProjectID != "" {
-		projPtr = &cfg.ProjectID
-	}
-	task, err := db.AtomicClaim(cfg.Pool, a.ID, projPtr)
-	if err != nil {
-		// No task available — kill the agent we just spawned.
-		agent.Kill(cfg.Pool, cfg.TmuxSession, a.ID)
-		return false, nil
-	}
-	if task == nil {
-		agent.Kill(cfg.Pool, cfg.TmuxSession, a.ID)
-		return false, nil
-	}
-
-	log.Printf("Dispatched agent %s for task %s", a.ID, task.ID)
-	notify(cfg, fmt.Sprintf("Agent spawned: %s → task %s", a.ID, task.ID))
-	return true, nil
-}
+// Legacy volta-era dispatch() was removed in task 3.6. Every ready task
+// now reaches its implementor via the task-scheduler → agent_inbox path,
+// not a direct tmux spawn-and-claim. Runtimes that still want to cap
+// concurrent agents should do so in the task-scheduler's EnsureAgent
+// callback (a future follow-up on this package).
 
 func processMergeQueue(cfg Config) error {
 	entry, err := db.ClaimMergeEntry(cfg.Pool)
