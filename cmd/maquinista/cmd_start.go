@@ -15,6 +15,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/bot"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/listener"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
@@ -230,6 +231,13 @@ func runStart() error {
 		workerID := fmt.Sprintf("consumer-%d", os.Getpid())
 		go runMailboxConsumer(ctx, pool, cfg.TmuxSessionName, workerID)
 		log.Printf("mailbox: inbox consumer running (worker=%s)", workerID)
+
+		// Declarative jobreg reconcile: upsert every YAML under
+		// config/schedules + config/hooks, soft-disable rows whose
+		// YAML is gone. Missing dirs are fine (silent no-op).
+		if err := jobreg.Reconcile(ctx, pool, "config/schedules", "config/hooks"); err != nil {
+			log.Printf("jobreg reconcile: %v", err)
+		}
 	} else {
 		log.Println("mailbox: DB pool unavailable — inbox routing will error")
 	}

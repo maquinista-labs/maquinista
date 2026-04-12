@@ -83,6 +83,14 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleDefaultCommand(msg)
 	case "global_default":
 		b.handleGlobalDefaultCommand(msg)
+	case "schedule":
+		b.handleScheduleCommand(msg)
+	case "hook_register":
+		b.handleHookRegisterCommand(msg)
+	case "hook_enable":
+		b.handleHookEnableCommand(msg)
+	case "hook_disable":
+		b.handleHookDisableCommand(msg)
 	default:
 		b.reply(msg.Chat.ID, getThreadID(msg), "Unknown command: /"+msg.Command())
 	}
