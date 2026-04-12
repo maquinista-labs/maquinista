@@ -44,8 +44,17 @@ Other errors bump 'attempts'; once attempts exceed the cap the row is marked
 			cancel()
 		}()
 
+		cfg := dispatcher.DefaultConfig()
+		// MAILBOX_DISPATCHER=1 → live; default is shadow so channel_deliveries
+		// rows are consumed without double-sending alongside the legacy path.
+		cfg.Shadow = os.Getenv("MAILBOX_DISPATCHER") != "1"
+		if cfg.Shadow {
+			log.Println("dispatcher: SHADOW mode (MAILBOX_DISPATCHER!=1)")
+		} else {
+			log.Println("dispatcher: LIVE mode")
+		}
 		client := &dispatcher.BotAPIClient{API: api}
-		return dispatcher.Run(ctx, pool, client, dispatcher.DefaultConfig())
+		return dispatcher.Run(ctx, pool, client, cfg)
 	},
 }
 

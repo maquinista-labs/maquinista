@@ -79,6 +79,10 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleAgentKillAllCommand(msg)
 	case "runner":
 		b.handleRunnerCommand(msg)
+	case "default":
+		b.handleDefaultCommand(msg)
+	case "global_default":
+		b.handleGlobalDefaultCommand(msg)
 	default:
 		b.reply(msg.Chat.ID, getThreadID(msg), "Unknown command: /"+msg.Command())
 	}

@@ -117,6 +117,8 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "agent_spawn", Description: "Spawn a new execution agent"},
 		tgbotapi.BotCommand{Command: "agent_kill", Description: "Kill a specific agent"},
 		tgbotapi.BotCommand{Command: "agent_kill_all", Description: "Kill all agents"},
+		tgbotapi.BotCommand{Command: "default", Description: "Set your owner agent for this topic"},
+		tgbotapi.BotCommand{Command: "global_default", Description: "Admin: set the global default agent"},
 	)
 	if _, err := b.api.Request(commands); err != nil {
 		log.Printf("Warning: failed to register bot commands: %v", err)

@@ -56,6 +56,13 @@ type Config struct {
 	// topic. Empty list leaves the legacy path untouched.
 	// Configured via MAILBOX_INBOUND_TOPICS (comma-separated, or "*").
 	MailboxInboundTopics []string
+
+	// MailboxDispatcher flips the Telegram dispatcher from shadow mode (DB
+	// rows flow but SendMessage is skipped) to live mode. Shadow mode is
+	// the default during the task-1.7 ↔ task-1.8 rollout so channel_deliveries
+	// accumulate without double-sending alongside the legacy Telegram path.
+	// Configured via MAILBOX_DISPATCHER=1.
+	MailboxDispatcher bool
 }
 
 // MailboxInboundEnabled reports whether the mailbox.inbound flag is active
@@ -170,6 +177,7 @@ func Load(envFile ...string) (*Config, error) {
 		DefaultRunner:       defaultRunner,
 		MailboxOutbound:      parseBoolEnv(os.Getenv("MAILBOX_OUTBOUND")),
 		MailboxInboundTopics: parseTopicList(os.Getenv("MAILBOX_INBOUND_TOPICS")),
+		MailboxDispatcher:    parseBoolEnv(os.Getenv("MAILBOX_DISPATCHER")),
 	}, nil
 }
 

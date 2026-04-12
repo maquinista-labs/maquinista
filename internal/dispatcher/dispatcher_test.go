@@ -71,6 +71,36 @@ func seedDelivery(t *testing.T, pool *pgxpool.Pool, text string, chatID int64, t
 	return deliveryID
 }
 
+func TestProcessOne_ShadowMode_SkipsSendButMarksSent(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	id := seedDelivery(t, pool, "shadow-hi", -1001, 42)
+
+	mc := &mockClient{}
+	cfg := DefaultConfig()
+	cfg.Shadow = true
+
+	ok, err := ProcessOne(ctx, pool, mc, cfg, nil)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if len(mc.calls) != 0 {
+		t.Errorf("SendMessage called %d times in shadow; want 0", len(mc.calls))
+	}
+
+	var status string
+	var extID *int64
+	pool.QueryRow(ctx, `SELECT status, external_msg_id FROM channel_deliveries WHERE id=$1`, id).
+		Scan(&status, &extID)
+	if status != "sent" {
+		t.Errorf("status=%q, want sent (shadow still advances state)", status)
+	}
+	if extID != nil {
+		t.Errorf("shadow external_msg_id=%v, want NULL", *extID)
+	}
+}
+
 func TestProcessOne_HappyPath(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()

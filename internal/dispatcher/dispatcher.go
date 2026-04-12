@@ -43,6 +43,12 @@ type Config struct {
 	RatePerSec int
 	// DefaultRateLimitBackoff is used when a 429 lacks retry_after.
 	DefaultRateLimitBackoff time.Duration
+	// Shadow, when true, claims rows and flips them to 'sent' with a null
+	// external_msg_id — but never calls TelegramClient.SendMessage. Used
+	// during rollout so channel_deliveries accumulates alongside the legacy
+	// Telegram path without double-sending. Mapped from MAILBOX_DISPATCHER
+	// (off = shadow, on = live) at the callsite.
+	Shadow bool
 }
 
 // DefaultConfig returns the production defaults.
@@ -145,6 +151,18 @@ func ProcessOne(ctx context.Context, pool *pgxpool.Pool, client TelegramClient, 
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return false, fmt.Errorf("commit claim: %w", err)
+	}
+
+	if cfg.Shadow {
+		// Shadow mode: skip the network call but still mark 'sent' so rows
+		// don't pile up as 'sending'. external_msg_id is left NULL so a
+		// later parity check can tell shadow rows from live ones.
+		_, uerr := pool.Exec(ctx, `
+			UPDATE channel_deliveries
+			SET status='sent', sent_at=NOW(), external_msg_id=NULL, next_attempt_at=NULL
+			WHERE id=$1
+		`, c.id)
+		return true, uerr
 	}
 
 	if limiter != nil {
