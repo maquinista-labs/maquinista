@@ -43,6 +43,12 @@ type Config struct {
 
 	// Default agent runner (claude, opencode, etc.)
 	DefaultRunner string
+
+	// Feature flags (see plans/maquinista-v2-implementation.md §"Feature flags").
+	// MailboxOutbound enables shadow-mode writes from the monitor into
+	// agent_outbox — the existing Telegram path continues to run so traffic
+	// is unaffected. Toggled by MAILBOX_OUTBOUND=1.
+	MailboxOutbound bool
 }
 
 func Load(envFile ...string) (*Config, error) {
@@ -142,7 +148,16 @@ func Load(envFile ...string) (*Config, error) {
 		DefaultProject:      defaultProject,
 		PlannerPromptPath:   plannerPromptPath,
 		DefaultRunner:       defaultRunner,
+		MailboxOutbound:     parseBoolEnv(os.Getenv("MAILBOX_OUTBOUND")),
 	}, nil
+}
+
+func parseBoolEnv(v string) bool {
+	switch strings.ToLower(strings.TrimSpace(v)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 func (c *Config) IsAllowedUser(userID int64) bool {

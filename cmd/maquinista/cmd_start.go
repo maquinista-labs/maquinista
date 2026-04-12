@@ -181,6 +181,24 @@ func runStart() error {
 	mon.AddSource(openclaudeSrc)
 	mon.PlanHandler = b.HandlePlanFromMonitor
 
+	// Feature flag mailbox.outbound: mirror every captured response into
+	// agent_outbox in parallel with the legacy Telegram path.
+	if cfg.MailboxOutbound {
+		if pool == nil && cfg.DatabaseURL != "" {
+			if p, dbErr := db.Connect(cfg.DatabaseURL); dbErr != nil {
+				log.Printf("mailbox.outbound: cannot connect DB: %v", dbErr)
+			} else {
+				pool = p
+			}
+		}
+		if pool != nil {
+			mon.OutboxWriter = monitor.NewDBOutboxWriter(pool)
+			log.Println("mailbox.outbound: shadow-writing responses to agent_outbox")
+		} else {
+			log.Println("mailbox.outbound: flag set but no DB pool — ignoring")
+		}
+	}
+
 	sp := bot.NewStatusPoller(b, q, mon)
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)

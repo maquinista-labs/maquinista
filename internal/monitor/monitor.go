@@ -20,6 +20,23 @@ import (
 // Implementations should look up the agent by window, then look up observing topics.
 type ObservationLookup func(windowID string) []ObservingTopic
 
+// OutboxEvent is one captured assistant response ready to be mirrored into
+// agent_outbox. Used by OutboxWriter; keeps the monitor package free of
+// direct DB access.
+type OutboxEvent struct {
+	AgentID   string // equal to WindowID by convention
+	UserID    int64
+	ThreadID  int
+	ChatID    int64
+	Role      string // 'assistant' | 'user' | 'thinking' | ...
+	Text      string // rendered payload (the same string handed to the queue)
+	InReplyTo string // optional: correlating inbox row id (currently unused — reserved for sidecar path)
+}
+
+// OutboxWriter mirrors every captured response into agent_outbox when set.
+// A nil writer disables the mailbox.outbound path.
+type OutboxWriter func(e OutboxEvent)
+
 // ObservingTopic represents a topic that is observing an agent's output.
 type ObservingTopic struct {
 	TopicID int64
@@ -39,6 +56,7 @@ type Monitor struct {
 	PlanHandler       func(userID int64, threadID int, chatID int64, planJSON string)
 	planBuffers       map[string]string // windowID → partial plan text
 	ObservationLookup ObservationLookup // optional: resolve window → observing topics
+	OutboxWriter      OutboxWriter      // optional: shadow-write captured responses to agent_outbox
 	pollCount         int
 }
 
@@ -226,6 +244,22 @@ func (m *Monitor) enqueueEntry(userID int64, threadID int, chatID int64, windowI
 		ToolUseID:   pe.ToolUseID,
 		WindowID:    windowID,
 	})
+
+	// Shadow-mode mirror: write the same response into agent_outbox so the
+	// relay/dispatcher pipeline can be validated in parallel with the
+	// legacy Telegram path. Only assistant-produced content is mirrored —
+	// user echoes and internal thinking stay out of the outbox to match
+	// what reaches Telegram as an agent turn.
+	if m.OutboxWriter != nil && pe.Role == "assistant" && (pe.ContentType == "text" || pe.ContentType == "thinking") {
+		m.OutboxWriter(OutboxEvent{
+			AgentID:  windowID,
+			UserID:   userID,
+			ThreadID: threadID,
+			ChatID:   chatID,
+			Role:     pe.Role,
+			Text:     text,
+		})
+	}
 }
 
 // extractPlanJSON finds "PLAN_JSON:" marker followed by a JSON array,
