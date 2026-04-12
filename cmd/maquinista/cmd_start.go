@@ -15,7 +15,6 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/bot"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/db"
-	"github.com/maquinista-labs/maquinista/internal/inboxbridge"
 	"github.com/maquinista-labs/maquinista/internal/listener"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
@@ -214,31 +213,25 @@ func runStart() error {
 	go mon.Run(ctx)
 	go sp.Run(ctx)
 
-	// Feature flag mailbox.inbound: start the in-process bridge that drains
-	// agent_inbox rows into the existing pty via tmux.SendKeysWithDelay.
-	if len(cfg.MailboxInboundTopics) > 0 {
-		if pool == nil && cfg.DatabaseURL != "" {
-			if p, dbErr := db.Connect(cfg.DatabaseURL); dbErr != nil {
-				log.Printf("mailbox.inbound: cannot connect DB: %v", dbErr)
-			} else {
-				pool = p
-			}
-		}
-		if pool != nil {
-			b.SetPool(pool)
-			drive := func(agentID, text string) error {
-				return tmux.SendKeysWithDelay(cfg.TmuxSessionName, agentID, text, 500)
-			}
-			bridgeCfg := inboxbridge.DefaultConfig(fmt.Sprintf("bridge-%d", os.Getpid()))
-			go func() {
-				if err := inboxbridge.Run(ctx, pool, drive, bridgeCfg); err != nil && err != context.Canceled {
-					log.Printf("mailbox.inbound: bridge exited: %v", err)
-				}
-			}()
-			log.Printf("mailbox.inbound: bridge running for topics %v", cfg.MailboxInboundTopics)
+	// Mailbox inbox consumer: claim agent_inbox rows and pipe content into
+	// the pty. Replaces the task-1.6 inboxbridge package. The plan's end
+	// state is one sidecar goroutine per live agent (§7); until that per-
+	// agent supervisor is wired, this single process consumer drains all
+	// agents serially via FOR UPDATE SKIP LOCKED.
+	if pool == nil && cfg.DatabaseURL != "" {
+		if p, dbErr := db.Connect(cfg.DatabaseURL); dbErr != nil {
+			log.Printf("mailbox: cannot connect DB: %v", dbErr)
 		} else {
-			log.Println("mailbox.inbound: flag set but no DB pool — bridge disabled")
+			pool = p
 		}
+	}
+	if pool != nil {
+		b.SetPool(pool)
+		workerID := fmt.Sprintf("consumer-%d", os.Getpid())
+		go runMailboxConsumer(ctx, pool, cfg.TmuxSessionName, workerID)
+		log.Printf("mailbox: inbox consumer running (worker=%s)", workerID)
+	} else {
+		log.Println("mailbox: DB pool unavailable — inbox routing will error")
 	}
 
 	// Start orchestrator if requested.

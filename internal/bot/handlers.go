@@ -48,25 +48,13 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Feature flag mailbox.inbound: route through agent_inbox instead of
-	// driving the pty directly. The in-process inboxbridge picks up the row
-	// via LISTEN agent_inbox_new and calls SendKeysWithDelay itself, so the
-	// pane sees the same keystrokes either way.
-	if b.config.MailboxInboundEnabled(threadID) {
-		if routed := b.routeTextViaInbox(msg, windowID, text); routed {
-			return
-		}
-		log.Printf("mailbox.inbound: inbox route failed for %s, falling back to legacy path", windowID)
-	}
-
-	// Send text to tmux with 500ms delay before Enter
-	if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, windowID, text, 500); err != nil {
-		if tmux.IsWindowDead(err) {
-			b.handleDeadWindow(msg, windowID, text)
-			return
-		}
-		log.Printf("Error sending keys to %s: %v", windowID, err)
-		b.reply(chatID, getThreadID(msg), "Error: failed to send to Claude session.")
+	// User text always routes via agent_inbox. A separate consumer
+	// (cmd_start's mailbox loop, eventually a per-agent sidecar) claims
+	// inbox rows and drives the pty via SendKeysWithDelay — so direct
+	// pty writes from the bot handler are gone.
+	if routed := b.routeTextViaInbox(msg, windowID, text); !routed {
+		log.Printf("mailbox.inbound: routing failed for %s (DB unavailable?)", windowID)
+		b.reply(chatID, getThreadID(msg), "Error: agent mailbox is unavailable. Check DATABASE_URL.")
 	}
 }
 
