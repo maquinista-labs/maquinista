@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"context"
 	"fmt"
 	"sync"
 )
@@ -16,13 +15,11 @@ type Config struct {
 	ExtraArgs []string
 }
 
-// Result holds the outcome of a non-interactive agent run.
-type Result struct {
-	ExitCode int
-	Output   string
-}
-
 // AgentRunner defines the interface for pluggable agent runners.
+//
+// α (see plans/maquinista-v2.md §10a) exercises runners exclusively
+// through InteractiveCommand — the non-interactive / one-shot surface
+// was retired in task 3.7.
 type AgentRunner interface {
 	// Name returns the runner's identifier (e.g. "claude", "opencode").
 	Name() string
@@ -38,13 +35,6 @@ type AgentRunner interface {
 	// PlannerCommand returns the shell command string to start an
 	// interactive planner session with a system prompt loaded from the given path.
 	PlannerCommand(systemPromptPath string, cfg Config) string
-
-	// NonInteractiveArgs returns the command and arguments for a
-	// non-interactive (headless) agent run.
-	NonInteractiveArgs(prompt string, cfg Config) []string
-
-	// RunNonInteractive executes the agent non-interactively and returns the result.
-	RunNonInteractive(ctx context.Context, prompt string, cfg Config) (*Result, error)
 
 	// DetectInstallation checks if the runner's binary is available on the system.
 	DetectInstallation() bool

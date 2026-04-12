@@ -23,23 +23,6 @@ func TestCustomRunner_InteractiveCommand(t *testing.T) {
 	}
 }
 
-func TestCustomRunner_NonInteractiveArgs(t *testing.T) {
-	c := &CustomRunner{
-		Binary:      "myagent",
-		NonInterTpl: "{{.Binary}} --headless -p {{.Prompt}}",
-	}
-	args := c.NonInteractiveArgs("test", Config{})
-	if len(args) < 4 {
-		t.Fatalf("expected at least 4 args, got %v", args)
-	}
-	if args[0] != "myagent" {
-		t.Errorf("args[0] = %q", args[0])
-	}
-	if args[1] != "--headless" {
-		t.Errorf("args[1] = %q", args[1])
-	}
-}
-
 func TestCustomRunner_EnvOverrides(t *testing.T) {
 	c := &CustomRunner{
 		Binary: "myagent",

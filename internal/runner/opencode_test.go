@@ -23,27 +23,6 @@ func TestOpenCodeRunner_InteractiveCommand(t *testing.T) {
 	}
 }
 
-func TestOpenCodeRunner_NonInteractiveArgs(t *testing.T) {
-	o := &OpenCodeRunner{Model: "anthropic/claude-sonnet"}
-	args := o.NonInteractiveArgs("test", Config{})
-
-	hasFlag := func(flag string) bool {
-		for _, a := range args {
-			if a == flag {
-				return true
-			}
-		}
-		return false
-	}
-
-	if !hasFlag("--format") {
-		t.Error("missing --format")
-	}
-	if !hasFlag("-m") {
-		t.Error("missing -m")
-	}
-}
-
 func TestOpenCodeRunner_EnvOverrides_SkipPermissions(t *testing.T) {
 	o := &OpenCodeRunner{SkipPermissions: true}
 	env := o.EnvOverrides()

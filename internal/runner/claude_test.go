@@ -23,57 +23,6 @@ func TestClaudeRunner_InteractiveCommand(t *testing.T) {
 	}
 }
 
-func TestClaudeRunner_NonInteractiveArgs(t *testing.T) {
-	c := &ClaudeRunner{Model: "opus", MaxBudget: 5.0}
-	args := c.NonInteractiveArgs("test prompt", Config{})
-
-	hasFlag := func(flag string) bool {
-		for _, a := range args {
-			if a == flag {
-				return true
-			}
-		}
-		return false
-	}
-
-	if !hasFlag("--output-format") {
-		t.Error("missing --output-format")
-	}
-	if !hasFlag("--dangerously-skip-permissions") {
-		t.Error("missing --dangerously-skip-permissions")
-	}
-	if !hasFlag("--no-session-persistence") {
-		t.Error("missing --no-session-persistence")
-	}
-	if !hasFlag("--model") {
-		t.Error("missing --model")
-	}
-	if !hasFlag("--max-budget-usd") {
-		t.Error("missing --max-budget-usd")
-	}
-
-	// Check model value follows --model flag
-	for i, a := range args {
-		if a == "--model" && i+1 < len(args) {
-			if args[i+1] != "opus" {
-				t.Errorf("model = %q, want opus", args[i+1])
-			}
-		}
-	}
-}
-
-func TestClaudeRunner_NonInteractiveArgs_DefaultModel(t *testing.T) {
-	c := &ClaudeRunner{}
-	args := c.NonInteractiveArgs("test", Config{})
-	for i, a := range args {
-		if a == "--model" && i+1 < len(args) {
-			if args[i+1] != "sonnet" {
-				t.Errorf("default model = %q, want sonnet", args[i+1])
-			}
-		}
-	}
-}
-
 func TestClaudeRunner_EnvOverrides(t *testing.T) {
 	c := &ClaudeRunner{}
 	env := c.EnvOverrides()
