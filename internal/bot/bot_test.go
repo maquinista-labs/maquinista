@@ -3,7 +3,7 @@ package bot
 import (
 	"testing"
 
-	"github.com/otaviocarvalho/volta/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/config"
 )
 
 func TestIsAuthorized(t *testing.T) {

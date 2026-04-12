@@ -9,8 +9,8 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/runner"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // handlePlannerCommand is the entry point for /plan.

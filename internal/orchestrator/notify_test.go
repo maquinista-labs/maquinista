@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/otaviocarvalho/volta/internal/listener"
+	"github.com/maquinista-labs/maquinista/internal/listener"
 )
 
 func TestNotifyBridge_ReadyEvent(t *testing.T) {

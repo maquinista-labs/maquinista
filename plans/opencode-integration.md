@@ -1,13 +1,13 @@
 # OpenCode Integration Improvements
 
-Derived from a comparison of the Claude Code source and Volta's current OpenCode runner.
+Derived from a comparison of the Claude Code source and Maquinista's current OpenCode runner.
 The goal is to close the capability gap so OpenCode agents are as reliable as Claude Code agents.
 
 ---
 
 ## Problem Summary
 
-Volta's `OpenCodeRunner` was scaffolded but never fully integrated. Four categories of gaps:
+Maquinista's `OpenCodeRunner` was scaffolded but never fully integrated. Four categories of gaps:
 
 | Category | Severity | Impact |
 |----------|----------|--------|
@@ -63,7 +63,7 @@ agent's role before any user input. Options (in preference order):
 2. If not, prepend the system prompt file content to the task prompt with a role-framing header
 3. As a last resort, document planner mode as unsupported for OpenCode
 
-**Acceptance:** `volta spawn --runner opencode --role planner` starts an agent that treats the
+**Acceptance:** `maquinista spawn --runner opencode --role planner` starts an agent that treats the
 planner prompt as behavioral context, not as a task to complete.
 
 ---
@@ -88,7 +88,7 @@ if !r.HasSessionHook() {
 This lets bot handlers route Telegram messages to OpenCode windows the same way they do for
 Claude Code, using the agent ID as the stable key.
 
-**Acceptance:** After `volta spawn --runner opencode`, `volta status` shows the agent; a Telegram
+**Acceptance:** After `maquinista spawn --runner opencode`, `maquinista status` shows the agent; a Telegram
 message sent to its topic reaches the correct tmux window.
 
 ---
@@ -138,7 +138,7 @@ func (o *OpenCodeRunner) NonInteractiveArgs(prompt string, cfg Config) []string 
 
 Same pattern as `ClaudeRunner` defaulting to `"sonnet"`.
 
-**Acceptance:** `volta run --runner opencode` without explicit model uses a predictable model.
+**Acceptance:** `maquinista run --runner opencode` without explicit model uses a predictable model.
 
 ---
 

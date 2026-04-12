@@ -8,10 +8,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/otaviocarvalho/volta/internal/agent"
-	"github.com/otaviocarvalho/volta/internal/db"
-	"github.com/otaviocarvalho/volta/internal/runner"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/agent"
+	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // Config holds orchestrator configuration.

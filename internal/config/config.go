@@ -19,7 +19,7 @@ type Config struct {
 	ApprovalsTopicID    int64
 
 	// Directories and sessions
-	VoltaDir        string
+	MaquinistaDir        string
 	TmuxSessionName string
 
 	// Agent settings
@@ -29,7 +29,7 @@ type Config struct {
 	MonitorPollInterval float64
 
 	// CLI binary path (for bridge)
-	VoltaBin string
+	MaquinistaBin string
 
 	// Database
 	DatabaseURL string
@@ -73,18 +73,18 @@ func Load(envFile ...string) (*Config, error) {
 		}
 	}
 
-	dir := os.Getenv("VOLTA_DIR")
+	dir := os.Getenv("MAQUINISTA_DIR")
 	if dir == "" {
-		dir = "~/.volta"
+		dir = "~/.maquinista"
 	}
 	dir = expandHome(dir)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return nil, fmt.Errorf("creating volta dir: %w", err)
+		return nil, fmt.Errorf("creating maquinista dir: %w", err)
 	}
 
 	sessionName := os.Getenv("TMUX_SESSION_NAME")
 	if sessionName == "" {
-		sessionName = "volta"
+		sessionName = "maquinista"
 	}
 
 	claudeCmd := os.Getenv("CLAUDE_COMMAND")
@@ -92,9 +92,9 @@ func Load(envFile ...string) (*Config, error) {
 		claudeCmd = "claude"
 	}
 
-	voltaBin := os.Getenv("VOLTA_BIN")
-	if voltaBin == "" {
-		voltaBin = "volta"
+	maquinistaBin := os.Getenv("MAQUINISTA_BIN")
+	if maquinistaBin == "" {
+		maquinistaBin = "maquinista"
 	}
 
 	pollInterval := 2.0
@@ -105,23 +105,23 @@ func Load(envFile ...string) (*Config, error) {
 		}
 	}
 
-	scriptsDir := os.Getenv("VOLTA_SCRIPTS_DIR")
+	scriptsDir := os.Getenv("MAQUINISTA_SCRIPTS_DIR")
 
 	var queueTopicID int64
-	if q := os.Getenv("VOLTA_QUEUE_TOPIC_ID"); q != "" {
+	if q := os.Getenv("MAQUINISTA_QUEUE_TOPIC_ID"); q != "" {
 		queueTopicID, _ = strconv.ParseInt(q, 10, 64)
 	}
 
 	var approvalsTopicID int64
-	if a := os.Getenv("VOLTA_APPROVALS_TOPIC_ID"); a != "" {
+	if a := os.Getenv("MAQUINISTA_APPROVALS_TOPIC_ID"); a != "" {
 		approvalsTopicID, _ = strconv.ParseInt(a, 10, 64)
 	}
 
-	defaultProject := os.Getenv("VOLTA_DEFAULT_PROJECT")
+	defaultProject := os.Getenv("MAQUINISTA_DEFAULT_PROJECT")
 
-	plannerPromptPath := os.Getenv("VOLTA_PLANNER_PROMPT")
+	plannerPromptPath := os.Getenv("MAQUINISTA_PLANNER_PROMPT")
 
-	defaultRunner := os.Getenv("VOLTA_DEFAULT_RUNNER")
+	defaultRunner := os.Getenv("MAQUINISTA_DEFAULT_RUNNER")
 	if defaultRunner == "" {
 		defaultRunner = "claude"
 	}
@@ -130,10 +130,10 @@ func Load(envFile ...string) (*Config, error) {
 		TelegramBotToken:    token,
 		AllowedUsers:        users,
 		AllowedGroups:       groups,
-		VoltaDir:            dir,
+		MaquinistaDir:            dir,
 		TmuxSessionName:     sessionName,
 		ClaudeCommand:       claudeCmd,
-		VoltaBin:            voltaBin,
+		MaquinistaBin:            maquinistaBin,
 		MonitorPollInterval: pollInterval,
 		DatabaseURL:         os.Getenv("DATABASE_URL"),
 		ScriptsDir:          scriptsDir,

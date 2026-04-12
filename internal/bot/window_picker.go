@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // windowPickerState holds per-user window picker state.

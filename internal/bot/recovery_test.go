@@ -3,7 +3,7 @@ package bot
 import (
 	"testing"
 
-	"github.com/otaviocarvalho/volta/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
 func TestReResolveWindow(t *testing.T) {

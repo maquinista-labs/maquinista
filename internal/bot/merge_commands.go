@@ -9,8 +9,8 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/git"
-	"github.com/otaviocarvalho/volta/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/git"
+	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
 // handleMergeCommand attempts a squash merge; on conflict, spawns a Claude topic.

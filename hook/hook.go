@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/otaviocarvalho/volta/internal/state"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // hookInput is the JSON structure read from stdin by the hook.
@@ -24,7 +24,7 @@ var uuidRegex = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f
 
 // Run executes the SessionStart hook logic:
 // reads stdin JSON, gets tmux pane info, writes to session_map.json.
-// Does NOT import config package — uses VOLTA_DIR env or ~/.volta.
+// Does NOT import config package — uses MAQUINISTA_DIR env or ~/.maquinista.
 func Run() error {
 	var input hookInput
 	if err := json.NewDecoder(os.Stdin).Decode(&input); err != nil {
@@ -63,14 +63,14 @@ func Run() error {
 	windowName := parts[2]
 	key := sessionName + ":" + windowID
 
-	// Resolve volta dir
-	dir := os.Getenv("VOLTA_DIR")
+	// Resolve maquinista dir
+	dir := os.Getenv("MAQUINISTA_DIR")
 	if dir == "" {
-		dir = "~/.volta"
+		dir = "~/.maquinista"
 	}
 	dir = expandHome(dir)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("creating volta dir: %w", err)
+		return fmt.Errorf("creating maquinista dir: %w", err)
 	}
 
 	sessionMapPath := filepath.Join(dir, "session_map.json")
@@ -90,7 +90,7 @@ func EnsureInstalled() error {
 	return install(false)
 }
 
-// Install adds the volta hook to ~/.claude/settings.json.
+// Install adds the maquinista hook to ~/.claude/settings.json.
 func Install() error {
 	return install(true)
 }
@@ -137,7 +137,7 @@ func install(verbose bool) error {
 
 	sessionStart, _ := hooks["SessionStart"].([]any)
 
-	// Remove any invalid flat-format entries containing "volta hook"
+	// Remove any invalid flat-format entries containing "maquinista hook"
 	// (these break Claude Code's settings parser and cause all settings to be skipped)
 	cleaned := removeInvalidEntries(sessionStart)
 
@@ -229,13 +229,13 @@ func isHookInstalled(settings map[string]any, command string) bool {
 				continue
 			}
 			cmd, _ := hm["command"].(string)
-			if strings.Contains(cmd, "volta hook") {
+			if strings.Contains(cmd, "maquinista hook") {
 				return true
 			}
 		}
 		// Old format: {type, command, timeout} directly
 		cmd, _ := m["command"].(string)
-		if strings.Contains(cmd, "volta hook") {
+		if strings.Contains(cmd, "maquinista hook") {
 			return true
 		}
 	}

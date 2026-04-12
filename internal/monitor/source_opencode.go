@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/otaviocarvalho/volta/internal/config"
-	"github.com/otaviocarvalho/volta/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/state"
 	_ "modernc.org/sqlite"
 )
 
@@ -83,7 +83,7 @@ func (o *OpenCodeSource) resetDB() {
 }
 
 func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
-	sessionMapPath := filepath.Join(o.config.VoltaDir, "session_map.json")
+	sessionMapPath := filepath.Join(o.config.MaquinistaDir, "session_map.json")
 	sm, err := state.LoadSessionMap(sessionMapPath)
 	if err != nil {
 		return nil

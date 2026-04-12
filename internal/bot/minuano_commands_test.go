@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/otaviocarvalho/volta/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/config"
 )
 
 func TestBuildMinuanoEnv(t *testing.T) {
@@ -28,7 +28,7 @@ func TestBuildMinuanoEnv(t *testing.T) {
 		if env["DATABASE_URL"] != "postgres://localhost/minuano" {
 			t.Errorf("DATABASE_URL = %q", env["DATABASE_URL"])
 		}
-		if env["AGENT_ID"] != "volta-mywindow" {
+		if env["AGENT_ID"] != "maquinista-mywindow" {
 			t.Errorf("AGENT_ID = %q", env["AGENT_ID"])
 		}
 		if _, ok := env["PATH"]; ok {

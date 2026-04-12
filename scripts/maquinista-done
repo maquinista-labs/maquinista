@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+# Run tests. On pass: mark done. On fail: write failure to context, reset to ready.
+set -euo pipefail
+
+TASK_ID="${1:?Usage: maquinista-done <id> <summary>}"
+SUMMARY="${2:?Usage: maquinista-done <id> <summary>}"
+AGENT_ID="${AGENT_ID:?AGENT_ID not set}"
+DB="${DATABASE_URL:?DATABASE_URL not set}"
+
+# Resolve test command: from task metadata, env, or default
+TEST_CMD=$(psql "$DB" -t -A -c \
+  "SELECT COALESCE(metadata->>'test_cmd', 'go test ./...') FROM tasks WHERE id='$TASK_ID'")
+TEST_CMD="${MINUANO_TEST_CMD:-$TEST_CMD}"
+
+echo "▶ Running: $TEST_CMD"
+TEST_OUTPUT=$($TEST_CMD 2>&1) && EXIT_CODE=0 || EXIT_CODE=$?
+
+if [ "$EXIT_CODE" -eq 0 ]; then
+  # Safely quote the summary for SQL
+  QUOTED_SUMMARY=$(psql "$DB" -t -A -c "SELECT quote_literal(E'$(printf '%s' "$SUMMARY" | sed "s/'/''/g")')")
+
+  psql "$DB" -c "
+    WITH ctx AS (
+      INSERT INTO task_context (task_id, agent_id, kind, content)
+      VALUES ('$TASK_ID', '$AGENT_ID', 'result', $QUOTED_SUMMARY)
+    )
+    UPDATE tasks SET status='done', done_at=NOW(), claimed_by=NULL, claimed_at=NULL
+    WHERE id='$TASK_ID' AND claimed_by='$AGENT_ID';
+
+    UPDATE agents SET task_id=NULL, status='idle', last_seen=NOW()
+    WHERE id='$AGENT_ID';
+  "
+  echo "✓ Done: $TASK_ID"
+
+  # Worktree mode: auto-commit and enqueue for merge.
+  if [ -n "${WORKTREE_DIR:-}" ] && [ -n "${BRANCH:-}" ]; then
+    git -C "$WORKTREE_DIR" add -A
+    if ! git -C "$WORKTREE_DIR" diff --cached --quiet 2>/dev/null; then
+      COMMIT_SHA=$(git -C "$WORKTREE_DIR" commit -m "maquinista: $TASK_ID — $SUMMARY" --quiet && \
+                   git -C "$WORKTREE_DIR" rev-parse HEAD)
+      BASE_BRANCH="${MINUANO_BASE_BRANCH:-main}"
+      psql "$DB" -c "
+        INSERT INTO merge_queue (task_id, agent_id, branch, worktree_dir, base_branch, commit_sha)
+        VALUES ('$TASK_ID', '$AGENT_ID', '$BRANCH', '$WORKTREE_DIR', '$BASE_BRANCH', '$COMMIT_SHA');
+      "
+      echo "✓ Committed $COMMIT_SHA on $BRANCH, enqueued for merge into $BASE_BRANCH"
+    fi
+  fi
+else
+  ATTEMPT=$(psql "$DB" -t -A -c "SELECT attempt FROM tasks WHERE id='$TASK_ID'")
+  MAX=$(psql "$DB" -t -A -c "SELECT max_attempts FROM tasks WHERE id='$TASK_ID'")
+  TRUNCATED=$(echo "$TEST_OUTPUT" | tail -80)
+
+  # Safely quote the failure content
+  QUOTED_CONTENT=$(psql "$DB" -t -A -c "SELECT quote_literal(E'$(printf '%s' "Attempt $ATTEMPT/$MAX failed. Command: $TEST_CMD
+
+$TRUNCATED" | sed "s/'/''/g")')")
+
+  psql "$DB" -c "
+    INSERT INTO task_context (task_id, agent_id, kind, content)
+    VALUES ('$TASK_ID', '$AGENT_ID', 'test_failure', $QUOTED_CONTENT);
+  "
+
+  if [ "$ATTEMPT" -ge "$MAX" ]; then
+    psql "$DB" -c "UPDATE tasks SET status='failed' WHERE id='$TASK_ID';"
+    echo "✗ Failed after $ATTEMPT attempts: $TASK_ID"
+    exit 1
+  else
+    psql "$DB" -c "
+      UPDATE tasks SET status='ready', claimed_by=NULL, claimed_at=NULL
+      WHERE id='$TASK_ID' AND claimed_by='$AGENT_ID';
+
+      UPDATE agents SET task_id=NULL, status='idle', last_seen=NOW()
+      WHERE id='$AGENT_ID';
+    "
+    echo "⚠ Tests failed (attempt $ATTEMPT/$MAX). Task reset to ready."
+    exit 1
+  fi
+fi

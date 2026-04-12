@@ -4,7 +4,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/otaviocarvalho/volta/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/db"
 )
 
 // OrchestratorStatus holds a snapshot of the orchestrator's state.

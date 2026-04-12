@@ -10,8 +10,8 @@ import (
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/monitor"
-	"github.com/otaviocarvalho/volta/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/monitor"
+	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
 const entriesPerPage = 10
@@ -93,7 +93,7 @@ func (b *Bot) handleHistoryCB(cq *tgbotapi.CallbackQuery) {
 
 // findJSONLForWindow finds the JSONL transcript file for a window.
 func (b *Bot) findJSONLForWindow(windowID string) string {
-	sessionMapPath := filepath.Join(b.config.VoltaDir, "session_map.json")
+	sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
 	sm, err := state.LoadSessionMap(sessionMapPath)
 	if err != nil {
 		return ""

@@ -8,9 +8,9 @@ import (
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/git"
-	"github.com/otaviocarvalho/volta/internal/state"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/git"
+	"github.com/maquinista-labs/maquinista/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // handleCommand routes slash commands.
@@ -123,7 +123,7 @@ func (b *Bot) resetSessionTracking(windowID string) {
 	// The monitor_state.json offset will be reset when the new JSONL file appears
 	if b.monitorState != nil {
 		// Find the session key that matches this window
-		sessionMapPath := filepath.Join(b.config.VoltaDir, "session_map.json")
+		sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
 		sm, err := loadSessionMapForReset(sessionMapPath)
 		if err != nil {
 			return
@@ -244,7 +244,7 @@ func (b *Bot) handleTopicClose(msg *tgbotapi.Message) {
 
 		// Remove monitor state if available
 		if b.monitorState != nil {
-			sessionMapPath := filepath.Join(b.config.VoltaDir, "session_map.json")
+			sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
 			sm, err := loadSessionMapForReset(sessionMapPath)
 			if err == nil {
 				for key := range sm {

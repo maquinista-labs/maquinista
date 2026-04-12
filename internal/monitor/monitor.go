@@ -9,10 +9,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/otaviocarvalho/volta/internal/config"
-	"github.com/otaviocarvalho/volta/internal/queue"
-	"github.com/otaviocarvalho/volta/internal/render"
-	"github.com/otaviocarvalho/volta/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/queue"
+	"github.com/maquinista-labs/maquinista/internal/render"
+	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
 // ObservationLookup resolves a tmux window to additional observing topics.
@@ -68,7 +68,7 @@ func (m *Monitor) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			m.monitorState.ForceSave(filepath.Join(m.config.VoltaDir, "monitor_state.json"))
+			m.monitorState.ForceSave(filepath.Join(m.config.MaquinistaDir, "monitor_state.json"))
 			log.Println("Session monitor stopped.")
 			return
 		case <-ticker.C:
@@ -141,7 +141,7 @@ func (m *Monitor) poll() {
 	}
 
 	// Periodically save state
-	monitorStatePath := filepath.Join(m.config.VoltaDir, "monitor_state.json")
+	monitorStatePath := filepath.Join(m.config.MaquinistaDir, "monitor_state.json")
 	m.monitorState.SaveIfDirty(monitorStatePath)
 }
 

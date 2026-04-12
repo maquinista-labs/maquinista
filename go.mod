@@ -1,4 +1,4 @@
-module github.com/otaviocarvalho/volta
+module github.com/maquinista-labs/maquinista
 
 go 1.24.0
 

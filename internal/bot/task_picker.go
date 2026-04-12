@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/bridge"
+	"github.com/maquinista-labs/maquinista/internal/bridge"
 )
 
 // taskPickerState holds state for an active task picker inline keyboard.

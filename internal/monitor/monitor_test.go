@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/otaviocarvalho/volta/internal/config"
-	"github.com/otaviocarvalho/volta/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
 func TestWindowIDFromSessionKey(t *testing.T) {
@@ -32,7 +32,7 @@ func TestWindowIDFromSessionKey(t *testing.T) {
 
 func TestMonitorNew(t *testing.T) {
 	cfg := &config.Config{
-		VoltaDir:            t.TempDir(),
+		MaquinistaDir:            t.TempDir(),
 		MonitorPollInterval: 2.0,
 	}
 	st := state.NewState()
@@ -53,7 +53,7 @@ func TestClaudeSource_HasFileChanged(t *testing.T) {
 	os.WriteFile(path, []byte(`{}`), 0o644)
 
 	cfg := &config.Config{
-		VoltaDir:            dir,
+		MaquinistaDir:            dir,
 		MonitorPollInterval: 2.0,
 	}
 	cs := NewClaudeSource(cfg, state.NewState(), state.NewMonitorState())
@@ -80,7 +80,7 @@ func TestClaudeSource_HasFileChanged(t *testing.T) {
 
 func TestClaudeSource_HasFileChanged_NonExistent(t *testing.T) {
 	cfg := &config.Config{
-		VoltaDir:            t.TempDir(),
+		MaquinistaDir:            t.TempDir(),
 		MonitorPollInterval: 2.0,
 	}
 	cs := NewClaudeSource(cfg, state.NewState(), state.NewMonitorState())
@@ -98,7 +98,7 @@ func TestClaudeSource_ReadNewEntries_Truncation(t *testing.T) {
 	os.WriteFile(path, []byte(`{"type":"assistant","message":{"content":"hello"}}`+"\n"), 0o644)
 
 	cfg := &config.Config{
-		VoltaDir:            dir,
+		MaquinistaDir:            dir,
 		MonitorPollInterval: 2.0,
 	}
 	ms := state.NewMonitorState()
@@ -134,7 +134,7 @@ func TestClaudeSource_ReadNewEntries_Truncation(t *testing.T) {
 func TestClaudeSource_DiscoverSessions_RemovesStale(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
-		VoltaDir:            dir,
+		MaquinistaDir:            dir,
 		MonitorPollInterval: 2.0,
 	}
 	ms := state.NewMonitorState()
@@ -175,7 +175,7 @@ func TestClaudeSource_SearchSessionsIndex(t *testing.T) {
 	os.WriteFile(filepath.Join(projectDir, "test-session-id.jsonl"), []byte(`{}`), 0o644)
 
 	cfg := &config.Config{
-		VoltaDir:            t.TempDir(),
+		MaquinistaDir:            t.TempDir(),
 		MonitorPollInterval: 2.0,
 	}
 	cs := NewClaudeSource(cfg, state.NewState(), state.NewMonitorState())
@@ -196,7 +196,7 @@ func TestClaudeSource_SearchJSONLFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, "other.jsonl"), []byte(`{}`), 0o644)
 
 	cfg := &config.Config{
-		VoltaDir:            t.TempDir(),
+		MaquinistaDir:            t.TempDir(),
 		MonitorPollInterval: 2.0,
 	}
 	cs := NewClaudeSource(cfg, state.NewState(), state.NewMonitorState())

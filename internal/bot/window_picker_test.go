@@ -3,7 +3,7 @@ package bot
 import (
 	"testing"
 
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 func TestBuildWindowPicker_SingleWindow(t *testing.T) {

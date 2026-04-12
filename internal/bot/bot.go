@@ -9,12 +9,12 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/otaviocarvalho/volta/internal/config"
-	"github.com/otaviocarvalho/volta/internal/bridge"
-	"github.com/otaviocarvalho/volta/internal/queue"
-	"github.com/otaviocarvalho/volta/internal/runner"
-	"github.com/otaviocarvalho/volta/internal/state"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/bridge"
+	"github.com/maquinista-labs/maquinista/internal/queue"
+	"github.com/maquinista-labs/maquinista/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // Bot is the main Telegram bot instance.
@@ -63,7 +63,7 @@ func New(cfg *config.Config) (*Bot, error) {
 	log.Printf("Authorized as @%s", api.Self.UserName)
 
 	// Load state
-	statePath := filepath.Join(cfg.VoltaDir, "state.json")
+	statePath := filepath.Join(cfg.MaquinistaDir, "state.json")
 	st, err := state.Load(statePath)
 	if err != nil {
 		return nil, fmt.Errorf("loading state: %w", err)
@@ -86,7 +86,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		taskPickerStates:   make(map[int64]*taskPickerState),
 		pendingInputs:      make(map[int64]*pendingInput),
 		planStates:         make(map[int64]*planState),
-		minuanoBridge:      bridge.NewBridge(cfg.VoltaBin, cfg.DatabaseURL),
+		minuanoBridge:      bridge.NewBridge(cfg.MaquinistaBin, cfg.DatabaseURL),
 	}, nil
 }
 
@@ -227,7 +227,7 @@ func (b *Bot) handleCallback(cq *tgbotapi.CallbackQuery) {
 
 // saveState persists the current state to disk.
 func (b *Bot) saveState() {
-	path := filepath.Join(b.config.VoltaDir, "state.json")
+	path := filepath.Join(b.config.MaquinistaDir, "state.json")
 	if err := b.state.Save(path); err != nil {
 		log.Printf("Error saving state: %v", err)
 	}

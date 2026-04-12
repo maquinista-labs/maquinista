@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/otaviocarvalho/volta/internal/db"
-	"github.com/otaviocarvalho/volta/internal/git"
-	"github.com/otaviocarvalho/volta/internal/runner"
-	"github.com/otaviocarvalho/volta/internal/state"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/git"
+	"github.com/maquinista-labs/maquinista/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // Agent represents a running agent instance.
@@ -77,8 +77,8 @@ func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath st
 		return nil, fmt.Errorf("finding repo root: %w", err)
 	}
 
-	worktreeDir := filepath.Join(repoRoot, ".volta", "worktrees", agentID)
-	branch := "volta/" + agentID
+	worktreeDir := filepath.Join(repoRoot, ".maquinista", "worktrees", agentID)
+	branch := "maquinista/" + agentID
 
 	if err := git.WorktreeAdd(repoRoot, worktreeDir, branch); err != nil {
 		return nil, fmt.Errorf("creating worktree: %w", err)
@@ -135,9 +135,9 @@ func writeSessionMapFallback(tmuxSession, agentID, workDir string) {
 		return // tmux not available or window not found; skip silently
 	}
 
-	dir := os.Getenv("VOLTA_DIR")
+	dir := os.Getenv("MAQUINISTA_DIR")
 	if dir == "" {
-		dir = "~/.volta"
+		dir = "~/.maquinista"
 	}
 	if strings.HasPrefix(dir, "~/") {
 		home, err := os.UserHomeDir()

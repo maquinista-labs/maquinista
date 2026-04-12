@@ -6,8 +6,8 @@ import (
 	"strconv"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/state"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // ReconcileState cleans up stale bindings by checking against live tmux windows.
@@ -233,7 +233,7 @@ func cleanupDeadWindow(b *Bot, windowID string) {
 	b.state.RemoveWindowState(windowID)
 
 	// Remove monitor state and session_map entries
-	sessionMapPath := filepath.Join(b.config.VoltaDir, "session_map.json")
+	sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
 	sm, err := state.LoadSessionMap(sessionMapPath)
 	if err == nil {
 		for key := range sm {
@@ -268,7 +268,7 @@ func cleanStaleProjects(s *state.State) {
 
 // cleanStaleSessionMap removes session_map entries for dead windows.
 func (b *Bot) cleanStaleSessionMap(liveIDs map[string]bool) {
-	sessionMapPath := filepath.Join(b.config.VoltaDir, "session_map.json")
+	sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
 	sm, err := state.LoadSessionMap(sessionMapPath)
 	if err != nil {
 		return
@@ -289,7 +289,7 @@ func (b *Bot) cleanStaleSessionMap(liveIDs map[string]bool) {
 
 // saveStateUnlocked saves state (caller must hold b.mu).
 func (b *Bot) saveStateUnlocked() {
-	path := filepath.Join(b.config.VoltaDir, "state.json")
+	path := filepath.Join(b.config.MaquinistaDir, "state.json")
 	if err := b.state.Save(path); err != nil {
 		log.Printf("Error saving state: %v", err)
 	}

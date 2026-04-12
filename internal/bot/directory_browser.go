@@ -11,9 +11,9 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/runner"
-	"github.com/otaviocarvalho/volta/internal/state"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 const dirsPerPage = 6
@@ -263,7 +263,7 @@ func (b *Bot) createWindowForDir(dir string, userID int64, chatID int64, threadI
 	// Kill the placeholder _init window now that we have a real window
 	tmux.CleanupInitWindow(b.config.TmuxSessionName)
 
-	sessionMapPath := filepath.Join(b.config.VoltaDir, "session_map.json")
+	sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
 	sessionKey := b.config.TmuxSessionName + ":" + windowID
 
 	r := b.DefaultRunner()

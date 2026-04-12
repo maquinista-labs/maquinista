@@ -8,9 +8,9 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/otaviocarvalho/volta/internal/agent"
-	"github.com/otaviocarvalho/volta/internal/db"
-	"github.com/otaviocarvalho/volta/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/agent"
+	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/runner"
 )
 
 // handleAgentListCommand shows all registered agents.

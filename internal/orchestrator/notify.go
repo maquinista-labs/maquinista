@@ -3,7 +3,7 @@ package orchestrator
 import (
 	"context"
 
-	"github.com/otaviocarvalho/volta/internal/listener"
+	"github.com/maquinista-labs/maquinista/internal/listener"
 )
 
 // NotifyBridge bridges listener.TaskEvent to a simple signal channel

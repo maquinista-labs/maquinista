@@ -5,7 +5,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/otaviocarvalho/volta/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/db"
 )
 
 func TestTruncate(t *testing.T) {

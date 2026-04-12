@@ -1,4 +1,4 @@
-# Volta
+# Maquinista
 
 Unified agent orchestration platform. Combines Telegram bot management, pull-based task coordination via PostgreSQL, and pluggable agent runners into a single CLI.
 
@@ -32,14 +32,14 @@ Create a `.env` file in the project root:
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 ALLOWED_USERS=YOUR_USER_ID
 ALLOWED_GROUPS=-100XXXXXXXXXX
-DATABASE_URL=postgres://volta:volta@localhost:5432/voltadb?sslmode=disable
+DATABASE_URL=postgres://maquinista:maquinista@localhost:5432/maquinistadb?sslmode=disable
 
 # Optional
-VOLTA_DIR=~/.volta
-TMUX_SESSION_NAME=volta
-VOLTA_DEFAULT_PROJECT=myproject
-# VOLTA_QUEUE_TOPIC_ID=123       # topic ID for queue status notifications
-# VOLTA_APPROVALS_TOPIC_ID=456   # topic ID for approval requests
+MAQUINISTA_DIR=~/.maquinista
+TMUX_SESSION_NAME=maquinista
+MAQUINISTA_DEFAULT_PROJECT=myproject
+# MAQUINISTA_QUEUE_TOPIC_ID=123       # topic ID for queue status notifications
+# MAQUINISTA_APPROVALS_TOPIC_ID=456   # topic ID for approval requests
 ```
 
 ### 3. Start Database
@@ -48,7 +48,7 @@ VOLTA_DEFAULT_PROJECT=myproject
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-This starts PostgreSQL 16 on port 5432 with credentials `volta:volta` and database `voltadb`.
+This starts PostgreSQL 16 on port 5432 with credentials `maquinista:maquinista` and database `maquinistadb`.
 
 To also start pgAdmin (available at http://localhost:5050):
 
@@ -60,28 +60,28 @@ docker compose -f docker/docker-compose.yml --profile debug up -d
 
 ```bash
 make build
-./volta migrate
+./maquinista migrate
 ```
 
 ### 5. Run
 
 ```bash
 # Start Telegram bot
-./volta start
+./maquinista start
 
 # Start Telegram bot + autonomous orchestrator
-./volta start --orchestrate --orchestrate-project myproject
+./maquinista start --orchestrate --orchestrate-project myproject
 
-# Stop Volta (kills bot, tmux session, DB agents)
-./volta stop
+# Stop Maquinista (kills bot, tmux session, DB agents)
+./maquinista stop
 
 # Standalone orchestrator (no Telegram)
-./volta orchestrate --project myproject --max-agents 3
+./maquinista orchestrate --project myproject --max-agents 3
 ```
 
 ## How It Works
 
-Each Telegram **topic** maps to one **tmux window** running a Claude Code session. Send a message in a topic and Volta spawns an agent, forwards your text, and streams responses back.
+Each Telegram **topic** maps to one **tmux window** running a Claude Code session. Send a message in a topic and Maquinista spawns an agent, forwards your text, and streams responses back.
 
 For automated work, the **orchestrator** polls the task queue, spawns agents for ready tasks, and reconciles dead sessions. Tasks flow through: `draft` -> `ready` -> `claimed` -> `done`.
 
@@ -108,26 +108,26 @@ For automated work, the **orchestrator** polls the task queue, spawns agents for
 ### CLI
 
 ```
-volta start          Start Telegram bot daemon
-volta stop           Stop Volta and clean up resources
-volta orchestrate    Run autonomous orchestrator loop
-volta run            Spawn agents in tmux
-volta spawn <name>   Spawn a single named agent
-volta status         Table view of all tasks
-volta tree           Dependency tree with status symbols
-volta add            Create a task
-volta show <id>      Print task spec + context
-volta spec sync      Sync spec files to database
-volta spec validate  Validate spec files
-volta migrate        Run database migrations
-volta agents         Show running agents
-volta logs <agent>   Capture agent's tmux output
-volta kill <agent>   Kill agent and release tasks
-volta merge          Process merge queue
-volta attach         Attach to tmux session
-volta search <q>     Full-text search across task context
-volta prompt auto    Generate auto-mode prompt
-volta prompt single  Generate single-task prompt
+maquinista start          Start Telegram bot daemon
+maquinista stop           Stop Maquinista and clean up resources
+maquinista orchestrate    Run autonomous orchestrator loop
+maquinista run            Spawn agents in tmux
+maquinista spawn <name>   Spawn a single named agent
+maquinista status         Table view of all tasks
+maquinista tree           Dependency tree with status symbols
+maquinista add            Create a task
+maquinista show <id>      Print task spec + context
+maquinista spec sync      Sync spec files to database
+maquinista spec validate  Validate spec files
+maquinista migrate        Run database migrations
+maquinista agents         Show running agents
+maquinista logs <agent>   Capture agent's tmux output
+maquinista kill <agent>   Kill agent and release tasks
+maquinista merge          Process merge queue
+maquinista attach         Attach to tmux session
+maquinista search <q>     Full-text search across task context
+maquinista prompt auto    Generate auto-mode prompt
+maquinista prompt single  Generate single-task prompt
 ```
 
 ### Agent Scripts
@@ -136,11 +136,11 @@ These are available in agent tmux sessions via `$PATH`:
 
 | Script | Description |
 |--------|-------------|
-| `volta-claim` | Claim next ready task from queue |
-| `volta-done <id> "<summary>"` | Run tests, mark task done |
-| `volta-pick <id>` | Claim a specific task by ID |
-| `volta-observe <id> "<note>"` | Record an observation |
-| `volta-handoff <id> "<note>"` | Record handoff before long operations |
+| `maquinista-claim` | Claim next ready task from queue |
+| `maquinista-done <id> "<summary>"` | Run tests, mark task done |
+| `maquinista-pick <id>` | Claim a specific task by ID |
+| `maquinista-observe <id> "<note>"` | Record an observation |
+| `maquinista-handoff <id> "<note>"` | Record handoff before long operations |
 
 ## Task Specs
 
@@ -162,12 +162,12 @@ Detailed specification goes here.
 Sync to database:
 
 ```bash
-volta spec sync --dir .specs/ --project myproject --release
+maquinista spec sync --dir .specs/ --project myproject --release
 ```
 
 ## Agent Runners
 
-Volta supports pluggable agent runners via the `--runner` flag:
+Maquinista supports pluggable agent runners via the `--runner` flag:
 
 | Runner | Description |
 |--------|-------------|
@@ -176,14 +176,14 @@ Volta supports pluggable agent runners via the `--runner` flag:
 | `custom` | Arbitrary binary with Go template commands |
 
 ```bash
-volta run --runner opencode --agents 2
-volta orchestrate --project myproject --runner claude
+maquinista run --runner opencode --agents 2
+maquinista orchestrate --project myproject --runner claude
 ```
 
 ## Project Structure
 
 ```
-cmd/volta/          CLI entry point and all subcommands
+cmd/maquinista/          CLI entry point and all subcommands
 internal/
   agent/            Agent lifecycle (spawn, kill, heartbeat)
   bot/              Telegram bot handlers and UI
@@ -202,6 +202,6 @@ internal/
   state/            Persistent state management
   tmux/             tmux session/window management
   tui/              Terminal UI components
-scripts/            Agent shell scripts (volta-claim, volta-done, etc.)
+scripts/            Agent shell scripts (maquinista-claim, maquinista-done, etc.)
 docker/             Docker Compose for PostgreSQL
 ```

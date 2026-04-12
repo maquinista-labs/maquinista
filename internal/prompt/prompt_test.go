@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/otaviocarvalho/volta/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/db"
 )
 
 func TestBuildSinglePrompt(t *testing.T) {
@@ -26,8 +26,8 @@ func TestBuildSinglePrompt(t *testing.T) {
 	if !strings.Contains(result, "Do the thing.") {
 		t.Error("missing body")
 	}
-	if !strings.Contains(result, "volta-done") {
-		t.Error("missing volta-done instruction")
+	if !strings.Contains(result, "maquinista-done") {
+		t.Error("missing maquinista-done instruction")
 	}
 }
 
@@ -37,8 +37,8 @@ func TestBuildAutoPrompt(t *testing.T) {
 	if !strings.Contains(result, "myproject") {
 		t.Error("missing project name")
 	}
-	if !strings.Contains(result, "volta-claim") {
-		t.Error("missing volta-claim instruction")
+	if !strings.Contains(result, "maquinista-claim") {
+		t.Error("missing maquinista-claim instruction")
 	}
 	if !strings.Contains(result, "Auto Mode") {
 		t.Error("missing Auto Mode header")

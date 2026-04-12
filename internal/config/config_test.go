@@ -9,7 +9,7 @@ import (
 func clearEnv() {
 	for _, key := range []string{
 		"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "ALLOWED_GROUPS",
-		"VOLTA_DIR", "TMUX_SESSION_NAME", "CLAUDE_COMMAND",
+		"MAQUINISTA_DIR", "TMUX_SESSION_NAME", "CLAUDE_COMMAND",
 		"MONITOR_POLL_INTERVAL", "DATABASE_URL",
 	} {
 		os.Unsetenv(key)
@@ -39,7 +39,7 @@ func TestLoad_Defaults(t *testing.T) {
 	tmpDir := t.TempDir()
 	os.Setenv("TELEGRAM_BOT_TOKEN", "test-token")
 	os.Setenv("ALLOWED_USERS", "123,456")
-	os.Setenv("VOLTA_DIR", tmpDir)
+	os.Setenv("MAQUINISTA_DIR", tmpDir)
 
 	cfg, err := Load()
 	if err != nil {
@@ -52,8 +52,8 @@ func TestLoad_Defaults(t *testing.T) {
 	if len(cfg.AllowedUsers) != 2 || cfg.AllowedUsers[0] != 123 || cfg.AllowedUsers[1] != 456 {
 		t.Errorf("users = %v, want [123, 456]", cfg.AllowedUsers)
 	}
-	if cfg.TmuxSessionName != "volta" {
-		t.Errorf("session = %q, want %q", cfg.TmuxSessionName, "volta")
+	if cfg.TmuxSessionName != "maquinista" {
+		t.Errorf("session = %q, want %q", cfg.TmuxSessionName, "maquinista")
 	}
 	if cfg.ClaudeCommand != "claude" {
 		t.Errorf("claude command = %q, want %q", cfg.ClaudeCommand, "claude")
@@ -69,7 +69,7 @@ func TestLoad_AllowedGroups(t *testing.T) {
 	os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
 	os.Setenv("ALLOWED_USERS", "1")
 	os.Setenv("ALLOWED_GROUPS", "-100123,-100456")
-	os.Setenv("VOLTA_DIR", tmpDir)
+	os.Setenv("MAQUINISTA_DIR", tmpDir)
 
 	cfg, err := Load()
 	if err != nil {
@@ -85,11 +85,11 @@ func TestLoad_CustomValues(t *testing.T) {
 	tmpDir := t.TempDir()
 	os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
 	os.Setenv("ALLOWED_USERS", "1")
-	os.Setenv("VOLTA_DIR", tmpDir)
+	os.Setenv("MAQUINISTA_DIR", tmpDir)
 	os.Setenv("TMUX_SESSION_NAME", "mysess")
 	os.Setenv("CLAUDE_COMMAND", "/usr/bin/claude")
 	os.Setenv("MONITOR_POLL_INTERVAL", "5.0")
-	os.Setenv("DATABASE_URL", "postgres://localhost/volta")
+	os.Setenv("DATABASE_URL", "postgres://localhost/maquinista")
 
 	cfg, err := Load()
 	if err != nil {
@@ -104,24 +104,24 @@ func TestLoad_CustomValues(t *testing.T) {
 	if cfg.MonitorPollInterval != 5.0 {
 		t.Errorf("interval = %f", cfg.MonitorPollInterval)
 	}
-	if cfg.DatabaseURL != "postgres://localhost/volta" {
+	if cfg.DatabaseURL != "postgres://localhost/maquinista" {
 		t.Errorf("db = %q", cfg.DatabaseURL)
 	}
 }
 
-func TestLoad_CreatesVoltaDir(t *testing.T) {
+func TestLoad_CreatesMaquinistaDir(t *testing.T) {
 	clearEnv()
 	tmpDir := filepath.Join(t.TempDir(), "subdir")
 	os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
 	os.Setenv("ALLOWED_USERS", "1")
-	os.Setenv("VOLTA_DIR", tmpDir)
+	os.Setenv("MAQUINISTA_DIR", tmpDir)
 
 	_, err := Load()
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if _, err := os.Stat(tmpDir); os.IsNotExist(err) {
-		t.Error("volta dir was not created")
+		t.Error("maquinista dir was not created")
 	}
 }
 
@@ -129,7 +129,7 @@ func TestLoad_InvalidPollInterval(t *testing.T) {
 	clearEnv()
 	os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
 	os.Setenv("ALLOWED_USERS", "1")
-	os.Setenv("VOLTA_DIR", t.TempDir())
+	os.Setenv("MAQUINISTA_DIR", t.TempDir())
 	os.Setenv("MONITOR_POLL_INTERVAL", "notanumber")
 
 	_, err := Load()
@@ -209,7 +209,7 @@ func TestLoad_FromEnvFile(t *testing.T) {
 	clearEnv()
 	tmpDir := t.TempDir()
 	envFile := filepath.Join(tmpDir, ".env")
-	os.WriteFile(envFile, []byte("TELEGRAM_BOT_TOKEN=file-token\nALLOWED_USERS=42\nVOLTA_DIR="+tmpDir+"\n"), 0644)
+	os.WriteFile(envFile, []byte("TELEGRAM_BOT_TOKEN=file-token\nALLOWED_USERS=42\nMAQUINISTA_DIR="+tmpDir+"\n"), 0644)
 
 	cfg, err := Load(envFile)
 	if err != nil {

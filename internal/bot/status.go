@@ -8,9 +8,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/otaviocarvalho/volta/internal/monitor"
-	"github.com/otaviocarvalho/volta/internal/queue"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/monitor"
+	"github.com/maquinista-labs/maquinista/internal/queue"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // statusKey is a composite key for per-(user, thread) status tracking.

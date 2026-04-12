@@ -181,7 +181,7 @@ SQLite FTS5 for full-text search of session history.
 
 ## 7. Recommended Next Steps
 
-Priority order for extending Minuano/Tramuntana or contributing to Volta:
+Priority order for extending Minuano/Tramuntana or contributing to Maquinista:
 
 ### P0 — High value, low complexity
 

@@ -1,5 +1,5 @@
 # Binary
-volta
+maquinista
 
 # Environment
 .env
@@ -20,8 +20,8 @@ Thumbs.db
 # Go
 vendor/
 
-# Volta runtime
-.volta/
+# Maquinista runtime
+.maquinista/
 
 # Docker volumes
 docker/pgdata/

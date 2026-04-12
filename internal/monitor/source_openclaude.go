@@ -9,8 +9,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/otaviocarvalho/volta/internal/config"
-	"github.com/otaviocarvalho/volta/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
 // OpenClaudeSource implements TranscriptSource for OpenClaude.
@@ -42,7 +42,7 @@ func (o *OpenClaudeSource) Name() string {
 }
 
 func (o *OpenClaudeSource) DiscoverSessions() []ActiveSession {
-	sessionMapPath := filepath.Join(o.config.VoltaDir, "session_map.json")
+	sessionMapPath := filepath.Join(o.config.MaquinistaDir, "session_map.json")
 	sm, err := state.LoadSessionMap(sessionMapPath)
 	if err != nil {
 		return nil

@@ -7,7 +7,7 @@ import (
 	"strings"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/listener"
+	"github.com/maquinista-labs/maquinista/internal/listener"
 )
 
 // ApprovalHandler posts pending_approval tasks to the #approvals topic with inline keyboards.

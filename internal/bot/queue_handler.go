@@ -8,8 +8,8 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/listener"
-	"github.com/otaviocarvalho/volta/internal/bridge"
+	"github.com/maquinista-labs/maquinista/internal/listener"
+	"github.com/maquinista-labs/maquinista/internal/bridge"
 )
 
 // QueueHandler updates a live pinned status board in the #queue topic.

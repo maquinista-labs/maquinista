@@ -9,8 +9,8 @@ import (
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/render"
-	"github.com/otaviocarvalho/volta/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/render"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
 // screenshotState tracks the current screenshot message per (user, thread).

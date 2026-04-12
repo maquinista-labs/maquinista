@@ -1,6 +1,6 @@
-# Volta Execution Plan
+# Maquinista Execution Plan
 
-Derived from `volta_plan.md`. 35 tasks across 5 phases, organized into execution waves that maximize parallelism while respecting dependencies.
+Derived from `maquinista_plan.md`. 35 tasks across 5 phases, organized into execution waves that maximize parallelism while respecting dependencies.
 
 ---
 
@@ -10,7 +10,7 @@ Derived from `volta_plan.md`. 35 tasks across 5 phases, organized into execution
 |------|------------|----------|-----------------|
 | **P1-01** | Initialize Go module, directory skeleton, Makefile, empty cobra root | 10 | Small |
 
-**Deliverable:** `go build ./cmd/volta && ./volta version`
+**Deliverable:** `go build ./cmd/maquinista && ./maquinista version`
 
 ---
 
@@ -20,12 +20,12 @@ All tasks in this wave can run **in parallel**.
 
 | Task | Description | Priority | Est. Complexity |
 |------|------------|----------|-----------------|
-| **P1-02** | Port merged config package (tramuntana base + DB/Volta fields) | 9 | Small |
+| **P1-02** | Port merged config package (tramuntana base + DB/Maquinista fields) | 9 | Small |
 | **P1-03** | Port merged tmux package (tramuntana base + minuano extras) | 9 | Medium |
 | **P1-04** | Port merged git package (tramuntana base + minuano extras) | 9 | Small |
 | **P1-05** | Port state package from tramuntana (wholesale copy) | 8 | Small |
 | **P1-06** | Port database package from minuano (wholesale copy) | 8 | Medium |
-| **P1-12** | Port and rename scripts (minuano-* -> volta-*) | 6 | Small |
+| **P1-12** | Port and rename scripts (minuano-* -> maquinista-*) | 6 | Small |
 | **P1-13** | Port docker and claude directories | 5 | Small |
 
 **Deliverable:** All foundational packages compile independently.
@@ -64,7 +64,7 @@ P1-07, P1-08, P1-10, P1-11 can run **in parallel** (different dependency subsets
 | **P1-14** | Wire up unified CLI with all subcommands | 10 | P1-02 through P1-13 |
 | **P1-15** | End-to-end build verification | 10 | P1-14 |
 
-**Deliverable:** `volta version`, `volta serve --help`, `volta status --help`, `go test ./... && go vet ./...`
+**Deliverable:** `maquinista version`, `maquinista serve --help`, `maquinista status --help`, `go test ./... && go vet ./...`
 
 ---
 
@@ -78,7 +78,7 @@ These two tracks can run **in parallel** since they are independent.
 |------|------------|----------|------------|
 | **P2-01** | Implement spec file parser (YAML frontmatter + markdown body) | 8 | P1-15 |
 | **P2-02** | Implement spec sync logic (diff specs vs DB, create/update) | 8 | P2-01, P1-06 |
-| **P2-03** | Create `volta spec sync` CLI command | 7 | P2-02 |
+| **P2-03** | Create `maquinista spec sync` CLI command | 7 | P2-02 |
 | **P2-04** | Example specs and documentation | 5 | P2-03 |
 
 ### Track B: Agent Runner
@@ -93,7 +93,7 @@ These two tracks can run **in parallel** since they are independent.
 
 P3-02, P3-03, P3-04 can run **in parallel** after P3-01.
 
-**Deliverable (Track A):** `volta spec sync --dir .specs/ --project test` works.
+**Deliverable (Track A):** `maquinista spec sync --dir .specs/ --project test` works.
 **Deliverable (Track B):** Runner interface with 3 implementations + DB migration.
 
 ---
@@ -104,7 +104,7 @@ P3-02, P3-03, P3-04 can run **in parallel** after P3-01.
 |------|------------|----------|------------|
 | **P3-05** | Refactor agent package to use AgentRunner | 8 | P3-02, P1-07 |
 
-**Deliverable:** `volta spawn my-agent --runner claude` and `--runner opencode` both work.
+**Deliverable:** `maquinista spawn my-agent --runner claude` and `--runner opencode` both work.
 
 ---
 
@@ -116,7 +116,7 @@ Sequential chain:
 |------|------------|----------|------------|
 | **P4-01** | Implement core orchestrator loop (poll-dispatch-reconcile) | 8 | P3-05, P1-06, P1-07 |
 | **P4-02** | Add NOTIFY-driven wake-up (channel-based select) | 7 | P4-01, P1-08 |
-| **P4-03** | Create `volta orchestrate` command | 8 | P4-02 |
+| **P4-03** | Create `maquinista orchestrate` command | 8 | P4-02 |
 
 Then in parallel after P4-03:
 
@@ -125,7 +125,7 @@ Then in parallel after P4-03:
 | **P4-04** | Extract shared prompt builders | 7 | P4-03 |
 | **P4-05** | Orchestrator status reporting | 5 | P4-03 |
 
-**Deliverable:** `volta orchestrate --project test --max-agents 2` polls and dispatches.
+**Deliverable:** `maquinista orchestrate --project test --max-agents 2` polls and dispatches.
 
 ---
 
@@ -141,7 +141,7 @@ P5-01 can start as early as Wave 6 (only depends on P1-06):
 | **P5-04** | Orchestrator Telegram notifications | 5 | P5-01, P4-03 |
 | **P5-05** | Combined serve+orchestrate mode | 5 | P5-04 |
 
-**Deliverable:** Topics can observe any agent. `volta serve --orchestrate` runs both.
+**Deliverable:** Topics can observe any agent. `maquinista serve --orchestrate` runs both.
 
 ---
 
@@ -183,7 +183,7 @@ P1-01 -> P1-03 -> P1-07 -> P3-05 -> P4-01 -> P4-02 -> P4-03 -> P5-04 -> P5-05
 
 ## Task Checklist
 
-- [ ] P1-01: Initialize volta Go module and directory skeleton
+- [ ] P1-01: Initialize maquinista Go module and directory skeleton
 - [ ] P1-02: Port merged config package
 - [ ] P1-03: Port merged tmux package
 - [ ] P1-04: Port merged git package
@@ -200,7 +200,7 @@ P1-01 -> P1-03 -> P1-07 -> P3-05 -> P4-01 -> P4-02 -> P4-03 -> P5-04 -> P5-05
 - [ ] P1-15: End-to-end build verification
 - [ ] P2-01: Implement spec file parser
 - [ ] P2-02: Implement spec sync logic
-- [ ] P2-03: Create `volta spec sync` CLI command
+- [ ] P2-03: Create `maquinista spec sync` CLI command
 - [ ] P2-04: Example specs and documentation
 - [ ] P3-01: Define AgentRunner interface and registry
 - [ ] P3-02: Implement Claude Code runner
@@ -210,7 +210,7 @@ P1-01 -> P1-03 -> P1-07 -> P3-05 -> P4-01 -> P4-02 -> P4-03 -> P5-04 -> P5-05
 - [ ] P3-06: Add DB migration for runner metadata
 - [ ] P4-01: Implement core orchestrator loop
 - [ ] P4-02: Add NOTIFY-driven wake-up
-- [ ] P4-03: Create `volta orchestrate` command
+- [ ] P4-03: Create `maquinista orchestrate` command
 - [ ] P4-04: Extract shared prompt builders
 - [ ] P4-05: Orchestrator status reporting
 - [ ] P5-01: Add topic-agent observation model to DB

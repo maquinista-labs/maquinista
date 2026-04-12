@@ -3,7 +3,7 @@ package bot
 import (
 	"testing"
 
-	"github.com/otaviocarvalho/volta/internal/monitor"
+	"github.com/maquinista-labs/maquinista/internal/monitor"
 )
 
 func TestBuildInteractiveKeyboard_Full(t *testing.T) {

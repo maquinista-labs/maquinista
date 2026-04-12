@@ -6,7 +6,7 @@ import (
 	"strconv"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/otaviocarvalho/volta/internal/listener"
+	"github.com/maquinista-labs/maquinista/internal/listener"
 )
 
 // CrashHandler alerts users when a planner session crashes and offers inline reopen.
