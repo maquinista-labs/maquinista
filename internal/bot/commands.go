@@ -91,6 +91,12 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleHookEnableCommand(msg)
 	case "hook_disable":
 		b.handleHookDisableCommand(msg)
+	case "jobs":
+		b.handleJobsCommand(msg)
+	case "hooks":
+		b.handleHooksCommand(msg)
+	case "job_runs":
+		b.handleJobRunsCommand(msg)
 	default:
 		b.reply(msg.Chat.ID, getThreadID(msg), "Unknown command: /"+msg.Command())
 	}

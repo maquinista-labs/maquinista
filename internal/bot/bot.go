@@ -123,6 +123,9 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "hook_register", Description: "Admin: register a webhook"},
 		tgbotapi.BotCommand{Command: "hook_enable", Description: "Admin: enable a webhook"},
 		tgbotapi.BotCommand{Command: "hook_disable", Description: "Admin: disable a webhook"},
+		tgbotapi.BotCommand{Command: "jobs", Description: "List scheduled jobs"},
+		tgbotapi.BotCommand{Command: "hooks", Description: "List webhook handlers"},
+		tgbotapi.BotCommand{Command: "job_runs", Description: "Show run history for a job"},
 	)
 	if _, err := b.api.Request(commands); err != nil {
 		log.Printf("Warning: failed to register bot commands: %v", err)
