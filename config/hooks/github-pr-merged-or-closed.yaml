@@ -1,0 +1,12 @@
+name: github-pr-merged-or-closed
+path: /hooks/github/pr-merged-or-closed
+secret: CHANGEME
+signature_scheme: github-hmac-sha256
+# GitHub sends a single event with action='closed' for both close and merge;
+# the template passes action through so /close-pr can branch on the payload.
+# Filter absent → every pull_request event lands here; the skill filters
+# further by looking at pull_request.merged.
+agent_id: pr-closer
+prompt_template: "/close-pr {{.number}} {{if (index . \"pull_request\").merged}}merged{{else}}closed{{end}}"
+rate_limit_per_min: 60
+enabled: false

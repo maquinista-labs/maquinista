@@ -113,6 +113,24 @@ func TestMarkMerged_UnblocksDependents(t *testing.T) {
 	}
 }
 
+func TestTaskByPR_LookupAndMiss(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+	if err := CreateTask(ctx, pool, Task{ID: "A", Title: "A"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := SetPRUrl(ctx, pool, "A", "https://github.com/x/y/pull/42"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := TaskByPR(ctx, pool, "https://github.com/x/y/pull/42")
+	if err != nil || id != "A" {
+		t.Errorf("got id=%q err=%v", id, err)
+	}
+	if _, err := TaskByPR(ctx, pool, "https://example/nope"); err == nil {
+		t.Error("expected miss")
+	}
+}
+
 func TestMarkClosed_FailsTask(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()

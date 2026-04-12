@@ -110,6 +110,41 @@ func init() {
 	tasksSetPRCmd.Flags().StringVar(&tasksPRURL, "url", "", "")
 
 	tasksCmd.AddCommand(tasksCreateCmd, tasksAddDepCmd, tasksValidateCmd,
-		tasksSetPRCmd, tasksMarkMergedCmd, tasksMarkClosedCmd)
+		tasksSetPRCmd, tasksMarkMergedCmd, tasksMarkClosedCmd,
+		tasksMarkReviewCmd, tasksByPRCmd)
 	rootCmd.AddCommand(tasksCmd)
+}
+
+var tasksMarkReviewCmd = &cobra.Command{
+	Use:   "mark-review <id>",
+	Args:  cobra.ExactArgs(1),
+	Short: "MarkReview: flip status='review' (idempotent safety net)",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := connectDB(); err != nil {
+			return err
+		}
+		return tasks.MarkReview(context.Background(), pool, args[0])
+	},
+}
+
+var tasksByPRURL string
+
+var tasksByPRCmd = &cobra.Command{
+	Use:   "by-pr",
+	Short: "Resolve a task id from a PR URL",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := connectDB(); err != nil {
+			return err
+		}
+		id, err := tasks.TaskByPR(context.Background(), pool, tasksByPRURL)
+		if err != nil {
+			return err
+		}
+		fmt.Println(id)
+		return nil
+	},
+}
+
+func init() {
+	tasksByPRCmd.Flags().StringVar(&tasksByPRURL, "url", "", "PR URL to look up")
 }

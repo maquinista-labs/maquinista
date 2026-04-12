@@ -111,6 +111,18 @@ func MarkReview(ctx context.Context, pool *pgxpool.Pool, taskID string) error {
 	return err
 }
 
+// TaskByPR looks up the task whose pr_url matches url. Used by
+// /close-pr to bridge webhook payload → task id.
+func TaskByPR(ctx context.Context, pool *pgxpool.Pool, url string) (string, error) {
+	var id string
+	err := pool.QueryRow(ctx,
+		`SELECT id FROM tasks WHERE pr_url = $1 LIMIT 1`, url).Scan(&id)
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
 // MarkMerged flips pr_state='merged', status='done'. The existing
 // refresh_ready_tasks trigger (migration 001/003) fires on
 // status='done' and promotes eligible dependents to 'ready'.

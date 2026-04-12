@@ -1,0 +1,13 @@
+name: github-pr-opened
+path: /hooks/github/pr-opened
+# HMAC secret. Set a real one before enabling in production (env subst is
+# a nice-to-have the jobreg YAML loader can add later — for now, rotate here).
+secret: CHANGEME
+signature_scheme: github-hmac-sha256
+# Only route when the delivery is actually a pull_request.opened event.
+event_filter:
+  action: opened
+agent_id: reviewer
+prompt_template: "/review-pr {{.number}}"
+rate_limit_per_min: 60
+enabled: false
