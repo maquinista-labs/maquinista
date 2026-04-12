@@ -3,62 +3,17 @@ package db
 import (
 	"context"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maquinista-labs/maquinista/internal/dbtest"
 	"github.com/maquinista-labs/maquinista/internal/state"
-	"github.com/testcontainers/testcontainers-go"
-	tcpg "github.com/testcontainers/testcontainers-go/modules/postgres"
-	"github.com/testcontainers/testcontainers-go/wait"
 )
 
-// pgContainer spins up a disposable Postgres and returns its connection string.
-// Skips the calling test if Docker is not available on the host.
-func pgContainer(t *testing.T) (*pgxpool.Pool, string) {
-	t.Helper()
-
-	if os.Getenv("MAQUINISTA_SKIP_DOCKER_TESTS") != "" {
-		t.Skip("MAQUINISTA_SKIP_DOCKER_TESTS set")
-	}
-
-	ctx := context.Background()
-	container, err := tcpg.Run(ctx,
-		"postgres:16-alpine",
-		tcpg.WithDatabase("maquinista_test"),
-		tcpg.WithUsername("test"),
-		tcpg.WithPassword("test"),
-		testcontainers.WithWaitStrategy(
-			wait.ForLog("database system is ready to accept connections").
-				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
-		),
-	)
-	if err != nil {
-		t.Skipf("postgres container unavailable: %v", err)
-	}
-	t.Cleanup(func() {
-		_ = container.Terminate(context.Background())
-	})
-
-	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
-	if err != nil {
-		t.Fatalf("connection string: %v", err)
-	}
-
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("new pool: %v", err)
-	}
-	t.Cleanup(pool.Close)
-
-	return pool, dsn
-}
-
 func TestMigration009_AppliesCleanly(t *testing.T) {
-	pool, _ := pgContainer(t)
+	pool, _ := dbtest.PgContainer(t)
 
 	applied, err := RunMigrations(pool)
 	if err != nil {
@@ -93,7 +48,6 @@ func TestMigration009_AppliesCleanly(t *testing.T) {
 		}
 	}
 
-	// stop_requested column on agents.
 	var col string
 	err = pool.QueryRow(context.Background(), `
 		SELECT column_name FROM information_schema.columns
@@ -103,7 +57,6 @@ func TestMigration009_AppliesCleanly(t *testing.T) {
 		t.Errorf("agents.stop_requested missing: %v", err)
 	}
 
-	// is_default column on agent_settings.
 	err = pool.QueryRow(context.Background(), `
 		SELECT column_name FROM information_schema.columns
 		WHERE table_name='agent_settings' AND column_name='is_default'
@@ -114,7 +67,7 @@ func TestMigration009_AppliesCleanly(t *testing.T) {
 }
 
 func TestMigration009_OwnerBindingUnique(t *testing.T) {
-	pool, _ := pgContainer(t)
+	pool, _ := dbtest.PgContainer(t)
 	if _, err := RunMigrations(pool); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
 	}
@@ -137,7 +90,6 @@ func TestMigration009_OwnerBindingUnique(t *testing.T) {
 		t.Fatal("expected unique-violation on second owner for (u1, 100)")
 	}
 
-	// Observers are not bound by that index, so both agents can observe.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO topic_agent_bindings (topic_id, agent_id, binding_type, user_id, thread_id)
 		VALUES (100, 'a2', 'observer', 'u1', '100')
@@ -147,7 +99,7 @@ func TestMigration009_OwnerBindingUnique(t *testing.T) {
 }
 
 func TestMigration009_NotifyAgentInbox(t *testing.T) {
-	pool, dsn := pgContainer(t)
+	pool, dsn := dbtest.PgContainer(t)
 	if _, err := RunMigrations(pool); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
 	}
@@ -187,7 +139,7 @@ func TestMigration009_NotifyAgentInbox(t *testing.T) {
 }
 
 func TestMigration009_BackfillIdempotent(t *testing.T) {
-	pool, _ := pgContainer(t)
+	pool, _ := dbtest.PgContainer(t)
 	if _, err := RunMigrations(pool); err != nil {
 		t.Fatalf("RunMigrations: %v", err)
 	}
@@ -234,7 +186,6 @@ func TestMigration009_BackfillIdempotent(t *testing.T) {
 		t.Errorf("owner rows = %d, want 2", count)
 	}
 
-	// chat_id propagated.
 	var chatID int64
 	if err := pool.QueryRow(ctx, `
 		SELECT chat_id FROM topic_agent_bindings
