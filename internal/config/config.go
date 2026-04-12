@@ -49,6 +49,26 @@ type Config struct {
 	// agent_outbox — the existing Telegram path continues to run so traffic
 	// is unaffected. Toggled by MAILBOX_OUTBOUND=1.
 	MailboxOutbound bool
+
+	// MailboxInboundTopics is the set of Telegram thread_ids for which
+	// inbound user messages route through agent_inbox instead of calling
+	// tmux.SendKeysWithDelay directly. Value "*" enables the flag for every
+	// topic. Empty list leaves the legacy path untouched.
+	// Configured via MAILBOX_INBOUND_TOPICS (comma-separated, or "*").
+	MailboxInboundTopics []string
+}
+
+// MailboxInboundEnabled reports whether the mailbox.inbound flag is active
+// for the given Telegram thread_id. Uses string comparison so callers can
+// pass either the numeric thread_id or its string representation consistently
+// with the rest of the mailbox code.
+func (c *Config) MailboxInboundEnabled(threadID string) bool {
+	for _, t := range c.MailboxInboundTopics {
+		if t == "*" || t == threadID {
+			return true
+		}
+	}
+	return false
 }
 
 func Load(envFile ...string) (*Config, error) {
@@ -148,8 +168,24 @@ func Load(envFile ...string) (*Config, error) {
 		DefaultProject:      defaultProject,
 		PlannerPromptPath:   plannerPromptPath,
 		DefaultRunner:       defaultRunner,
-		MailboxOutbound:     parseBoolEnv(os.Getenv("MAILBOX_OUTBOUND")),
+		MailboxOutbound:      parseBoolEnv(os.Getenv("MAILBOX_OUTBOUND")),
+		MailboxInboundTopics: parseTopicList(os.Getenv("MAILBOX_INBOUND_TOPICS")),
 	}, nil
+}
+
+func parseTopicList(v string) []string {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(v, ",") {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 func parseBoolEnv(v string) bool {

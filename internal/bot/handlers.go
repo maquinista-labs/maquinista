@@ -48,6 +48,17 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 		return
 	}
 
+	// Feature flag mailbox.inbound: route through agent_inbox instead of
+	// driving the pty directly. The in-process inboxbridge picks up the row
+	// via LISTEN agent_inbox_new and calls SendKeysWithDelay itself, so the
+	// pane sees the same keystrokes either way.
+	if b.config.MailboxInboundEnabled(threadID) {
+		if routed := b.routeTextViaInbox(msg, windowID, text); routed {
+			return
+		}
+		log.Printf("mailbox.inbound: inbox route failed for %s, falling back to legacy path", windowID)
+	}
+
 	// Send text to tmux with 500ms delay before Enter
 	if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, windowID, text, 500); err != nil {
 		if tmux.IsWindowDead(err) {
