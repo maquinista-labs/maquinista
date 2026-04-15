@@ -118,6 +118,30 @@ func ensureDefaultAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.P
 	}
 	log.Printf("default agent: spawned %s at %s:%s (cwd=%s, runner=%s)",
 		agentID, cfg.TmuxSessionName, windowID, cwd, runnerCmd)
+
+	// Upsert the agents row immediately — don't wait for Claude Code's
+	// SessionStart hook, which only fires once the user types their first
+	// prompt. Without this, the routing ladder's tier-4 picker finds no
+	// live agents and bounces every message until the user interacts with
+	// the spawned pane. The hook still runs later and idempotently bumps
+	// last_seen / reconciles tmux_window if Claude was started outside
+	// this code path.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO agents
+			(id, tmux_session, tmux_window, role, status, runner_type,
+			 started_at, last_seen, stop_requested)
+		VALUES ($1, $2, $3, 'user', 'running', $4, NOW(), NOW(), FALSE)
+		ON CONFLICT (id) DO UPDATE SET
+			tmux_session   = EXCLUDED.tmux_session,
+			tmux_window    = EXCLUDED.tmux_window,
+			status         = 'running',
+			runner_type    = EXCLUDED.runner_type,
+			last_seen      = NOW(),
+			stop_requested = FALSE
+	`, agentID, cfg.TmuxSessionName, windowID, cfg.DefaultRunner); err != nil {
+		return fmt.Errorf("registering default agent row: %w", err)
+	}
+	log.Printf("default agent: registered %s in agents table", agentID)
 	return nil
 }
 
