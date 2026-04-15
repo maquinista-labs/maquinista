@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
@@ -81,17 +82,28 @@ func ensureDefaultAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.P
 		return fmt.Errorf("ensuring tmux session: %w", err)
 	}
 
-	runnerCmd := cfg.ClaudeCommand
-	if runnerCmd == "" {
-		runnerCmd = "claude"
-	}
-
+	// Use the runner's LaunchCommand so the spawned pane gets the same
+	// sandbox/skip-permissions flags the task runners do (e.g. claude
+	// yields "IS_SANDBOX=1 claude --dangerously-skip-permissions"). Falls
+	// back to $CLAUDE_COMMAND if the runner isn't registered.
+	var runnerCmd string
 	env := map[string]string{
 		"AGENT_ID":    agentID,
 		"RUNNER_TYPE": cfg.DefaultRunner,
 	}
 	if cfg.DatabaseURL != "" {
 		env["DATABASE_URL"] = cfg.DatabaseURL
+	}
+	if r, err := runner.Get(cfg.DefaultRunner); err == nil {
+		runnerCmd = r.LaunchCommand(runner.Config{WorkDir: cwd, Env: env})
+		for k, v := range r.EnvOverrides() {
+			env[k] = v
+		}
+	} else {
+		runnerCmd = cfg.ClaudeCommand
+		if runnerCmd == "" {
+			runnerCmd = "claude"
+		}
 	}
 
 	windowID, err := tmux.NewWindow(cfg.TmuxSessionName, agentID, cwd, runnerCmd, env)
