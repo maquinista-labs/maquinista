@@ -1,5 +1,5 @@
-# Binary
-maquinista
+# Binary (root-anchored so cmd/maquinista/* source isn't swallowed)
+/maquinista
 
 # Environment
 .env

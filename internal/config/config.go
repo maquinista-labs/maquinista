@@ -44,6 +44,18 @@ type Config struct {
 	// Default agent runner (claude, opencode, etc.)
 	DefaultRunner string
 
+	// DefaultAgent is the agent id auto-spawned by `maquinista start` when
+	// no agent with that id is already registered. The spawned tmux window
+	// exports AGENT_ID=<DefaultAgent> so the SessionStart hook upserts the
+	// agents row. Configured via MAQUINISTA_DEFAULT_AGENT; defaults to
+	// "maquinista" if unset. Override on the command line with --agent.
+	DefaultAgent string
+
+	// DefaultAgentCWD is the directory the auto-spawned default agent
+	// starts in. Configured via MAQUINISTA_DEFAULT_CWD; defaults to the
+	// user's home dir when unset. Override with --agent-cwd.
+	DefaultAgentCWD string
+
 	// Feature flags (see plans/maquinista-v2-implementation.md §"Feature flags").
 	// MailboxOutbound enables shadow-mode writes from the monitor into
 	// agent_outbox — the existing Telegram path continues to run so traffic
@@ -159,6 +171,16 @@ func Load(envFile ...string) (*Config, error) {
 		defaultRunner = "claude"
 	}
 
+	defaultAgent := strings.TrimSpace(os.Getenv("MAQUINISTA_DEFAULT_AGENT"))
+	if defaultAgent == "" {
+		defaultAgent = "maquinista"
+	}
+
+	defaultAgentCWD := strings.TrimSpace(os.Getenv("MAQUINISTA_DEFAULT_CWD"))
+	if defaultAgentCWD != "" {
+		defaultAgentCWD = expandHome(defaultAgentCWD)
+	}
+
 	return &Config{
 		TelegramBotToken:    token,
 		AllowedUsers:        users,
@@ -175,6 +197,8 @@ func Load(envFile ...string) (*Config, error) {
 		DefaultProject:      defaultProject,
 		PlannerPromptPath:   plannerPromptPath,
 		DefaultRunner:       defaultRunner,
+		DefaultAgent:        defaultAgent,
+		DefaultAgentCWD:     defaultAgentCWD,
 		MailboxOutbound:      parseBoolEnv(os.Getenv("MAILBOX_OUTBOUND")),
 		MailboxInboundTopics: parseTopicList(os.Getenv("MAILBOX_INBOUND_TOPICS")),
 		MailboxDispatcher:    parseBoolEnv(os.Getenv("MAILBOX_DISPATCHER")),

@@ -38,6 +38,12 @@ DATABASE_URL=postgres://maquinista:maquinista@localhost:5434/maquinistadb?sslmod
 MAQUINISTA_DIR=~/.maquinista
 TMUX_SESSION_NAME=maquinista
 MAQUINISTA_DEFAULT_PROJECT=myproject
+# Auto-spawned default agent. `maquinista start` opens a tmux window
+# running $CLAUDE_COMMAND with AGENT_ID exported, unless --no-agent is
+# passed or an agent with the same id is already registered.
+MAQUINISTA_DEFAULT_AGENT=maquinista
+# Working directory for the default agent (defaults to $HOME).
+# MAQUINISTA_DEFAULT_CWD=~/code/maquinista
 # MAQUINISTA_QUEUE_TOPIC_ID=123       # topic ID for queue status notifications
 # MAQUINISTA_APPROVALS_TOPIC_ID=456   # topic ID for approval requests
 ```
@@ -66,8 +72,14 @@ make build
 ### 5. Run
 
 ```bash
-# Start Telegram bot
+# Start Telegram bot (auto-spawns default agent named "maquinista")
 ./maquinista start
+
+# Override the default agent id or working dir
+./maquinista start --agent otavio --agent-cwd ~/code/myproject
+
+# Skip the auto-spawn entirely (agents must be started manually)
+./maquinista start --no-agent
 
 # Start Telegram bot + autonomous orchestrator
 ./maquinista start --orchestrate --orchestrate-project myproject
