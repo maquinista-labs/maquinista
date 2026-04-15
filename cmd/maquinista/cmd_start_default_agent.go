@@ -42,11 +42,17 @@ func ensureDefaultAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.P
 		cwd = cfg.DefaultAgentCWD
 	}
 	if cwd == "" {
-		h, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("resolving home dir: %w", err)
+		// Default to the dir `maquinista start` was invoked from — likely
+		// a folder the user already trusts in Claude Code, avoiding the
+		// workspace-trust prompt on first spawn. Fall back to $HOME only
+		// if os.Getwd fails.
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		} else if h, herr := os.UserHomeDir(); herr == nil {
+			cwd = h
+		} else {
+			return fmt.Errorf("resolving default cwd: getwd=%v home=%v", err, herr)
 		}
-		cwd = h
 	}
 
 	// Skip if agent is already live in DB.
