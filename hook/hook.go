@@ -1,6 +1,7 @@
 package hook
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -8,7 +9,9 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
@@ -75,13 +78,68 @@ func Run() error {
 
 	sessionMapPath := filepath.Join(dir, "session_map.json")
 
-	return state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
+	if err := state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
 		data[key] = state.SessionMapEntry{
 			SessionID:  input.SessionID,
 			CWD:        input.CWD,
 			WindowName: windowName,
 		}
-	})
+	}); err != nil {
+		return err
+	}
+
+	// If the user launched the runner with AGENT_ID set, upsert an agents
+	// row so the bot's routing ladder can resolve Telegram messages to this
+	// session. Fail open — a DB blip here must not crash the Claude session.
+	registerAgentFromEnv(sessionName, windowID)
+	return nil
+}
+
+// registerAgentFromEnv upserts an agents row when AGENT_ID + DATABASE_URL are
+// set. Logs and swallows any error.
+func registerAgentFromEnv(sessionName, windowID string) {
+	agentID := strings.TrimSpace(os.Getenv("AGENT_ID"))
+	if agentID == "" {
+		return
+	}
+	dbURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
+	if dbURL == "" {
+		log.Printf("hook: AGENT_ID=%s set but DATABASE_URL empty; skipping agents upsert", agentID)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, dbURL)
+	if err != nil {
+		log.Printf("hook: agents upsert connect: %v", err)
+		return
+	}
+	defer conn.Close(ctx)
+
+	runner := strings.TrimSpace(os.Getenv("RUNNER_TYPE"))
+	if runner == "" {
+		runner = "claude"
+	}
+
+	if _, err := conn.Exec(ctx, `
+		INSERT INTO agents
+			(id, tmux_session, tmux_window, role, status, runner_type,
+			 started_at, last_seen, stop_requested)
+		VALUES ($1, $2, $3, 'user', 'running', $4, NOW(), NOW(), FALSE)
+		ON CONFLICT (id) DO UPDATE SET
+			tmux_session  = EXCLUDED.tmux_session,
+			tmux_window   = EXCLUDED.tmux_window,
+			status        = 'running',
+			runner_type   = EXCLUDED.runner_type,
+			last_seen     = NOW(),
+			stop_requested= FALSE
+	`, agentID, sessionName, windowID, runner); err != nil {
+		log.Printf("hook: agents upsert for %s: %v", agentID, err)
+		return
+	}
+	log.Printf("hook: registered agent %s at %s:%s", agentID, sessionName, windowID)
 }
 
 // EnsureInstalled checks if the hook is installed and installs it if not.

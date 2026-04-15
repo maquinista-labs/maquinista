@@ -1,100 +1,100 @@
 package bot
 
 import (
+	"context"
+	"errors"
 	"log"
 	"strconv"
 	"strings"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maquinista-labs/maquinista/internal/routing"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
-// handleTextMessage forwards user text to the bound tmux window.
+// handleTextMessage resolves the target agent via the §8.1 ladder and
+// routes the text through agent_inbox.
 func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 	userID := strconv.FormatInt(msg.From.ID, 10)
 	threadID := strconv.Itoa(getThreadID(msg))
 	chatID := msg.Chat.ID
 
-	// Check if this is a reply to an add-task wizard message
 	if b.handleAddTaskReply(msg) {
 		return
 	}
-
-	// Check for pending input (prompt-then-type commands)
 	if b.handlePendingInput(msg) {
 		return
 	}
 
-	// Cancel any running bash capture for this topic
 	cancelBashCapture(msg.From.ID, getThreadID(msg))
 
-	// Store group chat ID
 	b.state.SetGroupChatID(userID, threadID, chatID)
 	b.saveState()
 
-	// Look up window binding
-	windowID, bound := b.state.GetWindowForThread(userID, threadID)
-	if !bound {
-		b.handleUnboundTopic(msg)
-		return
-	}
-
 	text := msg.Text
 
-	// Handle ! prefix for bash commands
+	// ! prefix still targets the existing window binding (bash mode is a
+	// pty-level concern and doesn't participate in the routing ladder).
 	if strings.HasPrefix(text, "!") && len(text) > 1 {
-		b.handleBashCommand(msg, windowID, text)
+		if windowID, bound := b.state.GetWindowForThread(userID, threadID); bound {
+			b.handleBashCommand(msg, windowID, text)
+			return
+		}
+		b.reply(chatID, getThreadID(msg), "No window bound for ! commands. Send a regular message first.")
 		return
 	}
 
-	// User text always routes via agent_inbox. A separate consumer
-	// (cmd_start's mailbox loop, eventually a per-agent sidecar) claims
-	// inbox rows and drives the pty via SendKeysWithDelay — so direct
-	// pty writes from the bot handler are gone.
-	if routed := b.routeTextViaInbox(msg, windowID, text); !routed {
-		log.Printf("mailbox.inbound: routing failed for %s (DB unavailable?)", windowID)
-		b.reply(chatID, getThreadID(msg), "Error: agent mailbox is unavailable. Check DATABASE_URL.")
+	pool := b.getPool()
+	if pool == nil {
+		b.reply(chatID, getThreadID(msg), "Error: agent mailbox unavailable (DATABASE_URL).")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	chatIDCopy := chatID
+	res, err := routing.Resolve(ctx, pool, userID, threadID, &chatIDCopy, text)
+	if errors.Is(err, routing.ErrRequirePicker) {
+		b.showAgentPicker(chatID, getThreadID(msg), msg.From.ID, text)
+		return
+	}
+	if err != nil {
+		log.Printf("routing.Resolve: %v", err)
+		b.reply(chatID, getThreadID(msg), "Error: routing failed. Check server logs.")
+		return
+	}
+
+	// Verify the resolved agent actually exists in agents before handing
+	// it to the inbox — prevents FK violations if a mention references a
+	// bogus id.
+	if !b.agentExists(ctx, pool, res.AgentID) {
+		b.reply(chatID, getThreadID(msg),
+			"Unknown agent @"+res.AgentID+". Start it with `AGENT_ID="+res.AgentID+" claude` or pick another.")
+		return
+	}
+
+	if !b.routeTextViaInbox(msg, res.AgentID, res.Text) {
+		log.Printf("mailbox.inbound: routing failed for %s", res.AgentID)
+		b.reply(chatID, getThreadID(msg), "Error: agent mailbox write failed. Check DATABASE_URL.")
 	}
 }
 
-// handleUnboundTopic shows window picker or directory browser for an unbound topic.
-func (b *Bot) handleUnboundTopic(msg *tgbotapi.Message) {
-	userID := msg.From.ID
-	chatID := msg.Chat.ID
-	threadID := getThreadID(msg)
-
-	// Ensure tmux session exists (it may have been destroyed if all windows were closed)
-	if err := tmux.EnsureSession(b.config.TmuxSessionName); err != nil {
-		log.Printf("Error ensuring tmux session: %v", err)
-		b.reply(chatID, threadID, "Error creating tmux session.")
-		return
-	}
-
-	// Get unbound windows
-	windows, err := tmux.ListWindows(b.config.TmuxSessionName)
+// agentExists returns true if agent_id is present in agents. Fail-open on
+// query error so a DB blip doesn't false-reject a legitimate message.
+func (b *Bot) agentExists(ctx context.Context, pool *pgxpool.Pool, agentID string) bool {
+	var one int
+	err := pool.QueryRow(ctx, `SELECT 1 FROM agents WHERE id = $1`, agentID).Scan(&one)
 	if err != nil {
-		log.Printf("Error listing windows: %v", err)
-		b.reply(chatID, threadID, "Error listing tmux windows.")
-		return
-	}
-
-	boundWindows := b.state.AllBoundWindowIDs()
-	var unboundWindows []tmux.Window
-	for _, w := range windows {
-		if !boundWindows[w.ID] && w.Name != tmux.InitWindowName {
-			unboundWindows = append(unboundWindows, w)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false
 		}
+		log.Printf("agentExists(%s): %v", agentID, err)
+		return true
 	}
-
-	// Store pending text
-	pendingText := msg.Text
-
-	if len(unboundWindows) > 0 {
-		b.showWindowPicker(chatID, threadID, userID, unboundWindows, pendingText)
-	} else {
-		b.showDirectoryBrowser(chatID, threadID, userID, pendingText)
-	}
+	return true
 }
 
 // handleBashCommand sends a ! command to Claude's bash mode.
@@ -140,8 +140,8 @@ func (b *Bot) routeCallback(cq *tgbotapi.CallbackQuery) {
 	b.api.Request(callback)
 
 	switch {
-	case strings.HasPrefix(data, "dir_"):
-		b.processDirectoryCallback(cq)
+	case strings.HasPrefix(data, "apick_"):
+		b.processAgentPickerCallback(cq)
 	case strings.HasPrefix(data, "win_"):
 		b.processWindowCallback(cq)
 	case strings.HasPrefix(data, "hist_"):

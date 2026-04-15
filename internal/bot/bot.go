@@ -30,6 +30,8 @@ type Bot struct {
 	windowCache map[int64][]tmux.Window
 	// Per-user window picker state
 	windowPickerStates map[int64]*windowPickerState
+	// Per-user tier-4 agent picker state
+	agentPickerStates map[int64]*agentPickerState
 	// Per-user file browser state for /get command
 	fileBrowseStates map[int64]*FileBrowseState
 	// Per-user add-task wizard state
@@ -81,6 +83,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		browseStates:       make(map[int64]*BrowseState),
 		windowCache:        make(map[int64][]tmux.Window),
 		windowPickerStates: make(map[int64]*windowPickerState),
+		agentPickerStates:  make(map[int64]*agentPickerState),
 		fileBrowseStates:   make(map[int64]*FileBrowseState),
 		addTaskStates:      make(map[int64]*addTaskState),
 		taskPickerStates:   make(map[int64]*taskPickerState),

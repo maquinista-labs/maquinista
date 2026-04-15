@@ -134,7 +134,8 @@ func (b *Bot) handleDeadWindow(msg *tgbotapi.Message, windowID, pendingText stri
 	// Check if binding still exists — the status poller may have already cleaned up
 	if _, bound := b.state.GetWindowForThread(userID, threadID); !bound {
 		log.Printf("Dead window %s: already cleaned up (race with poller), treating as unbound", windowID)
-		b.handleUnboundTopic(msg)
+		b.reply(chatID, threadIDInt,
+			"Agent session is gone. Restart it with `AGENT_ID=<id> claude` and resend.")
 		return true
 	}
 
@@ -185,10 +186,9 @@ func (b *Bot) handleDeadWindow(msg *tgbotapi.Message, windowID, pendingText stri
 	b.saveState()
 
 	if cwd == "" {
-		// No CWD known — fall back to directory browser
-		log.Printf("Dead window %s: no CWD, falling back to directory browser", windowID)
-		b.reply(chatID, threadIDInt, "Session died. Pick a directory to restart.")
-		b.handleUnboundTopic(msg)
+		log.Printf("Dead window %s: no CWD, cannot auto-restart", windowID)
+		b.reply(chatID, threadIDInt,
+			"Session died. Restart the agent with `AGENT_ID=<id> claude` and resend.")
 		return true
 	}
 
