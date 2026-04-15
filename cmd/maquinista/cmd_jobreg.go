@@ -69,7 +69,13 @@ var jobScheduleRmCmd = &cobra.Command{
 	},
 }
 
-var hookCmdGroup = &cobra.Command{Use: "hook", Short: "Manage webhook_handlers"}
+// NOTE: the top-level "hook" verb is reserved for the Claude Code
+// SessionStart hook runner (cmd/maquinista/main.go:hookCmd). Naming this
+// group "hook" caused Cobra to silently resolve `maquinista hook` (the
+// command Claude Code calls on every session start) to this stub's help
+// text instead of hook.Run(), so no agent row was ever upserted. Use
+// "webhook" here for the webhook_handlers CRUD surface.
+var hookCmdGroup = &cobra.Command{Use: "webhook", Short: "Manage webhook_handlers"}
 
 var hookAddCmd = &cobra.Command{
 	Use:   "add",
