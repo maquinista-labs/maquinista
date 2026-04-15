@@ -242,7 +242,7 @@ func findPlannerPrompt() string {
 	// Look for planner system prompt relative to binary or cwd.
 	candidates := []string{
 		"claude/planner-system-prompt.md",
-		"/home/otavio/code/minuano/claude/planner-system-prompt.md",
+		"/home/otavio/code/maquinista/claude/planner-system-prompt.md",
 	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {

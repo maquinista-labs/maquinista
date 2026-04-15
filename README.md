@@ -32,7 +32,7 @@ Create a `.env` file in the project root:
 TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
 ALLOWED_USERS=YOUR_USER_ID
 ALLOWED_GROUPS=-100XXXXXXXXXX
-DATABASE_URL=postgres://maquinista:maquinista@localhost:5432/maquinistadb?sslmode=disable
+DATABASE_URL=postgres://maquinista:maquinista@localhost:5434/maquinistadb?sslmode=disable
 
 # Optional
 MAQUINISTA_DIR=~/.maquinista
@@ -48,9 +48,9 @@ MAQUINISTA_DEFAULT_PROJECT=myproject
 docker compose -f docker/docker-compose.yml up -d
 ```
 
-This starts PostgreSQL 16 on port 5432 with credentials `maquinista:maquinista` and database `maquinistadb`.
+This starts PostgreSQL 16 on host port **5434** (container 5432) with credentials `maquinista:maquinista` and database `maquinistadb`.
 
-To also start pgAdmin (available at http://localhost:5050):
+To also start pgAdmin (available at http://localhost:5051):
 
 ```bash
 docker compose -f docker/docker-compose.yml --profile debug up -d
