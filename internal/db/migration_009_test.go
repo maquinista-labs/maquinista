@@ -57,13 +57,10 @@ func TestMigration009_AppliesCleanly(t *testing.T) {
 		t.Errorf("agents.stop_requested missing: %v", err)
 	}
 
-	err = pool.QueryRow(context.Background(), `
-		SELECT column_name FROM information_schema.columns
-		WHERE table_name='agent_settings' AND column_name='is_default'
-	`).Scan(&col)
-	if err != nil {
-		t.Errorf("agent_settings.is_default missing: %v", err)
-	}
+	// agent_settings.is_default was introduced in 009 and retired in
+	// migration 013 (per plans/per-topic-agent-pivot.md). RunMigrations
+	// applies everything in order, so by the time this test runs the
+	// column is gone — don't assert its presence here.
 }
 
 func TestMigration009_OwnerBindingUnique(t *testing.T) {

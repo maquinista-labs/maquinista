@@ -30,9 +30,7 @@ var (
 	// start --runner flag (default runner for all agents)
 	startRunner string
 	// start --agent / --agent-cwd flags (default agent auto-spawn)
-	startAgent    string
 	startAgentCWD string
-	startNoAgent  bool
 	// start --orchestrate flags
 	startOrchestrate   bool
 	startOrchProject   string
@@ -58,9 +56,7 @@ var startCmd = &cobra.Command{
 func init() {
 	startCmd.Flags().StringVar(&cfgPath, "env", "", "path to .env config file")
 	startCmd.Flags().StringVar(&startRunner, "runner", "", "default agent runner (claude, openclaude, opencode)")
-	startCmd.Flags().StringVar(&startAgent, "agent", "", "default agent id to auto-spawn (overrides MAQUINISTA_DEFAULT_AGENT)")
-	startCmd.Flags().StringVar(&startAgentCWD, "agent-cwd", "", "working dir for auto-spawned default agent (overrides MAQUINISTA_DEFAULT_CWD)")
-	startCmd.Flags().BoolVar(&startNoAgent, "no-agent", false, "skip the default-agent auto-spawn")
+	startCmd.Flags().StringVar(&startAgentCWD, "agent-cwd", "", "working dir inherited by newly-spawned topic agents (overrides cfg.DefaultAgentCWD; defaults to $PWD)")
 	startCmd.Flags().BoolVar(&startOrchestrate, "orchestrate", false, "run orchestrator alongside bot")
 	startCmd.Flags().StringVar(&startOrchProject, "orchestrate-project", "", "project for orchestrator")
 	startCmd.Flags().IntVar(&startOrchMaxAgents, "orchestrate-max-agents", 3, "max agents for orchestrator")
@@ -246,12 +242,14 @@ func runStart() error {
 			log.Printf("jobreg reconcile: %v", err)
 		}
 
-		// Auto-spawn the default agent in a tmux window so a fresh install
-		// can send a Telegram message without manually booting a runner.
-		// The SessionStart hook inside the spawned pane upserts the agents
-		// row; no DB write happens here.
-		if err := ensureDefaultAgent(ctx, cfg, pool, b.State()); err != nil {
-			log.Printf("default agent: %v", err)
+		// Inject the tier-3 spawn callback into the bot. Per
+		// plans/per-topic-agent-pivot.md the daemon no longer spawns a
+		// shared default agent at startup; agents are spawned per topic
+		// on first message via routing.Resolve → SpawnFunc.
+		if cwd, cwdErr := resolveStartCWD(cfg); cwdErr != nil {
+			log.Printf("spawn_topic_agent: cwd resolve failed: %v (tier-3 spawn will error)", cwdErr)
+		} else {
+			b.SetTopicAgentSpawner(newTopicAgentSpawner(cfg, pool, b.State(), cwd))
 		}
 	} else {
 		log.Println("mailbox: DB pool unavailable — inbox routing will error")

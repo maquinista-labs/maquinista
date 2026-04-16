@@ -53,10 +53,12 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// Tier-3 spawn can take several seconds (tmux + Claude init); give the
+	// ladder a generous budget. Owner-binding + mention paths return fast.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	chatIDCopy := chatID
-	res, err := routing.Resolve(ctx, pool, userID, threadID, &chatIDCopy, text)
+	res, err := routing.Resolve(ctx, pool, b.topicAgentSpawner, userID, threadID, &chatIDCopy, text)
 	if errors.Is(err, routing.ErrRequirePicker) {
 		b.showAgentPicker(chatID, getThreadID(msg), msg.From.ID, text)
 		return
@@ -69,10 +71,10 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 
 	// Verify the resolved agent actually exists in agents before handing
 	// it to the inbox — prevents FK violations if a mention references a
-	// bogus id.
+	// bogus id/handle.
 	if !b.agentExists(ctx, pool, res.AgentID) {
 		b.reply(chatID, getThreadID(msg),
-			"Unknown agent @"+res.AgentID+". Start it with `AGENT_ID="+res.AgentID+" claude` or pick another.")
+			"No agent @"+res.AgentID+". Use /agent_list to see existing agents, or send a message without a mention to spawn a new one for this topic.")
 		return
 	}
 
@@ -118,11 +120,16 @@ func (b *Bot) syncAgentStateFor(ctx context.Context, pool *pgxpool.Pool, agentID
 	b.saveState()
 }
 
-// agentExists returns true if agent_id is present in agents. Fail-open on
-// query error so a DB blip doesn't false-reject a legitimate message.
+// agentExists returns true if agent_id is present in agents (matching the
+// id column or the handle column, case-insensitive). Fail-open on query
+// error so a DB blip doesn't false-reject a legitimate message.
 func (b *Bot) agentExists(ctx context.Context, pool *pgxpool.Pool, agentID string) bool {
 	var one int
-	err := pool.QueryRow(ctx, `SELECT 1 FROM agents WHERE id = $1`, agentID).Scan(&one)
+	err := pool.QueryRow(ctx, `
+		SELECT 1 FROM agents
+		WHERE id = $1 OR LOWER(handle) = LOWER($1)
+		LIMIT 1
+	`, agentID).Scan(&one)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false

@@ -12,6 +12,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/bridge"
 	"github.com/maquinista-labs/maquinista/internal/queue"
+	"github.com/maquinista-labs/maquinista/internal/routing"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
@@ -53,6 +54,17 @@ type Bot struct {
 	poolMu sync.Mutex
 	// Default runner for agent spawning
 	defaultRunner runner.AgentRunner
+	// Spawns a fresh per-topic agent when tier-3 of the routing ladder
+	// fires (plans/per-topic-agent-pivot.md). Injected by cmd/maquinista so
+	// the bot package doesn't need to import tmux/runner spawn machinery
+	// directly. May be nil; a nil spawner forces the routing ladder to
+	// surface the tier-4 picker via ErrRequirePicker.
+	topicAgentSpawner routing.SpawnFunc
+}
+
+// SetTopicAgentSpawner injects the tier-3 spawn callback. Call before Run.
+func (b *Bot) SetTopicAgentSpawner(fn routing.SpawnFunc) {
+	b.topicAgentSpawner = fn
 }
 
 // New creates a new Bot instance.
@@ -120,8 +132,8 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "agent_spawn", Description: "Spawn a new execution agent"},
 		tgbotapi.BotCommand{Command: "agent_kill", Description: "Kill a specific agent"},
 		tgbotapi.BotCommand{Command: "agent_kill_all", Description: "Kill all agents"},
-		tgbotapi.BotCommand{Command: "default", Description: "Set your owner agent for this topic"},
-		tgbotapi.BotCommand{Command: "global_default", Description: "Admin: set the global default agent"},
+		tgbotapi.BotCommand{Command: "agent_default", Description: "Attach this topic to an existing agent"},
+		tgbotapi.BotCommand{Command: "agent_rename", Description: "Set a handle on the current topic's agent"},
 		tgbotapi.BotCommand{Command: "schedule", Description: "Register a scheduled job"},
 		tgbotapi.BotCommand{Command: "hook_register", Description: "Admin: register a webhook"},
 		tgbotapi.BotCommand{Command: "hook_enable", Description: "Admin: enable a webhook"},

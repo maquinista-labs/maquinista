@@ -79,10 +79,10 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleAgentKillAllCommand(msg)
 	case "runner":
 		b.handleRunnerCommand(msg)
-	case "default":
-		b.handleDefaultCommand(msg)
-	case "global_default":
-		b.handleGlobalDefaultCommand(msg)
+	case "agent_default":
+		b.handleAgentDefaultCommand(msg)
+	case "agent_rename":
+		b.handleAgentRenameCommand(msg)
 	case "schedule":
 		b.handleScheduleCommand(msg)
 	case "hook_register":

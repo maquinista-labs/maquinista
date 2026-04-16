@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -56,12 +57,21 @@ func TestParseMention(t *testing.T) {
 	}
 }
 
+// countingSpawner returns a SpawnFunc that records how many times it's
+// called and hands back a fixed id. Used to assert tier-3 behavior.
+func countingSpawner(id string, counter *int64) SpawnFunc {
+	return func(ctx context.Context, userID, threadID string, chatID *int64) (string, error) {
+		atomic.AddInt64(counter, 1)
+		return id, nil
+	}
+}
+
 func TestResolve_AllTiers(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()
 
-	t.Run("tier1_mention_no_binding", func(t *testing.T) {
-		res, err := Resolve(ctx, pool, "u1", "100", ptrInt64(-1001), "@beta hello")
+	t.Run("tier1_mention_resolves_by_id", func(t *testing.T) {
+		res, err := Resolve(ctx, pool, nil, "u1", "100", ptrInt64(-1001), "@beta hello")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -76,9 +86,31 @@ func TestResolve_AllTiers(t *testing.T) {
 		}
 	})
 
+	t.Run("tier1_mention_resolves_by_handle", func(t *testing.T) {
+		// Give alpha a handle, then mention it via the handle.
+		exec(t, pool, `UPDATE agents SET handle='researcher' WHERE id='alpha'`)
+		res, err := Resolve(ctx, pool, nil, "u1h", "101", ptrInt64(-1001), "@researcher hey")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Tier != TierMention || res.AgentID != "alpha" || res.Text != "hey" {
+			t.Errorf("got %+v (want canonical id 'alpha')", res)
+		}
+	})
+
+	t.Run("tier1_mention_unknown_token_passes_through", func(t *testing.T) {
+		res, err := Resolve(ctx, pool, nil, "u1x", "102", ptrInt64(-1001), "@nobody-here ?")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.AgentID != "nobody-here" {
+			t.Errorf("unknown mention should pass through raw token, got %q", res.AgentID)
+		}
+	})
+
 	t.Run("tier2_owner_binding", func(t *testing.T) {
 		exec(t, pool, `INSERT INTO topic_agent_bindings (topic_id, agent_id, binding_type, user_id, thread_id, chat_id) VALUES (200, 'alpha', 'owner', 'u2', '200', -2001)`)
-		res, err := Resolve(ctx, pool, "u2", "200", ptrInt64(-2001), "plain text")
+		res, err := Resolve(ctx, pool, nil, "u2", "200", ptrInt64(-2001), "plain text")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -90,33 +122,38 @@ func TestResolve_AllTiers(t *testing.T) {
 		}
 	})
 
-	t.Run("tier3_global_default_writes_owner", func(t *testing.T) {
-		// seed agent_settings.is_default for gamma
-		exec(t, pool, `INSERT INTO agent_settings (agent_id, is_default) VALUES ('gamma', TRUE)`)
-		res, err := Resolve(ctx, pool, "u3", "300", ptrInt64(-3001), "hi")
+	t.Run("tier3_spawn_writes_owner", func(t *testing.T) {
+		var calls int64
+		spawn := countingSpawner("gamma", &calls)
+		res, err := Resolve(ctx, pool, spawn, "u3", "300", ptrInt64(-3001), "hi")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if res.Tier != TierGlobalDefault || res.AgentID != "gamma" {
+		if res.Tier != TierSpawn || res.AgentID != "gamma" {
 			t.Errorf("got %+v", res)
 		}
 		if !res.BindingSet {
 			t.Error("tier3 should write owner binding on first use")
 		}
-		// Second call now hits tier2.
-		res2, err := Resolve(ctx, pool, "u3", "300", ptrInt64(-3001), "again")
+		if got := atomic.LoadInt64(&calls); got != 1 {
+			t.Errorf("SpawnFunc called %d times, want 1", got)
+		}
+		// Second call now hits tier-2 and must NOT call SpawnFunc again.
+		res2, err := Resolve(ctx, pool, spawn, "u3", "300", ptrInt64(-3001), "again")
 		if err != nil {
 			t.Fatal(err)
 		}
 		if res2.Tier != TierOwnerBinding || res2.AgentID != "gamma" {
 			t.Errorf("second call tier=%s agent=%s", res2.Tier, res2.AgentID)
 		}
+		if got := atomic.LoadInt64(&calls); got != 1 {
+			t.Errorf("SpawnFunc re-called on second message: calls=%d", got)
+		}
 	})
 
-	t.Run("tier4_picker_required", func(t *testing.T) {
-		// Remove global default so no tier matches.
-		exec(t, pool, `UPDATE agent_settings SET is_default=FALSE`)
-		_, err := Resolve(ctx, pool, "u4", "400", ptrInt64(-4001), "no binding")
+	t.Run("tier4_picker_required_when_no_spawner", func(t *testing.T) {
+		// Nil SpawnFunc → no tier matches → caller renders picker.
+		_, err := Resolve(ctx, pool, nil, "u4", "400", ptrInt64(-4001), "no binding")
 		if !errors.Is(err, ErrRequirePicker) {
 			t.Errorf("err=%v, want ErrRequirePicker", err)
 		}
@@ -136,7 +173,7 @@ func TestConfirmPickerChoice_WritesBinding(t *testing.T) {
 	}
 
 	// Subsequent Resolve should go through tier-2.
-	r2, err := Resolve(ctx, pool, "u5", "500", nil, "hi")
+	r2, err := Resolve(ctx, pool, nil, "u5", "500", nil, "hi")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -145,54 +182,118 @@ func TestConfirmPickerChoice_WritesBinding(t *testing.T) {
 	}
 }
 
-func TestSetUserDefault_OverwritesOwner(t *testing.T) {
+func TestSetUserDefault(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()
 
-	if err := SetUserDefault(ctx, pool, "u6", "600", ptrInt64(-6001), "alpha"); err != nil {
-		t.Fatal(err)
+	// Attach to existing agent: succeeds.
+	res, err := SetUserDefault(ctx, pool, "u6", "600", ptrInt64(-6001), "alpha")
+	if err != nil {
+		t.Fatalf("set alpha: %v", err)
 	}
-	if err := SetUserDefault(ctx, pool, "u6", "600", ptrInt64(-6001), "beta"); err != nil {
-		t.Fatal(err)
+	if res.AgentID != "alpha" || !res.BindingSet {
+		t.Errorf("got %+v", res)
+	}
+
+	// Re-attach to a different existing agent: overwrites.
+	if _, err := SetUserDefault(ctx, pool, "u6", "600", ptrInt64(-6001), "beta"); err != nil {
+		t.Fatalf("set beta: %v", err)
 	}
 	var agentID string
 	pool.QueryRow(ctx, `SELECT agent_id FROM topic_agent_bindings WHERE binding_type='owner' AND user_id='u6' AND thread_id='600'`).Scan(&agentID)
 	if agentID != "beta" {
 		t.Errorf("agent=%q, want beta", agentID)
 	}
+
+	// Attach to an unknown token: returns ErrUnknownAgent; no binding written.
+	_, err = SetUserDefault(ctx, pool, "u7", "700", ptrInt64(-7001), "nobody")
+	if !errors.Is(err, ErrUnknownAgent) {
+		t.Errorf("err=%v, want ErrUnknownAgent", err)
+	}
+	var count int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM topic_agent_bindings WHERE user_id='u7' AND thread_id='700'`).Scan(&count)
+	if count != 0 {
+		t.Errorf("unknown attach wrote %d rows, want 0", count)
+	}
+
+	// Attach by handle.
+	exec(t, pool, `UPDATE agents SET handle='pilot' WHERE id='alpha'`)
+	res, err = SetUserDefault(ctx, pool, "u8", "800", ptrInt64(-8001), "pilot")
+	if err != nil {
+		t.Fatalf("handle attach: %v", err)
+	}
+	if res.AgentID != "alpha" {
+		t.Errorf("handle resolution got %q, want alpha", res.AgentID)
+	}
 }
 
-func TestSetGlobalDefault_UniqueDefault(t *testing.T) {
+func TestValidateHandle(t *testing.T) {
+	cases := []struct {
+		in    string
+		ok    bool
+		label string
+	}{
+		{"researcher", true, "simple"},
+		{"pilot-one", true, "dash"},
+		{"pilot_one", true, "underscore"},
+		{"Pilot", true, "mixed case (normalized to lowercase)"},
+		{"p", false, "too short"},
+		{"", false, "empty"},
+		{"pilot!", false, "invalid char"},
+		{"t-55", false, "reserved prefix"},
+		{"T-Cap", false, "reserved prefix case-insensitive"},
+		{"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", false, "too long"},
+	}
+	for _, c := range cases {
+		err := ValidateHandle(c.in)
+		got := err == nil
+		if got != c.ok {
+			t.Errorf("ValidateHandle(%q) ok=%v err=%v; want ok=%v (%s)",
+				c.in, got, err, c.ok, c.label)
+		}
+	}
+}
+
+func TestSetHandle(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()
-	exec(t, pool, `INSERT INTO agent_settings (agent_id) VALUES ('alpha'), ('beta')`)
 
-	if err := SetGlobalDefault(ctx, pool, "alpha"); err != nil {
-		t.Fatal(err)
+	// Happy path.
+	if err := SetHandle(ctx, pool, "alpha", "Researcher"); err != nil {
+		t.Fatalf("set handle: %v", err)
 	}
-	if err := SetGlobalDefault(ctx, pool, "beta"); err != nil {
-		t.Fatal(err)
+	var handle string
+	pool.QueryRow(ctx, `SELECT handle FROM agents WHERE id='alpha'`).Scan(&handle)
+	if handle != "researcher" {
+		t.Errorf("handle stored as %q, want lowercase 'researcher'", handle)
 	}
 
-	var count int
-	pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_settings WHERE is_default=TRUE`).Scan(&count)
-	if count != 1 {
-		t.Errorf("defaults=%d, want 1", count)
+	// Uniqueness: another agent can't take the same handle.
+	err := SetHandle(ctx, pool, "beta", "researcher")
+	if !errors.Is(err, ErrHandleTaken) {
+		t.Errorf("err=%v, want ErrHandleTaken", err)
 	}
-	var id string
-	pool.QueryRow(ctx, `SELECT agent_id FROM agent_settings WHERE is_default=TRUE`).Scan(&id)
-	if id != "beta" {
-		t.Errorf("default=%q, want beta", id)
+
+	// Same agent re-setting its own handle is a no-op success.
+	if err := SetHandle(ctx, pool, "alpha", "researcher"); err != nil {
+		t.Errorf("self re-set failed: %v", err)
+	}
+
+	// Reserved prefix is rejected at validation.
+	err = SetHandle(ctx, pool, "beta", "t-55")
+	if err == nil {
+		t.Error("reserved prefix should fail validation")
 	}
 }
 
 // TestResolve_Tier3_RaceOneWinner: two goroutines resolve tier-3 for the
-// same (user, thread). The partial unique index forces one writer, the
-// other reads the committed row.
+// same (user, thread). The partial unique index on topic_agent_bindings
+// forces one writer, the other reads the committed row.
 func TestResolve_Tier3_RaceOneWinner(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()
-	exec(t, pool, `INSERT INTO agent_settings (agent_id, is_default) VALUES ('gamma', TRUE)`)
+	var calls int64
+	spawn := countingSpawner("gamma", &calls)
 
 	var wg sync.WaitGroup
 	results := make([]*Resolution, 2)
@@ -200,7 +301,7 @@ func TestResolve_Tier3_RaceOneWinner(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			res, err := Resolve(ctx, pool, "race", "777", ptrInt64(-7001), "go")
+			res, err := Resolve(ctx, pool, spawn, "race", "777", ptrInt64(-7001), "go")
 			if err != nil {
 				t.Errorf("resolve %d: %v", i, err)
 				return
