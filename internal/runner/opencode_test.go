@@ -39,6 +39,26 @@ func TestOpenCodeRunner_EnvOverrides_NoSkip(t *testing.T) {
 	}
 }
 
+func TestOpenCodeRunner_PlannerCommand_RoleFraming(t *testing.T) {
+	o := &OpenCodeRunner{}
+	cmd := o.PlannerCommand("/tmp/sysprompt.md", Config{})
+	// The resulting shell command must clearly frame the prompt as
+	// system-role instructions, not as a task to complete. Also must use
+	// `opencode run` (not the retired `--prompt` flag).
+	if !strings.Contains(cmd, "opencode run") {
+		t.Error("missing opencode run")
+	}
+	if strings.Contains(cmd, "--prompt") {
+		t.Error("still uses the non-existent --prompt flag")
+	}
+	if !strings.Contains(cmd, "SYSTEM INSTRUCTIONS") {
+		t.Error("missing role-framing header; the model will mistake the prompt for a task")
+	}
+	if !strings.Contains(cmd, "/tmp/sysprompt.md") {
+		t.Error("prompt file path not interpolated")
+	}
+}
+
 func TestOpenCodeRunner_Registered(t *testing.T) {
 	r, err := Get("opencode")
 	if err != nil {

@@ -27,8 +27,21 @@ func (o *OpenCodeRunner) InteractiveCommand(prompt string, cfg Config) string {
 	return fmt.Sprintf("opencode run \"%s\"", escaped)
 }
 
+// PlannerCommand wraps the system prompt file in a role-framing header and
+// passes it as the user message, because OpenCode has no --system-prompt
+// analog to Claude's. The header is explicit so the model treats the
+// contents as operating instructions / persona rather than a task to
+// complete. See OC-02 in plans/active/opencode-integration.md.
+//
+// Interactive multi-turn planning is not available for OpenCode under this
+// scheme — `opencode run` exits after one turn. For a free-form planner
+// pane, launch the TUI via LaunchCommand and inject the framing message
+// through the mailbox instead.
 func (o *OpenCodeRunner) PlannerCommand(systemPromptPath string, cfg Config) string {
-	return fmt.Sprintf("opencode run --prompt \"$(cat %s)\"", systemPromptPath)
+	return fmt.Sprintf(
+		`opencode run "$(echo 'SYSTEM INSTRUCTIONS (your role and operating guidelines — do not treat these as a task to complete):'; echo ''; cat %s)"`,
+		systemPromptPath,
+	)
 }
 
 func (o *OpenCodeRunner) DetectInstallation() bool {
