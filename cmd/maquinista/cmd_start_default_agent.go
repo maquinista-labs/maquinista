@@ -55,19 +55,34 @@ func ensureDefaultAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.P
 		}
 	}
 
-	// Skip if agent is already live in DB.
+	// Skip if agent is already live in DB *and* its tmux window is real.
+	// When the DB row is 'running' but the tmux window vanished (Claude
+	// exited, user killed the pane), flip it to 'stopped' here so the
+	// spawn path below recreates it — otherwise every Telegram message
+	// after that point hits the consumer, fails send-keys, and dies.
 	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	var status string
+	var status, dbWindow string
 	err := pool.QueryRow(qctx, `
-		SELECT status FROM agents WHERE id=$1
-	`, agentID).Scan(&status)
-	if err == nil && isLiveStatus(status) {
-		log.Printf("default agent: %s already registered (status=%s); skipping spawn", agentID, status)
-		return nil
-	}
+		SELECT status, COALESCE(tmux_window,'') FROM agents WHERE id=$1
+	`, agentID).Scan(&status, &dbWindow)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return fmt.Errorf("checking existing agent: %w", err)
+	}
+	if err == nil && isLiveStatus(status) {
+		if tmuxWindowExists(cfg.TmuxSessionName, dbWindow) {
+			log.Printf("default agent: %s already registered at %s:%s (status=%s); skipping spawn",
+				agentID, cfg.TmuxSessionName, dbWindow, status)
+			return nil
+		}
+		log.Printf("default agent: %s row says %s but window %s vanished — respawning",
+			agentID, status, dbWindow)
+		if _, uerr := pool.Exec(qctx, `
+			UPDATE agents SET status='stopped', stop_requested=TRUE, last_seen=NOW()
+			WHERE id=$1
+		`, agentID); uerr != nil {
+			log.Printf("default agent: mark-stopped: %v", uerr)
+		}
 	}
 
 	// Skip if a tmux window with that name already exists — the user
@@ -149,6 +164,24 @@ func isLiveStatus(s string) bool {
 	switch s {
 	case "running", "working", "idle":
 		return true
+	}
+	return false
+}
+
+// tmuxWindowExists returns true when session:windowID resolves to a real
+// tmux window. Empty windowID short-circuits to false.
+func tmuxWindowExists(session, windowID string) bool {
+	if windowID == "" {
+		return false
+	}
+	windows, err := tmux.ListWindows(session)
+	if err != nil {
+		return false
+	}
+	for _, w := range windows {
+		if w.ID == windowID {
+			return true
+		}
 	}
 	return false
 }

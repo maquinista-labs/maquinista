@@ -4,13 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
+
+// isTmuxWindowMissing returns true for the send-keys error returned when
+// the target window is gone (killed, renamed, session recreated).
+func isTmuxWindowMissing(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "can't find window") ||
+		strings.Contains(err.Error(), "no such window") ||
+		strings.Contains(err.Error(), "no current window")
+}
 
 // runMailboxConsumer claims agent_inbox rows for every live agent and pipes
 // their content into the matching tmux window via SendKeysWithDelay. It
@@ -102,7 +115,38 @@ func consumeOne(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID, 
 	}
 	row := claimed[0]
 	text := extractInboxText(row.Content)
-	driveErr := tmux.SendKeysWithDelay(tmuxSession, row.AgentID, text, 500)
+
+	// Resolve the actual tmux window id for this agent. Using row.AgentID
+	// as the send-keys target only works when a window is *named* after
+	// the agent id — it breaks the moment the window is renamed, killed,
+	// or the user attaches a different id. agents.tmux_window stores the
+	// tmux window-id (e.g. "@21"), which is stable.
+	var tmuxWindow, agentStatus string
+	lookupErr := pool.QueryRow(ctx,
+		`SELECT tmux_window, status FROM agents WHERE id=$1`,
+		row.AgentID).Scan(&tmuxWindow, &agentStatus)
+	var driveErr error
+	switch {
+	case lookupErr != nil:
+		driveErr = fmt.Errorf("lookup agent %s: %w", row.AgentID, lookupErr)
+	case tmuxWindow == "":
+		driveErr = fmt.Errorf("agent %s has no tmux_window", row.AgentID)
+	default:
+		driveErr = tmux.SendKeysWithDelay(tmuxSession, tmuxWindow, text, 500)
+		// If the window is gone, tmux returns "can't find window: …".
+		// Mark the agent as stopped so the next start (or the next
+		// reconcile pass) can respawn it rather than retrying 5x.
+		if driveErr != nil && isTmuxWindowMissing(driveErr) {
+			if _, err := pool.Exec(ctx,
+				`UPDATE agents SET status='stopped', stop_requested=TRUE,
+				 last_seen=NOW() WHERE id=$1`, row.AgentID); err != nil {
+				log.Printf("mailbox consumer: mark-stopped %s: %v", row.AgentID, err)
+			} else {
+				log.Printf("mailbox consumer: agent %s window %s vanished — marked stopped",
+					row.AgentID, tmuxWindow)
+			}
+		}
+	}
 
 	tx2, err := pool.Begin(ctx)
 	if err != nil {
