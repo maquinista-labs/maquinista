@@ -4,8 +4,8 @@
 
 This document is a reader-facing reference for the v2 architecture. It does **not** cover:
 
-- Design rationale or rejected alternatives — see [`../plans/maquinista-v2.md`](../plans/maquinista-v2.md).
-- Task-by-task rollout, feature-flag names, or migration ordering — see [`../plans/maquinista-v2-implementation.md`](../plans/maquinista-v2-implementation.md).
+- Design rationale or rejected alternatives — see [`../plans/reference/maquinista-v2.md`](../plans/reference/maquinista-v2.md).
+- Task-by-task rollout, feature-flag names, or migration ordering — see [`../plans/archive/maquinista-v2-implementation.md`](../plans/archive/maquinista-v2-implementation.md).
 
 Some files and tables referenced here land across the three migrations described in the plan (`009_mailbox.sql`, `010_jobs.sql`, `011_task_pipeline.sql`). Forward-references are marked `[planned]` — the cited plan section is authoritative until the code ships.
 
@@ -55,7 +55,7 @@ Each arrow is a DB commit or an external side effect. `LISTEN/NOTIFY` channels w
 
 ## 3. The mailbox tables
 
-All schema lives in `internal/db/migrations/009_mailbox.sql` [planned — see `plans/maquinista-v2.md` §6]. Existing tables from migration `001_initial.sql` (`tasks`, `task_deps`, `task_context`, `agents`) are reused unchanged.
+All schema lives in `internal/db/migrations/009_mailbox.sql` [planned — see `plans/reference/maquinista-v2.md` §6]. Existing tables from migration `001_initial.sql` (`tasks`, `task_deps`, `task_context`, `agents`) are reused unchanged.
 
 ### 3.1 `agent_inbox`
 
@@ -103,13 +103,13 @@ One row per (outbox, subscriber) the relay produces. The dispatcher is the only 
 
 Per-`(agent_id, user_id, thread_id)` runner session ID. Replaces `session_map.json`. Written by the SessionStart hook (or the sidecar's fallback for hookless runners like OpenCode). `reset_flag` lets `/reset` in Telegram ask the next turn to start a fresh runner session.
 
-> **Deferred under the per-topic-agent pivot** (`plans/per-topic-agent-pivot.md`). With agents now 1:1 with topics, the `(user_id, thread_id)` part of the PK and `reset_flag` are not read by the routing layer. The table is kept intact for the forthcoming session-resume plan, which will tighten the PK and decide the fate of `reset_flag`.
+> **Deferred under the per-topic-agent pivot** (`plans/archive/per-topic-agent-pivot.md`). With agents now 1:1 with topics, the `(user_id, thread_id)` part of the PK and `reset_flag` are not read by the routing layer. The table is kept intact for the forthcoming session-resume plan, which will tighten the PK and decide the fate of `reset_flag`.
 
 ### 3.5 `agent_settings`
 
 Per-agent config: `persona`, `system_prompt`, `heartbeat`, `roster`. Used by the sidecar to seed the system prompt on turn entry.
 
-> The earlier `is_default BOOLEAN` column and its partial unique index (`WHERE is_default`) were dropped in migration 013 (per `plans/per-topic-agent-pivot.md`). Tier-3 routing no longer consults a global default; it spawns a fresh per-topic agent instead.
+> The earlier `is_default BOOLEAN` column and its partial unique index (`WHERE is_default`) were dropped in migration 013 (per `plans/archive/per-topic-agent-pivot.md`). Tier-3 routing no longer consults a global default; it spawns a fresh per-topic agent instead.
 
 ### 3.6 `topic_agent_bindings`
 
@@ -119,7 +119,7 @@ Carry-over from migration `007_topic_observations.sql`, extended in 009 with `us
 
 ## 4. Routing an unaddressed message
 
-When Telegram hands the bot a message, it resolves the target agent using a **4-tier ladder** (`plans/maquinista-v2.md` §8.1). First hit wins.
+When Telegram hands the bot a message, it resolves the target agent using a **4-tier ladder** (`plans/reference/maquinista-v2.md` §8.1). First hit wins.
 
 | Tier | Rule | Side effect |
 |------|------|-------------|
@@ -149,7 +149,7 @@ Tiers deliberately **not** present (vs. tinyclaw): static `settings.json` mappin
 
 ## 5. Fan-out on reply
 
-When the outbox relay picks up a pending outbox row, it produces `channel_deliveries` rows from **three** sources (`plans/maquinista-v2.md` §8.2), UNIONed and deduped by the unique index:
+When the outbox relay picks up a pending outbox row, it produces `channel_deliveries` rows from **three** sources (`plans/reference/maquinista-v2.md` §8.2), UNIONed and deduped by the unique index:
 
 1. **Origin** (`binding_type='origin'`) — the triggering inbox row's `origin_*` columns, if `origin_channel='telegram'`. This covers tier-1 `@mentions` from unbound topics where no binding exists yet.
 2. **Owner** — the agent's single owner topic in `topic_agent_bindings`.
@@ -181,7 +181,7 @@ Auth is non-negotiable: per-handler secret, HMAC verification on every POST, rep
 
 ### 6.4 Task pipeline (Appendix D surface — planner → `@impl-<task_id>` → `@reviewer` → `@pr-closer`)
 
-`plans/maquinista-v2.md` Appendix D wires the existing planner + task DAG (migrations 001, 004, 008) into the mailbox without modifying those tables beyond migration 011's three columns (`worktree_path`, `pr_url`, `pr_state`) and a partial unique index that enforces "at most one live agent per task."
+`plans/reference/maquinista-v2.md` Appendix D wires the existing planner + task DAG (migrations 001, 004, 008) into the mailbox without modifying those tables beyond migration 011's three columns (`worktree_path`, `pr_url`, `pr_state`) and a partial unique index that enforces "at most one live agent per task."
 
 Flow (abbreviated):
 
@@ -315,7 +315,7 @@ maquinista schedule add \
 | `state.ThreadBindings` (in-memory map) | **Removed** — read-through cache over `topic_agent_bindings` |
 | `internal/monitor/` (pane scraper pushing to TG) | **Folded** into the sidecar; JSONL tail writes `agent_outbox` instead of sending |
 | `tmux.SendKeysWithDelay` from `internal/bot/handlers.go` | **Removed** — ingress writes `agent_inbox` instead |
-| Non-interactive runner surface (`RunNonInteractive`, `NonInteractiveArgs`, `-p <msg>`) | **Removed** — see `plans/maquinista-v2.md` §10a for the full inventory |
+| Non-interactive runner surface (`RunNonInteractive`, `NonInteractiveArgs`, `-p <msg>`) | **Removed** — see `plans/reference/maquinista-v2.md` §10a for the full inventory |
 | `maquinista schedule` (existing cron, DAG-template-based) | **Retargeted** — still creates task rows, but their dispatch edge moves from "direct tmux spawn" to "insert `agent_inbox`" (§6.4) |
 | volta planner + task DAG (migrations 001, 004, 008) | **Preserved unchanged** — Appendix D adds the dispatch edge; the planner itself keeps writing `tasks` and `task_deps` |
 | `/t_plan` (see `planning-workflows.md` §1) | **Retargeted** — planner agent writes tasks via the typed `maquinista tasks` tool surface, not raw SQL |
@@ -348,14 +348,14 @@ maquinista schedule add \
 | `cmd/maquinista/cmd_task_scheduler.go` [planned] | `maquinista task-scheduler` (§6.4 dispatch loop) |
 | `cmd/maquinista/cmd_jobs.go`, `cmd_webhooks.go` [planned] | CLI for registering scheduled jobs and webhook handlers |
 | `hook/hook.go` | SessionStart writes `agent_topic_sessions` |
-| `plans/maquinista-v2.md` | authoritative design; §6 schema, §8 flows, Appendices C & D |
-| `plans/maquinista-v2-implementation.md` | 21-task rollout plan, feature flags, testing plan |
+| `plans/reference/maquinista-v2.md` | authoritative design; §6 schema, §8 flows, Appendices C & D |
+| `plans/archive/maquinista-v2-implementation.md` | 21-task rollout plan, feature flags, testing plan |
 
 ---
 
 ## 12. Open questions
 
-Inherited from `plans/maquinista-v2.md` §11; listed here so the docs reader sees them:
+Inherited from `plans/reference/maquinista-v2.md` §11; listed here so the docs reader sees them:
 
 1. **Lease duration** — 5min is the starting default. Too short causes duplicate processing on slow turns; too long wastes time after a real crash. Revisit once there's production traffic to measure turn-length distribution.
 2. **Attachment size threshold** — `BYTEA` to ~10MB, Large Objects beyond. Current plan picks 5MB; confirm with real payloads.

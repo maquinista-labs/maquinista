@@ -1,5 +1,5 @@
 -- Migration 010: programmatic job sources (scheduled + webhook) from
--- plans/maquinista-v2.md Appendix C. Both tables feed agent_inbox rows
+-- plans/reference/maquinista-v2.md Appendix C. Both tables feed agent_inbox rows
 -- — we also widen the from_kind check so inbox consumers accept them.
 
 CREATE TABLE IF NOT EXISTS scheduled_jobs (

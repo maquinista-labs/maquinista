@@ -1,7 +1,7 @@
 -- 014_agents_handle.sql
 --
 -- Adds a nullable user-assigned handle to agents. See
--- plans/per-topic-agent-pivot.md §Q1.
+-- plans/archive/per-topic-agent-pivot.md §Q1.
 --
 -- The stable PK (agents.id) is auto-generated as t-<chat_id>-<thread_id>
 -- at tier-3 spawn time and never user-facing. The handle is the

@@ -55,7 +55,7 @@ type Bot struct {
 	// Default runner for agent spawning
 	defaultRunner runner.AgentRunner
 	// Spawns a fresh per-topic agent when tier-3 of the routing ladder
-	// fires (plans/per-topic-agent-pivot.md). Injected by cmd/maquinista so
+	// fires (plans/archive/per-topic-agent-pivot.md). Injected by cmd/maquinista so
 	// the bot package doesn't need to import tmux/runner spawn machinery
 	// directly. May be nil; a nil spawner forces the routing ladder to
 	// surface the tier-4 picker via ErrRequirePicker.

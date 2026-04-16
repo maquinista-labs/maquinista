@@ -41,7 +41,7 @@ func resolveStartCWD(cfg *config.Config) (string, error) {
 // newTopicAgentSpawner returns a routing.SpawnFunc closure that creates a
 // fresh per-topic agent: new agents row (id = t-<chat>-<thread>), new tmux
 // window, new runner process. Wired into the bot's routing ladder tier 3
-// per plans/per-topic-agent-pivot.md.
+// per plans/archive/per-topic-agent-pivot.md.
 //
 // Safe to call concurrently: the upsert on agents.id collapses same-topic
 // races; tmux window creation is idempotent via EnsureSession + unique

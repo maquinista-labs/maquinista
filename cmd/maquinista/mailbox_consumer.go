@@ -32,7 +32,7 @@ func isTmuxWindowMissing(err error) bool {
 //
 // This function replaces the task-1.6 internal/inboxbridge package
 // (retired by task 1.9). The long-term plan is one sidecar goroutine per
-// agent (plans/maquinista-v2.md §7); that wiring lives in a follow-up.
+// agent (plans/reference/maquinista-v2.md §7); that wiring lives in a follow-up.
 func runMailboxConsumer(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID string) {
 	listener, err := pool.Acquire(ctx)
 	if err != nil {

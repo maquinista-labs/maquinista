@@ -1,5 +1,5 @@
 // Package relay implements the outbox relay daemon from
-// plans/maquinista-v2.md §8.2. It claims rows from agent_outbox, fans them
+// plans/reference/maquinista-v2.md §8.2. It claims rows from agent_outbox, fans them
 // out to channel_deliveries (origin topic + owner/observer bindings), turns
 // `[@agent_id: text]` mentions into follow-up agent_inbox rows, and marks
 // the outbox row as routed — all inside one transaction so a crash leaves

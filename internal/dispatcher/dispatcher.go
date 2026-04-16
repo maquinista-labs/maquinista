@@ -1,5 +1,5 @@
 // Package dispatcher implements the Telegram channel dispatcher from
-// plans/maquinista-v2.md §8.3. It claims pending channel_deliveries rows,
+// plans/reference/maquinista-v2.md §8.3. It claims pending channel_deliveries rows,
 // renders agent_outbox.content into Telegram text, sends via the Bot API,
 // and flips the row to 'sent' (success), 'pending+next_attempt_at' (429),
 // or 'failed' (exhausted attempts).

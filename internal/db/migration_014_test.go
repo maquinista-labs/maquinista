@@ -10,7 +10,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/dbtest"
 )
 
-// Migrations 013 + 014 land together per plans/per-topic-agent-pivot.md:
+// Migrations 013 + 014 land together per plans/archive/per-topic-agent-pivot.md:
 // 013 drops agent_settings.is_default, 014 adds agents.handle with a
 // partial unique index on LOWER(handle). Both are exercised here.
 

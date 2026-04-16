@@ -1,6 +1,6 @@
 // Package routing implements the §8.1 routing ladder: explicit @mention →
 // owner binding → spawn per-topic agent → explicit attach via picker. See
-// plans/maquinista-v2.md §8.1 and plans/per-topic-agent-pivot.md for the
+// plans/reference/maquinista-v2.md §8.1 and plans/archive/per-topic-agent-pivot.md for the
 // full rationale.
 package routing
 

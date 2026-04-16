@@ -56,7 +56,7 @@ type Config struct {
 	// user's home dir when unset. Override with --agent-cwd.
 	DefaultAgentCWD string
 
-	// Feature flags (see plans/maquinista-v2-implementation.md §"Feature flags").
+	// Feature flags (see plans/archive/maquinista-v2-implementation.md §"Feature flags").
 	// MailboxOutbound enables shadow-mode writes from the monitor into
 	// agent_outbox — the existing Telegram path continues to run so traffic
 	// is unaffected. Toggled by MAILBOX_OUTBOUND=1.

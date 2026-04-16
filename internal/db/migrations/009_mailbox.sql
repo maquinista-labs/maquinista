@@ -1,5 +1,5 @@
 -- Migration 009: mailbox schema
--- See plans/maquinista-v2.md §6. Introduces the DB-backed agent mailbox:
+-- See plans/reference/maquinista-v2.md §6. Introduces the DB-backed agent mailbox:
 -- agent_inbox / agent_outbox / channel_deliveries, conversations,
 -- per-(agent, topic) runner sessions, attachments, agent settings, and the
 -- NOTIFY triggers that drive the sidecar + relay + dispatcher daemons.
@@ -48,7 +48,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_topic_binding_observer
 -- Per-(agent, topic) runner session IDs.
 --
 -- Owned by the deferred session-resume plan: under the per-topic-agent
--- pivot (plans/per-topic-agent-pivot.md) agents are 1:1 with topics, so
+-- pivot (plans/archive/per-topic-agent-pivot.md) agents are 1:1 with topics, so
 -- the (user_id, thread_id) part of the PK and the reset_flag column are
 -- not read by the pivoted 1:1 routing model. The table shape is
 -- preserved here until session-resume actually lands and decides

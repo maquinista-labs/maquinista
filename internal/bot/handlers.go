@@ -80,7 +80,7 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 
 	// Keep state.json bindings in sync with topic_agent_bindings so the
 	// monitor (which still reads state.*) can route responses back. See
-	// plans/json-state-migration.md Phase B for the proper fix that
+	// plans/active/json-state-migration.md Phase B for the proper fix that
 	// drops this dual-write.
 	b.syncAgentStateFor(ctx, pool, res.AgentID, userID, threadID, chatID)
 

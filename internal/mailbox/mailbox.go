@@ -1,6 +1,6 @@
 // Package mailbox provides typed wrappers for the agent_inbox / agent_outbox /
 // channel_deliveries / message_attachments tables introduced by migration 009
-// (see plans/maquinista-v2.md §6). Every op accepts a pgx.Tx so callers hold
+// (see plans/reference/maquinista-v2.md §6). Every op accepts a pgx.Tx so callers hold
 // the transaction boundary.
 package mailbox
 

@@ -29,7 +29,7 @@ Problems with keeping them on disk:
 - **Harder to inspect.** Every debug session ends with `cat
   ~/.maquinista/state.json | jq`. A `psql` one-liner wins.
 
-The v2 plan (`plans/maquinista-v2-implementation.md §1.9`) explicitly
+The v2 plan (`plans/archive/maquinista-v2-implementation.md §1.9`) explicitly
 calls for deleting `state.ThreadBindings` and `session_map.json`
 readers/writers and relocating session ids into `agent_topic_sessions`.
 That task is not started.

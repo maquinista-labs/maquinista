@@ -1,4 +1,4 @@
-// Package sidecar is the per-agent supervisor from plans/maquinista-v2.md §7.
+// Package sidecar is the per-agent supervisor from plans/reference/maquinista-v2.md §7.
 //
 // A SidecarRunner owns two things for exactly one agent:
 //   - the pty driver: consumes agent_inbox rows, pipes content into the pty,

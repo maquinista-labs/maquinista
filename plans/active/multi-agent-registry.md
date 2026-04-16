@@ -27,7 +27,7 @@ The existing schema already has most of what's needed:
   008, 009.
 - `agent_settings (agent_id, persona, system_prompt, heartbeat, roster)`
   — migration 009. The `is_default` column introduced in 009 was dropped
-  in 013 per `plans/per-topic-agent-pivot.md` (tier-3 now spawns, doesn't
+  in 013 per `plans/archive/per-topic-agent-pivot.md` (tier-3 now spawns, doesn't
   look up a global default).
 - `agents.handle` (migration 014) — nullable user-assigned alias for
   `@mention` / `/agent_default` resolution.
@@ -150,12 +150,12 @@ Migration `013_agents_cwd_system_prompt.sql`:
 ```sql
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS cwd TEXT;
 -- session_id + window_name land in the separate plan
--- plans/json-state-migration.md Phase A; this migration only adds cwd
+-- plans/active/json-state-migration.md Phase A; this migration only adds cwd
 -- since reconcile needs it in the agents row directly (avoid reading
 -- across tables during spawn hot path).
 ```
 
-If `plans/json-state-migration.md` Phase A lands first, `cwd` is
+If `plans/active/json-state-migration.md` Phase A lands first, `cwd` is
 already present — skip this migration, reuse the column.
 
 No new columns on `agent_settings`; it already has what Phase 2 needs.
@@ -222,7 +222,7 @@ No new columns on `agent_settings`; it already has what Phase 2 needs.
    Phase 1 §Step 2 says yes. Consider a `--no-bootstrap` flag or a
    sentinel row.
 4. **~~Interaction with `global_default`~~** — obsoleted by
-   `plans/per-topic-agent-pivot.md`. Tier-3 now spawns a fresh
+   `plans/archive/per-topic-agent-pivot.md`. Tier-3 now spawns a fresh
    per-topic agent on first message; there is no global default to
    toggle. Resolved.
 5. **`agent_settings.roster`** — undocumented today. Does anyone know

@@ -17,7 +17,7 @@ type Config struct {
 
 // AgentRunner defines the interface for pluggable agent runners.
 //
-// α (see plans/maquinista-v2.md §10a) exercises runners exclusively
+// α (see plans/reference/maquinista-v2.md §10a) exercises runners exclusively
 // through InteractiveCommand — the non-interactive / one-shot surface
 // was retired in task 3.7.
 type AgentRunner interface {

@@ -36,7 +36,7 @@ We already run Postgres for tasks, worktrees, planner sessions, observations, an
 - Preserve Postgres + task DAG + orchestrator + worktrees + merge commands + planner/executor roles.
 - **Single agent-lifetime model: α** — long-lived agent (tmux pane + Claude) + per-agent sidecar that pumps the DB mailbox into/out of the pty. Per-message CLI invocation (β) and dual-mode (γ) are explicitly out of scope. Features in the current codebase that assume a non-interactive / one-shot execution path will be removed (see §10a).
 - **No filesystem-based communication**. Every piece of state tinyclaw keeps in files goes in Postgres instead (messages, conversations, session IDs, attachments).
-- Doc lives at `plans/maquinista-v2.md`.
+- Doc lives at `plans/reference/maquinista-v2.md`.
 
 ---
 
@@ -610,7 +610,7 @@ Consequences accepted:
 
 ### 8.1 Inbound message
 
-Routing ladder (resolved in order; first hit wins). See `plans/per-topic-agent-pivot.md` for the pivot that rewrites tier 3.
+Routing ladder (resolved in order; first hit wins). See `plans/archive/per-topic-agent-pivot.md` for the pivot that rewrites tier 3.
 
 1. **Explicit mention** — message text starts with `@<id_or_handle>`. Matches against both `agents.id` and `agents.handle` (nullable user-assigned alias). Strip the mention, use the named agent. Does **not** write a binding.
 2. **Topic owner binding** — `topic_agent_bindings` row with `(user_id, thread_id)` and `binding_type='owner'`. This is the steady state after any previous routing established the topic.

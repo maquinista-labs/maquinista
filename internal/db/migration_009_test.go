@@ -58,7 +58,7 @@ func TestMigration009_AppliesCleanly(t *testing.T) {
 	}
 
 	// agent_settings.is_default was introduced in 009 and retired in
-	// migration 013 (per plans/per-topic-agent-pivot.md). RunMigrations
+	// migration 013 (per plans/archive/per-topic-agent-pivot.md). RunMigrations
 	// applies everything in order, so by the time this test runs the
 	// column is gone — don't assert its presence here.
 }

@@ -2,7 +2,7 @@
 
 > This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
 
-Derived from `plans/maquinista-v2.md` (§10 migration path, Appendices C and D). Tasks execute **strictly sequentially** — each task's deliverable gates the next one's start. Every task carries a feature flag so production traffic can be cut over gradually; each task's testing section assumes the flag is OFF for live users until verification is complete.
+Derived from `plans/reference/maquinista-v2.md` (§10 migration path, Appendices C and D). Tasks execute **strictly sequentially** — each task's deliverable gates the next one's start. Every task carries a feature flag so production traffic can be cut over gradually; each task's testing section assumes the flag is OFF for live users until verification is complete.
 
 **Phase map:**
 
@@ -20,7 +20,7 @@ All schema SQL lives under `internal/db/migrations/`. All tests live beside the 
 
 **Depends on:** nothing (first task).
 
-**Deliverable:** `internal/db/migrations/009_mailbox.sql` containing the tables and triggers from `plans/maquinista-v2.md` §6 — extended `topic_agent_bindings`, `agent_topic_sessions`, `conversations`, `agent_inbox`, `agent_outbox`, `channel_deliveries`, `message_attachments`, `agent_settings` (with `is_default BOOLEAN`), NOTIFY triggers for `agent_inbox_new` / `agent_outbox_new` / `channel_delivery_new` / `agent_stop`, and `ALTER TABLE agents ADD COLUMN stop_requested BOOLEAN`. Backfill script moves `state.ThreadBindings` JSON into `topic_agent_bindings`.
+**Deliverable:** `internal/db/migrations/009_mailbox.sql` containing the tables and triggers from `plans/reference/maquinista-v2.md` §6 — extended `topic_agent_bindings`, `agent_topic_sessions`, `conversations`, `agent_inbox`, `agent_outbox`, `channel_deliveries`, `message_attachments`, `agent_settings` (with `is_default BOOLEAN`), NOTIFY triggers for `agent_inbox_new` / `agent_outbox_new` / `channel_delivery_new` / `agent_stop`, and `ALTER TABLE agents ADD COLUMN stop_requested BOOLEAN`. Backfill script moves `state.ThreadBindings` JSON into `topic_agent_bindings`.
 
 **Testing:**
 
@@ -291,13 +291,13 @@ Add `/agent_rename <handle>` to set the handle on the current topic's owner agen
 
 **Depends on:** 3.6.
 
-**Deliverable:** remove the non-interactive runner surface listed in `plans/maquinista-v2.md` §10a — `Runner.NonInteractiveArgs`, `Runner.RunNonInteractive`, all per-runner implementations (claude/opencode/openclaude/custom), `CustomRunner.NonInterTpl`, and the corresponding `TestXXX_NonInteractive*` tests. Keep `InteractiveCommand` only. Small PR per runner wrapper for easy review.
+**Deliverable:** remove the non-interactive runner surface listed in `plans/reference/maquinista-v2.md` §10a — `Runner.NonInteractiveArgs`, `Runner.RunNonInteractive`, all per-runner implementations (claude/opencode/openclaude/custom), `CustomRunner.NonInterTpl`, and the corresponding `TestXXX_NonInteractive*` tests. Keep `InteractiveCommand` only. Small PR per runner wrapper for easy review.
 
 **Testing:**
 
 - `go build ./...` and `go test ./...` green after each PR.
 - Grep confirms zero remaining references to the removed identifiers.
-- Check §10a of `plans/maquinista-v2.md`: mark each row done or delete.
+- Check §10a of `plans/reference/maquinista-v2.md`: mark each row done or delete.
 
 ---
 

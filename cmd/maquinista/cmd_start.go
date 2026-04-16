@@ -243,7 +243,7 @@ func runStart() error {
 		}
 
 		// Inject the tier-3 spawn callback into the bot. Per
-		// plans/per-topic-agent-pivot.md the daemon no longer spawns a
+		// plans/archive/per-topic-agent-pivot.md the daemon no longer spawns a
 		// shared default agent at startup; agents are spawned per topic
 		// on first message via routing.Resolve → SpawnFunc.
 		if cwd, cwdErr := resolveStartCWD(cfg); cwdErr != nil {

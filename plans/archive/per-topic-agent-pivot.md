@@ -115,7 +115,7 @@ Explicitly out of scope, deferred to follow-up plans:
      the steady state.
    - Any lingering reference to `is_default`: remove.
 
-3. `ARCHITECTURE-COMPARISON.md`
+3. `architecture-comparison.md`
    - Update tinyclaw comparison: maquinista is now 1 topic : 1 agent : 1
      session, closer to volta and hermes-agent than to Letta.
 
