@@ -46,6 +46,14 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_topic_binding_observer
 
 -- --------------------------------------------------------------------
 -- Per-(agent, topic) runner session IDs.
+--
+-- Owned by the deferred session-resume plan: under the per-topic-agent
+-- pivot (plans/per-topic-agent-pivot.md) agents are 1:1 with topics, so
+-- the (user_id, thread_id) part of the PK and the reset_flag column are
+-- not read by the pivoted 1:1 routing model. The table shape is
+-- preserved here until session-resume actually lands and decides
+-- whether to tighten the PK to just agent_id, drop reset_flag, or
+-- replace it with `session_id IS NULL` semantics.
 -- --------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS agent_topic_sessions (
     agent_id    TEXT        NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -53,10 +61,10 @@ CREATE TABLE IF NOT EXISTS agent_topic_sessions (
     thread_id   TEXT        NOT NULL,
     runner      TEXT        NOT NULL,
     session_id  TEXT        NOT NULL,
-    reset_flag  BOOLEAN     NOT NULL DEFAULT FALSE,
+    reset_flag  BOOLEAN     NOT NULL DEFAULT FALSE,  -- deferred: owned by session-resume plan
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (agent_id, user_id, thread_id)
+    PRIMARY KEY (agent_id, user_id, thread_id)       -- deferred: owned by session-resume plan
 );
 
 -- --------------------------------------------------------------------

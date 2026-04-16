@@ -103,9 +103,13 @@ One row per (outbox, subscriber) the relay produces. The dispatcher is the only 
 
 Per-`(agent_id, user_id, thread_id)` runner session ID. Replaces `session_map.json`. Written by the SessionStart hook (or the sidecar's fallback for hookless runners like OpenCode). `reset_flag` lets `/reset` in Telegram ask the next turn to start a fresh runner session.
 
-### 3.5 `agent_settings` (+ `is_default`)
+> **Deferred under the per-topic-agent pivot** (`plans/per-topic-agent-pivot.md`). With agents now 1:1 with topics, the `(user_id, thread_id)` part of the PK and `reset_flag` are not read by the routing layer. The table is kept intact for the forthcoming session-resume plan, which will tighten the PK and decide the fate of `reset_flag`.
 
-Per-agent config: `persona`, `system_prompt`, `heartbeat`, `roster`, and — new in v2 — `is_default BOOLEAN`. A partial unique index (`WHERE is_default`) enforces at most one global default, which is the tier-3 routing target in §4.
+### 3.5 `agent_settings`
+
+Per-agent config: `persona`, `system_prompt`, `heartbeat`, `roster`. Used by the sidecar to seed the system prompt on turn entry.
+
+> The earlier `is_default BOOLEAN` column and its partial unique index (`WHERE is_default`) were dropped in migration 013 (per `plans/per-topic-agent-pivot.md`). Tier-3 routing no longer consults a global default; it spawns a fresh per-topic agent instead.
 
 ### 3.6 `topic_agent_bindings`
 
@@ -119,23 +123,23 @@ When Telegram hands the bot a message, it resolves the target agent using a **4-
 
 | Tier | Rule | Side effect |
 |------|------|-------------|
-| 1 | Explicit `@<agent_id>` prefix in `m.text` | strip mention, use that agent; **no binding written** |
+| 1 | Explicit `@<id-or-handle>` prefix in `m.text` | strip mention, resolve against `agents.id` or `agents.handle` (case-insensitive), use that agent; **no binding written** |
 | 2 | `topic_agent_bindings` row with `(user_id, thread_id, binding_type='owner')` | none — steady state |
-| 3 | `agent_settings.is_default = TRUE` | on first hit, write the owner binding so tier 2 takes over next time |
-| 4 | Agent picker (inline keyboard) | user's selection writes the owner binding |
+| 3 | **Spawn a fresh per-topic agent** via `SpawnTopicAgent` (id `t-<chat_id>-<thread_id>`) | write the owner binding so tier 2 takes over next turn |
+| 4 | `/agent_default @handle` (explicit attach) | user's selection writes the owner binding |
 
 ```
-if m.text matches /^@(\w+)/:
-    agent_id = captured; strip mention
+if m.text matches /^@([A-Za-z0-9][A-Za-z0-9_-]*)/:
+    token = captured
+    SELECT id FROM agents WHERE id=$token OR LOWER(handle)=LOWER($token) LIMIT 1;
+    agent_id = resolved; strip mention
 else:
     SELECT agent_id FROM topic_agent_bindings
       WHERE user_id=$u AND thread_id=$t AND binding_type='owner';
     if not found:
-        SELECT agent_id FROM agent_settings WHERE is_default LIMIT 1;
-        if found:
-            INSERT INTO topic_agent_bindings (…, binding_type='owner');
-        else:
-            send picker; return  -- resume on callback
+        agent_id = SpawnTopicAgent($u, $t, $c, cwd, runner)
+                 = 't-' || $c || '-' || $t
+        INSERT INTO topic_agent_bindings (…, binding_type='owner');
 INSERT INTO agent_inbox (…) ON CONFLICT DO NOTHING;
 ```
 
@@ -224,9 +228,10 @@ Lease expiry reaper: rows stuck in `status='processing'` past `lease_expires` fl
 
 | Command | Reads | Purpose |
 |---|---|---|
-| `/default @agent` | `agent_settings.is_default` | set / clear the tier-3 catch-all |
-| `/bind @agent` | `topic_agent_bindings (owner)` | explicit owner for this topic |
-| `/observe @agent` | `topic_agent_bindings (observer)` | add this topic as an observer |
+| `/agent_list` | `agents` | list all registered agents |
+| `/agent_default @handle` | `topic_agent_bindings (owner)` | attach this topic to an existing agent (unknown handle errors) |
+| `/agent_rename <handle>` | `agents.handle` | set a friendly alias on the current topic's agent |
+| `/observe @handle` | `topic_agent_bindings (observer)` | add this topic as an observer (when implemented) |
 | `/jobs` | `scheduled_jobs` | list registered cron jobs |
 | `/hooks` | `webhook_handlers` | list registered webhook endpoints |
 | `/job-runs <name>` | `job_runs` view | last N executions of a job or hook |
@@ -263,9 +268,10 @@ When a Telegram message got no response, walk the pipeline in order:
 
 ### 9.1 Add a new agent
 
-1. `INSERT INTO agent_settings (agent_id, persona, system_prompt, heartbeat, roster, is_default)` — set `is_default=TRUE` only if you want the global catch-all.
-2. The first inbox row for the agent lazy-spawns the pty + sidecar. No code change needed if the agent uses an existing runner type.
-3. For a bespoke runner, add to `internal/runner/` (`InteractiveCommand` only — the non-interactive surface is being removed per §10a of the plan).
+1. Easiest: send a message in a fresh Telegram topic. Tier-3 of the routing ladder will spawn a fresh agent (`t-<chat_id>-<thread_id>`), tmux window, and Claude process automatically.
+2. Optionally run `/agent_rename <handle>` in that topic to give it a friendly alias you can mention from other topics.
+3. `INSERT INTO agent_settings (agent_id, persona, system_prompt, heartbeat, roster)` to tune persona/prompt.
+4. For a bespoke runner, add to `internal/runner/` (`InteractiveCommand` only — the non-interactive surface is being removed per §10a of the plan).
 
 ### 9.2 Add a new skill
 
@@ -325,7 +331,9 @@ maquinista schedule add \
 | `internal/db/migrations/004_notify_triggers.sql` | `task_events` NOTIFY (reused by task-scheduler §6.4) |
 | `internal/db/migrations/007_topic_observations.sql` | `topic_agent_bindings` (extended in 009) |
 | `internal/db/migrations/008_agent_role.sql` | `agents.role` column (used by `ensure_agent(role, task_id)`) |
-| `internal/db/migrations/009_mailbox.sql` [planned] | mailbox tables, `is_default`, NOTIFY triggers (§3) |
+| `internal/db/migrations/009_mailbox.sql` | mailbox tables, NOTIFY triggers (§3). `is_default` dropped in 013. |
+| `internal/db/migrations/013_drop_default_agent_flag.sql` | retires tier-3 global default (per-topic-agent-pivot.md) |
+| `internal/db/migrations/014_agents_handle.sql` | `agents.handle` + case-insensitive unique index |
 | `internal/db/migrations/010_jobs.sql` [planned] | `scheduled_jobs`, `webhook_handlers`, `job_runs` view (§6.2/6.3) |
 | `internal/db/migrations/011_task_pipeline.sql` [planned] | `tasks.worktree_path`/`pr_url`/`pr_state`, `uq_agents_task_live` (§6.4) |
 | `internal/bot/handlers.go` | Telegram ingress → `agent_inbox` INSERT (Phase 1 of impl plan) |

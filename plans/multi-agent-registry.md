@@ -25,8 +25,12 @@ The existing schema already has most of what's needed:
 - `agents (id, tmux_session, tmux_window, role, status, runner_type,
   task_id, stop_requested, started_at, last_seen)` — migrations 001, 006,
   008, 009.
-- `agent_settings (agent_id, persona, system_prompt, heartbeat, roster,
-  is_default)` — migration 009.
+- `agent_settings (agent_id, persona, system_prompt, heartbeat, roster)`
+  — migration 009. The `is_default` column introduced in 009 was dropped
+  in 013 per `plans/per-topic-agent-pivot.md` (tier-3 now spawns, doesn't
+  look up a global default).
+- `agents.handle` (migration 014) — nullable user-assigned alias for
+  `@mention` / `/agent_default` resolution.
 
 Task-scoped agents (spawned by `internal/orchestrator/ensure_agent.go`
 with `task_id != NULL`) are orthogonal — they come and go per task and
@@ -112,7 +116,7 @@ New `cmd/maquinista/cmd_agent.go` with subcommands:
 
 | Subcommand | Purpose |
 |---|---|
-| `agent list [--all]` | Table of `id, runner, status, tmux_window, cwd, is_default, task_id, last_seen`. `--all` includes `archived` + task-scoped. |
+| `agent list [--all]` | Table of `id, handle, runner, status, tmux_window, cwd, task_id, last_seen`. `--all` includes `archived` + task-scoped. |
 | `agent add <id> [--runner claude] [--role user] [--cwd DIR] [--system-prompt FILE] [--persona NAME]` | Insert row into `agents` + upsert `agent_settings`. |
 | `agent edit <id> [--runner …] [--cwd …] [--system-prompt …] [--persona …]` | Partial update. |
 | `agent archive <id>` | `UPDATE agents SET status='archived'`. Reconcile skips. Keeps history / bindings intact. |
@@ -217,10 +221,10 @@ No new columns on `agent_settings`; it already has what Phase 2 needs.
    archived the last agent), do we re-insert the default? Current
    Phase 1 §Step 2 says yes. Consider a `--no-bootstrap` flag or a
    sentinel row.
-4. **Interaction with `global_default`** — should `agent add` set
-   `is_default=TRUE` for the first inserted agent automatically? Makes
-   the fresh-install flow "messages route immediately without
-   picker"; but surprises multi-agent users who add a second one.
+4. **~~Interaction with `global_default`~~** — obsoleted by
+   `plans/per-topic-agent-pivot.md`. Tier-3 now spawns a fresh
+   per-topic agent on first message; there is no global default to
+   toggle. Resolved.
 5. **`agent_settings.roster`** — undocumented today. Does anyone know
    what it holds? Check before Phase 2 writes more settings.
 
