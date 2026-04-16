@@ -1,5 +1,7 @@
 # OpenCode Integration Improvements
 
+> This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
+
 Derived from a comparison of the Claude Code source and Maquinista's current OpenCode runner.
 The goal is to close the capability gap so OpenCode agents are as reliable as Claude Code agents.
 

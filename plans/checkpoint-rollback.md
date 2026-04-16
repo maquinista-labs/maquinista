@@ -1,5 +1,7 @@
 # Agent checkpoints & rollback
 
+> This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
+
 ## Context
 
 Plandex (`/home/otavio/code/plandex`) has a polished checkpoint /

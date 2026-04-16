@@ -6,6 +6,23 @@ Status: **draft** — written for iteration.
 
 ---
 
+## 0. Principle: Postgres is the system of record
+
+**Persistent state is a Postgres row.** Never a markdown file, never JSON on disk, never a dotfile. The database is the system of record. Every value that has to survive a bot restart — bindings, sessions, memory, soul, skills, checkpoints, configuration, scheduled jobs, per-topic overrides — is a table column, not a filesystem artifact. Markdown is for humans reading documentation; tables are for the system to read. If a feature would introduce "we scan some files under `~/.maquinista/*.md` at spawn time," redesign it as a table.
+
+Rationale:
+
+- One source of truth. No file/DB divergence, no stale caches.
+- Transactional updates across related fields.
+- Queryable from operators, dashboard, schedulers, tests.
+- Multi-writer-safe without flocks or replace-and-pray.
+- Schema evolves through migrations, not ad-hoc file-format parsers.
+- Restart reliability: if the daemon dies mid-write, Postgres is the arbiter.
+
+The only permitted exceptions are ephemeral, process-local artifacts (monitor byte offsets, transcript tailing cursors) — and per `json-state-migration.md` even those are moving to Postgres. Every plan under `plans/` adheres to this principle.
+
+---
+
 ## 1. Context & goals
 
 Maquinista today hard-couples three things: one Telegram topic ↔ one tmux window ↔ one Claude Code process. The bot dispatches synchronously via `tmux send-keys`; the monitor captures output by pane-scraping + Claude JSONL tailing. This leaks runtime concerns (panes, processes, file offsets) into product concerns (topics, agents, conversations).
@@ -482,14 +499,11 @@ CREATE TABLE agent_settings (
   system_prompt TEXT,                                    -- CLAUDE.md equivalent
   heartbeat     TEXT,                                    -- heartbeat.md equivalent
   roster        JSONB       NOT NULL DEFAULT '[]',       -- AGENTS.md equivalent (teammate list)
-  is_default    BOOLEAN     NOT NULL DEFAULT FALSE,       -- tier-3 routing target (see §8.1)
   updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-
--- At most one global default agent.
-CREATE UNIQUE INDEX uq_agent_settings_is_default
-  ON agent_settings ((1))
-  WHERE is_default;
+-- Note: an earlier draft carried an `is_default BOOLEAN` column used by the
+-- old tier-3 "global default agent" routing. Dropped in migration 013 per
+-- per-topic-agent-pivot.md — tier 3 now spawns a fresh agent per topic.
 
 -- --------------------------------------------------------------------
 -- NOTIFY triggers
@@ -582,6 +596,7 @@ Why this is the right (and only) model for maquinista:
 - Keeps native session continuity — no need to thread `--session-id` through every invocation; the pty process is the session.
 - Sidecar crash is isolated: the agent pane survives, and restarting the sidecar replays rows in `status='processing'` with expired leases.
 - One sidecar per agent matches the "one pane per agent" constraint of tmux and removes any need for worker-fan-out contention on a single agent.
+- Under the per-topic-agent pivot (see `per-topic-agent-pivot.md`) the agent↔topic arity collapses to 1:1: one pty serves one conversation. The sidecar loop is unchanged, but "cross-thread interleaving on a shared agent" stops being a concern at all.
 
 Consequences accepted:
 
@@ -595,40 +610,40 @@ Consequences accepted:
 
 ### 8.1 Inbound message
 
-Routing ladder (resolved in order; first hit wins):
+Routing ladder (resolved in order; first hit wins). See `plans/per-topic-agent-pivot.md` for the pivot that rewrites tier 3.
 
-1. **Explicit mention** — message text starts with `@<agent_id>`. Strip the mention, use the named agent. Does **not** write a binding.
+1. **Explicit mention** — message text starts with `@<id_or_handle>`. Matches against both `agents.id` and `agents.handle` (nullable user-assigned alias). Strip the mention, use the named agent. Does **not** write a binding.
 2. **Topic owner binding** — `topic_agent_bindings` row with `(user_id, thread_id)` and `binding_type='owner'`. This is the steady state after any previous routing established the topic.
-3. **Global default agent** — row in `agent_settings` flagged `is_default=TRUE` (add boolean column in migration 009). Catches plain text in new topics without prompting, matching tinyclaw's tier 4 behavior. On first use, the bot also writes the owner binding so future messages skip the default lookup.
-4. **Agent picker (last resort)** — bot replies with inline-keyboard picker; user selects; bot writes the owner binding and enqueues. Only fires when no default is configured.
+3. **Spawn per-topic agent** — no existing binding. The ladder calls `SpawnTopicAgent(user, thread, chat, cwd, runner)`: inserts an `agents` row with id `t-<chat_id>-<thread_id>`, spawns a tmux window and Claude process, and writes the owner binding. Matches the tinyclaw "conversation is the unit" shape and the hermes-agent per-session-runtime model; it replaces the earlier shared-default-agent design. Each topic gets its own pty; contexts never mix.
+4. **Agent picker (explicit attach)** — user invokes `/agent_default @handle` to attach this topic to an already-running agent. Writes the owner binding to the named agent. Unknown handle returns a guidance error (never auto-spawns; spawning happens only via tier 3 on a message).
 
 Tiers deliberately omitted (vs. tinyclaw):
 
 - Static config mapping (`settings.json`) — the DB binding table already owns this.
-- Topic-name ↔ agent-id fuzzy match — fragile under rename; prefer the explicit `/default` command.
-- Silent "first available agent" fallback — prefer the picker over picking the wrong agent silently.
+- Topic-name ↔ agent-id fuzzy match — fragile under rename; prefer `/agent_default`.
+- Silent "first available agent" fallback — prefer error + explicit attach.
+- Global default agent — removed. The earlier `agent_settings.is_default` column is dropped in migration 013.
 
 ```
 Bot receives Telegram message m
     │
     ▼  BEGIN TX
-  -- 1. Explicit @agent_id mention in m.text?
-  if m.text matches /^@(\w+)/:
-      agent_id = captured; strip mention from content
+  -- 1. Explicit @id-or-handle mention in m.text?
+  if m.text matches /^@([A-Za-z0-9][A-Za-z0-9_-]*)/:
+      token = captured
+      SELECT id FROM agents WHERE id=$token OR LOWER(handle)=LOWER($token) LIMIT 1;
+      agent_id = resolved; strip mention from content
   else:
       -- 2. Topic owner binding?
       SELECT agent_id FROM topic_agent_bindings
         WHERE user_id=$u AND thread_id=$t AND binding_type='owner';
       if not found:
-          -- 3. Global default agent?
-          SELECT agent_id FROM agent_settings WHERE is_default=TRUE LIMIT 1;
-          if found:
-              INSERT INTO topic_agent_bindings
-                (user_id=$u, thread_id=$t, chat_id=$c,
-                 agent_id=$default, binding_type='owner');
-          else:
-              -- 4. Picker (async — bot sends reply, waits for callback, re-enters flow)
-              return;  -- abort TX; resume on user's picker callback
+          -- 3. Spawn new per-topic agent.
+          agent_id = SpawnTopicAgent($u, $t, $c, cwd, runner)
+                   = 't-' || $c || '-' || $t   (deterministic; upsert-safe)
+          INSERT INTO topic_agent_bindings
+            (user_id=$u, thread_id=$t, chat_id=$c,
+             agent_id=$new, binding_type='owner');
   INSERT INTO agent_inbox (agent_id, from_kind='user', origin_*,
                            external_msg_id=m.update_id, content=…)
     ON CONFLICT (origin_channel, external_msg_id) DO NOTHING;
@@ -780,7 +795,7 @@ Follow-up: once the inbox/outbox path is live end-to-end for one agent (step 4 o
 
 ## 11. Risks & open questions
 
-1. **Ordering guarantees**: per-(agent, thread) claim ordering via `ORDER BY enqueued_at` + a single sidecar per agent gives us in-order delivery by construction. Cross-thread ordering for the same agent is serialized by the sidecar. If a future agent type ever needs intra-agent parallelism, add a `thread_lock` advisory lock keyed by hash of `(agent_id, thread_id)`.
+1. **Ordering guarantees**: per-agent in-order delivery holds by construction — one sidecar per agent drains one pty. Under the per-topic-agent pivot (see `per-topic-agent-pivot.md`), each topic owns its own agent, so "cross-thread ordering for the same agent" no longer arises; the earlier `thread_lock` advisory-lock follow-up was specific to the shared-default-agent model and is retired along with it.
 2. **Lease expiry**: choosing the lease duration. Under α, stale `processing` rows only appear if the sidecar crashes mid-turn. Too short → duplicate processing on slow turns; too long → stuck messages after a real crash. Start at 5min, make configurable.
 3. **Sidecar crash recovery**: on sidecar restart, reclaim any row where `status='processing' AND claimed_by=<this-agent-sidecar-id>`; decide per-row whether to retry (content not yet sent into the pty) or ack (response observed in the transcript but the commit TX never happened). The JSONL tail offset stored in sidecar state is the arbiter.
 4. **Conversation aggregation semantics**: when does a conversation "close"? Tinyclaw decrements on each response; we port that logic into the outbox relay (`UPDATE conversations SET pending_count = pending_count - 1; IF pending_count = 0 THEN aggregate + send`). Aggregated delivery = single `channel_deliveries` row containing merged content.
@@ -840,7 +855,10 @@ Follow-up: once the inbox/outbox path is live end-to-end for one agent (step 4 o
 - **Agent outbox**: `agent_outbox` rows keyed by `agent_id`, consumed by the outbox relay.
 - **Channel delivery**: `channel_deliveries` row keyed by `(outbox_id, user_id, thread_id)`, consumed by the Telegram dispatcher.
 - **Sidecar**: per-agent process (or goroutine) that owns the pty bridge and the JSONL tail — the sole consumer of that agent's inbox.
-- **Owner topic**: `topic_agent_bindings.binding_type = 'owner'` — can send, receives.
+- **Agent id**: stable PK of `agents`. Auto-generated as `t-<chat_id>-<thread_id>` at tier-3 spawn time; immutable.
+- **Agent handle**: optional user-assigned alias on `agents.handle` (lowercase `[a-z0-9_-]{2,32}`, reserved prefix `t-` forbidden). Set via `/agent_rename`. Resolvable in `@mention` lookups alongside the id.
+- **Per-topic agent**: under the pivot, one `agents` row per Telegram topic — one tmux window, one Claude process, one conversation.
+- **Owner topic**: `topic_agent_bindings.binding_type = 'owner'` — can send, receives. Written by tier-3 spawn or by `/agent_default`.
 - **Observer topic**: `binding_type = 'observer'` — receives only.
 - **Conversation**: `conversations` row tying multiple agents' turns together for aggregated delivery.
 - **Outbox pattern**: transactional enqueue — business state and message are inserted in the same TX.

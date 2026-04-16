@@ -1,5 +1,7 @@
 # Maquinista v2 — Sequential Implementation Plan
 
+> This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
+
 Derived from `plans/maquinista-v2.md` (§10 migration path, Appendices C and D). Tasks execute **strictly sequentially** — each task's deliverable gates the next one's start. Every task carries a feature flag so production traffic can be cut over gradually; each task's testing section assumes the flag is OFF for live users until verification is complete.
 
 **Phase map:**
@@ -108,14 +110,23 @@ All schema SQL lives under `internal/db/migrations/`. All tests live beside the 
 
 **Depends on:** 1.7.
 
-**Deliverable:** in bot handler, implement the four-tier ladder — explicit `@agent` mention → owner binding → global default (`agent_settings.is_default=TRUE`) → picker. Add `/default @agent` slash command that sets the user's default for this topic. Add `/global-default @agent` for admins. Auto-write owner binding on first use after tiers 3 and 4 resolve.
+**Deliverable:** in bot handler, implement the four-tier ladder per `per-topic-agent-pivot.md`:
+
+1. **Explicit mention** — `@id-or-handle` matches `agents.id` or `agents.handle` (the nullable user-assigned alias).
+2. **Topic owner binding** — `topic_agent_bindings` with `binding_type='owner'`.
+3. **Spawn new per-topic agent** — calls `SpawnTopicAgent(user, thread, chat, cwd, runner)` which inserts an `agents` row with id `t-<chat_id>-<thread_id>`, spawns a tmux window + Claude process, and writes the owner binding.
+4. **Explicit attach via `/agent_default @handle`** — attaches current topic to an already-running agent. Unknown handle returns a guidance error; never auto-spawns.
+
+Add `/agent_rename <handle>` to set the handle on the current topic's owner agent (regex `^[a-z0-9_-]{2,32}$`, reserved prefix `t-` forbidden, unique when set). Rename `/agents` → `/agent_list`. Hard cutover — no legacy aliases. `/global-default` is removed entirely (the `agent_settings.is_default` column is dropped in migration 013).
 
 **Testing:**
 
 - Table-driven tests for each tier: message, existing-state fixtures, expected binding writes + inbox agent_id.
-- Picker callback test: user clicks picker button → binding written → message enqueued → agent wakes.
-- `@agent` from an unbound topic: no binding written; response still reaches origin topic via §8.2 fan-out.
-- Concurrency: two humans in the same topic racing tier-3 writes → partial unique index forces one winner; second request reads the committed row and proceeds.
+- Tier-3 spawn test: mock `SpawnFunc`; assert it's called exactly once per fresh `(user, thread)`; assert the returned id receives the owner binding.
+- Mention resolution: `@id` and `@handle` both resolve to the same canonical `agents.id`.
+- `/agent_default @unknown` returns the guidance error and does not spawn.
+- `/agent_rename` validation: accepts valid handles, rejects regex violations, reserved prefix `t-`, and uniqueness collisions.
+- Concurrency: two humans in the same topic racing tier-3 spawn → partial unique index forces one winner; second request reads the committed row and proceeds.
 
 ### Task 1.9 — Retire legacy paths
 

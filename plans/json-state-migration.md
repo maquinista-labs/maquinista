@@ -1,5 +1,7 @@
 # Migrate on-disk JSON state to Postgres
 
+> This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state. This is the plan that finishes carrying prior-era JSON state into the database.
+
 ## Context
 
 The running maquinista process keeps three JSON files under

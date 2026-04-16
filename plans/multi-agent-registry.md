@@ -1,5 +1,7 @@
 # Multi-agent registry & reconcile loop
 
+> This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
+
 ## Context
 
 After commits 3.10–3.15, `./maquinista start` boots **one** agent

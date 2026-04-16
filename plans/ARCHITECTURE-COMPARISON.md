@@ -1,5 +1,7 @@
 # Architecture Comparison: Minuano + Tramuntana vs. Claws Alternatives
 
+> This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
+
 ## 1. Context & Framing
 
 ### The Two Systems

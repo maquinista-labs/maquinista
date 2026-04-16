@@ -1,5 +1,7 @@
 # Minuano: PostgreSQL to Turso + AgentFS Migration
 
+> **Tension with §0 of `maquinista-v2.md`** ("Postgres is the system of record"). This document predates that principle and proposes moving off Postgres; reconcile before acting on it. Keeping Postgres as the substrate is the current direction.
+
 ## Context
 
 Minuano is a Go task coordination tool using PostgreSQL for task state management with `SELECT FOR UPDATE SKIP LOCKED` for atomic task claiming, and git worktrees for agent file isolation. The goal is to evaluate porting to Turso (libSQL/SQLite) for the database layer and AgentFS for file isolation, removing the PostgreSQL dependency.

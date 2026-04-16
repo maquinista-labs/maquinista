@@ -1,5 +1,7 @@
 # Maquinista: Unified Agent Orchestration Platform
 
+> This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
+
 ## Context
 
 Two existing Go projects need to be ported into a new **maquinista** repository (clean start, not merging into either):
