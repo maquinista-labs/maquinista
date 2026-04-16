@@ -3,6 +3,8 @@ package runner
 import (
 	"fmt"
 	"sync"
+
+	"github.com/maquinista-labs/maquinista/internal/monitor"
 )
 
 // Config holds runner-specific configuration passed from the agent/orchestrator.
@@ -47,6 +49,12 @@ type AgentRunner interface {
 	// When false, the bot writes a preliminary session_map entry and the
 	// TranscriptSource discovers the session ID later.
 	HasSessionHook() bool
+
+	// MonitorProfile returns the TUI parsing parameters the shared
+	// monitor helpers use when scanning captured pane text. Each runner
+	// has its own spinner characters, chrome separators, and interactive
+	// UI patterns. See plans/active/opencode-integration.md OC-01.
+	MonitorProfile() monitor.MonitorProfile
 }
 
 var (

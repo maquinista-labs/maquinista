@@ -5,6 +5,39 @@ import (
 	"testing"
 )
 
+func TestMonitorProfile_Claude_DefaultMatchesLegacyBehavior(t *testing.T) {
+	// ClaudeProfile must match the package-level defaults byte-for-byte so
+	// existing callers of StripPaneChrome / ExtractStatusLine keep working.
+	profile := ClaudeProfile()
+	if profile.SpinnerChars != spinnerChars {
+		t.Errorf("spinner chars diverged: %q vs %q", profile.SpinnerChars, spinnerChars)
+	}
+	if profile.MinSeparatorLen != 20 {
+		t.Errorf("min separator len: %d", profile.MinSeparatorLen)
+	}
+}
+
+func TestMonitorProfile_OpenCode_NoSeparatorStripping(t *testing.T) {
+	profile := OpenCodeProfile()
+	pane := "first line\n───────────────────────────────\nbottom"
+
+	// OpenCode has no chrome separator; stripping is a no-op.
+	got := StripPaneChromeFor(pane, profile)
+	if got != pane {
+		t.Errorf("expected pane unchanged for OpenCode, got %q", got)
+	}
+
+	// ExtractStatusLineFor returns false when the profile has no spinner.
+	if _, ok := ExtractStatusLineFor(pane, profile); ok {
+		t.Error("OpenCode profile should not detect a spinner status")
+	}
+
+	// No interactive-UI patterns under OpenCode today.
+	if IsInteractiveUIFor(pane, profile) {
+		t.Error("OpenCode profile should report no interactive UI")
+	}
+}
+
 func TestStripPaneChrome(t *testing.T) {
 	// Simulate Claude Code's terminal output with chrome
 	lines := []string{

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/maquinista-labs/maquinista/internal/monitor"
 )
 
 // OpenCodeRunner implements AgentRunner for OpenCode.
@@ -58,3 +60,5 @@ func (o *OpenCodeRunner) EnvOverrides() map[string]string {
 }
 
 func (o *OpenCodeRunner) HasSessionHook() bool { return false }
+
+func (o *OpenCodeRunner) MonitorProfile() monitor.MonitorProfile { return monitor.OpenCodeProfile() }

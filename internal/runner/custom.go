@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"os/exec"
 	"text/template"
+
+	"github.com/maquinista-labs/maquinista/internal/monitor"
 )
 
 // CustomRunner implements AgentRunner for arbitrary binaries.
@@ -57,6 +59,10 @@ func (c *CustomRunner) EnvOverrides() map[string]string {
 func (c *CustomRunner) HasSessionHook() bool {
 	return false
 }
+
+// MonitorProfile returns an empty profile: custom runners have no known
+// chrome layout. Override by wrapping with a subtype that supplies one.
+func (c *CustomRunner) MonitorProfile() monitor.MonitorProfile { return monitor.MonitorProfile{} }
 
 func (c *CustomRunner) renderTemplate(tpl, prompt string) string {
 	t, err := template.New("cmd").Parse(tpl)

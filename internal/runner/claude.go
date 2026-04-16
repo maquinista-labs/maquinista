@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/maquinista-labs/maquinista/internal/monitor"
 )
 
 // ClaudeRunner implements AgentRunner for Claude Code.
@@ -41,3 +43,5 @@ func (c *ClaudeRunner) EnvOverrides() map[string]string {
 }
 
 func (c *ClaudeRunner) HasSessionHook() bool { return true }
+
+func (c *ClaudeRunner) MonitorProfile() monitor.MonitorProfile { return monitor.ClaudeProfile() }

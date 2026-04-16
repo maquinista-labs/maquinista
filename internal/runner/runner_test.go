@@ -1,6 +1,10 @@
 package runner
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/maquinista-labs/maquinista/internal/monitor"
+)
 
 type mockRunner struct{}
 
@@ -11,6 +15,7 @@ func (m *mockRunner) PlannerCommand(p string, c Config) string     { return "moc
 func (m *mockRunner) DetectInstallation() bool                     { return true }
 func (m *mockRunner) EnvOverrides() map[string]string              { return nil }
 func (m *mockRunner) HasSessionHook() bool                         { return false }
+func (m *mockRunner) MonitorProfile() monitor.MonitorProfile       { return monitor.MonitorProfile{} }
 
 func TestRegisterAndGet(t *testing.T) {
 	defer func() {

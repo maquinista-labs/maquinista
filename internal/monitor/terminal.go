@@ -5,27 +5,94 @@ import (
 	"unicode/utf8"
 )
 
+// MonitorProfile holds runner-specific TUI parsing parameters. Each
+// AgentRunner returns its own profile; the shared StripPaneChrome /
+// ExtractStatusLine / IsInteractiveUI helpers can be called with a
+// profile (the *For variants) or without (uses the Claude default for
+// backward compatibility). See plans/active/opencode-integration.md OC-01.
+type MonitorProfile struct {
+	// SpinnerChars are the unicode runes that can appear at the start of
+	// a status line to indicate the agent is working.
+	SpinnerChars string
+	// SeparatorRunes are the rune set that makes up a chrome separator
+	// (Claude draws ─/━ rows; OpenCode uses a build-status bar and needs
+	// no separator match at all — leave empty for "never match").
+	SeparatorRunes []rune
+	// MinSeparatorLen is the minimum rune count that counts as a separator.
+	MinSeparatorLen int
+	// UIPatterns are the interactive-prompt markers ExtractInteractiveContent
+	// scans for. nil = the runner has no interactive UI patterns yet.
+	UIPatterns []UIPattern
+}
+
+// ClaudeProfile returns the Claude Code TUI parsing parameters that have
+// been hardcoded into this package since day one. Kept as the default so
+// existing callers (and tests) keep working when they don't pass an
+// explicit profile.
+func ClaudeProfile() MonitorProfile {
+	return MonitorProfile{
+		SpinnerChars:    spinnerChars,
+		SeparatorRunes:  []rune{'─', '━'},
+		MinSeparatorLen: 20,
+		UIPatterns:      uiPatterns,
+	}
+}
+
+// OpenCodeProfile returns the OpenCode TUI parsing parameters. OpenCode's
+// status appears in a bottom bar ("Build 12s"); there are no permission /
+// plan-mode prompts to catch yet. Status detection stays in OpenCodeSource
+// since the pattern is line-content not chrome-layout.
+func OpenCodeProfile() MonitorProfile {
+	return MonitorProfile{
+		SpinnerChars:    "",
+		SeparatorRunes:  nil, // never match a separator — OpenCode has no chrome line
+		MinSeparatorLen: 0,
+		UIPatterns:      nil,
+	}
+}
+
 // Spinner characters used by Claude Code's status line.
 const spinnerChars = "·✻✽✶✳✢"
 
-// StripPaneChrome removes Claude Code's bottom chrome (separator, prompt, status bar)
-// from captured pane text. Returns the text above the separator.
+// StripPaneChrome removes Claude Code's bottom chrome (separator, prompt,
+// status bar) from captured pane text. Returns the text above the
+// separator. Uses ClaudeProfile; for other runners call StripPaneChromeFor.
 func StripPaneChrome(paneText string) string {
+	return StripPaneChromeFor(paneText, ClaudeProfile())
+}
+
+// StripPaneChromeFor is the profile-aware variant. When profile.SeparatorRunes
+// is empty the function returns the input unchanged (runners without a
+// chrome separator have no "above the separator" to extract).
+func StripPaneChromeFor(paneText string, profile MonitorProfile) string {
+	if len(profile.SeparatorRunes) == 0 {
+		return paneText
+	}
 	lines := strings.Split(paneText, "\n")
-	sepIdx := findChromeSeparator(lines)
+	sepIdx := findChromeSeparatorFor(lines, profile)
 	if sepIdx < 0 {
 		return paneText
 	}
 	return strings.Join(lines[:sepIdx], "\n")
 }
 
-// ExtractStatusLine detects Claude's spinner/status from the terminal output.
-// Returns the status text and whether a status was found.
-// Matches CCBot logic: find topmost separator, then search above it for a line
-// whose first character is a spinner. Stops at the first non-empty non-spinner line.
+// ExtractStatusLine detects Claude's spinner/status from the terminal
+// output. Returns the status text and whether a status was found. Uses
+// ClaudeProfile; for other runners call ExtractStatusLineFor.
 func ExtractStatusLine(paneText string) (string, bool) {
+	return ExtractStatusLineFor(paneText, ClaudeProfile())
+}
+
+// ExtractStatusLineFor is the profile-aware variant. It looks for the
+// profile's separator, then searches a few lines above for one whose first
+// rune is in the profile's SpinnerChars. Returns ("", false) when the
+// profile has no separator runes or no spinner chars.
+func ExtractStatusLineFor(paneText string, profile MonitorProfile) (string, bool) {
+	if len(profile.SeparatorRunes) == 0 || profile.SpinnerChars == "" {
+		return "", false
+	}
 	lines := strings.Split(paneText, "\n")
-	sepIdx := findChromeSeparator(lines)
+	sepIdx := findChromeSeparatorFor(lines, profile)
 	if sepIdx < 0 {
 		return "", false
 	}
@@ -41,7 +108,7 @@ func ExtractStatusLine(paneText string) (string, bool) {
 			continue
 		}
 		r, size := utf8.DecodeRuneInString(line)
-		if strings.ContainsRune(spinnerChars, r) {
+		if strings.ContainsRune(profile.SpinnerChars, r) {
 			return strings.TrimSpace(line[size:]), true
 		}
 		// First non-empty non-spinner line → no status
@@ -51,31 +118,49 @@ func ExtractStatusLine(paneText string) (string, bool) {
 }
 
 // findChromeSeparator finds the line index of the topmost chrome separator
-// (a line of ─ chars) in the last 10 lines. Searches top-down to find the
-// first separator, which sits just below the status line in Claude Code's layout.
+// (a line of ─ chars) in the last 10 lines. Uses ClaudeProfile.
 func findChromeSeparator(lines []string) int {
+	return findChromeSeparatorFor(lines, ClaudeProfile())
+}
+
+func findChromeSeparatorFor(lines []string, profile MonitorProfile) int {
+	if len(profile.SeparatorRunes) == 0 {
+		return -1
+	}
 	start := len(lines) - 10
 	if start < 0 {
 		start = 0
 	}
-
 	for i := start; i < len(lines); i++ {
-		if isChromeSeparator(lines[i]) {
+		if isChromeSeparatorFor(lines[i], profile) {
 			return i
 		}
 	}
 	return -1
 }
 
-// isChromeSeparator checks if a line is a chrome separator.
-// All characters must be ─ or ━, with at least 20 runes (matches CCBot's strict check).
+// isChromeSeparator checks if a line is a chrome separator under the Claude profile.
 func isChromeSeparator(line string) bool {
+	return isChromeSeparatorFor(line, ClaudeProfile())
+}
+
+func isChromeSeparatorFor(line string, profile MonitorProfile) bool {
+	if len(profile.SeparatorRunes) == 0 {
+		return false
+	}
 	trimmed := strings.TrimSpace(line)
-	if utf8.RuneCountInString(trimmed) < 20 {
+	if utf8.RuneCountInString(trimmed) < profile.MinSeparatorLen {
 		return false
 	}
 	for _, r := range trimmed {
-		if r != '─' && r != '━' {
+		ok := false
+		for _, sr := range profile.SeparatorRunes {
+			if r == sr {
+				ok = true
+				break
+			}
+		}
+		if !ok {
 			return false
 		}
 	}
@@ -139,19 +224,31 @@ var uiPatterns = []UIPattern{
 	},
 }
 
-// IsInteractiveUI returns true if the pane text contains an interactive UI prompt.
+// IsInteractiveUI returns true if the pane text contains an interactive UI
+// prompt under the Claude profile.
 func IsInteractiveUI(paneText string) bool {
-	_, ok := ExtractInteractiveContent(paneText)
+	return IsInteractiveUIFor(paneText, ClaudeProfile())
+}
+
+func IsInteractiveUIFor(paneText string, profile MonitorProfile) bool {
+	_, ok := ExtractInteractiveContentFor(paneText, profile)
 	return ok
 }
 
-// ExtractInteractiveContent extracts the interactive UI content from pane text.
-// Returns the UI content and true if found.
+// ExtractInteractiveContent extracts the interactive UI content from pane
+// text under the Claude profile. Returns the UI content and true if found.
 func ExtractInteractiveContent(paneText string) (UIContent, bool) {
-	stripped := StripPaneChrome(paneText)
+	return ExtractInteractiveContentFor(paneText, ClaudeProfile())
+}
+
+func ExtractInteractiveContentFor(paneText string, profile MonitorProfile) (UIContent, bool) {
+	if len(profile.UIPatterns) == 0 {
+		return UIContent{}, false
+	}
+	stripped := StripPaneChromeFor(paneText, profile)
 	lines := strings.Split(stripped, "\n")
 
-	for _, pattern := range uiPatterns {
+	for _, pattern := range profile.UIPatterns {
 		content, ok := tryExtract(lines, pattern)
 		if ok {
 			return content, true

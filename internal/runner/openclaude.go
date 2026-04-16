@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+
+	"github.com/maquinista-labs/maquinista/internal/monitor"
 )
 
 // OpenClaudeRunner implements AgentRunner for OpenClaude.
@@ -41,3 +43,7 @@ func (o *OpenClaudeRunner) EnvOverrides() map[string]string {
 }
 
 func (o *OpenClaudeRunner) HasSessionHook() bool { return true }
+
+// OpenClaude is a Claude-compatible TUI fork, so the Claude monitor profile
+// matches. Override here if openclaude diverges.
+func (o *OpenClaudeRunner) MonitorProfile() monitor.MonitorProfile { return monitor.ClaudeProfile() }
