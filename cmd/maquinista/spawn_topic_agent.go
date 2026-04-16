@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
@@ -134,6 +135,22 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			return "", fmt.Errorf("registering topic agent row: %w", err)
 		}
 
+		// Create a soul row from the default template. Per
+		// plans/active/agent-soul-db-state.md Phase 2 every persistent
+		// agent gets structured identity at creation time; failure is
+		// logged but non-fatal (agent still boots with empty soul).
+		if err := soul.CreateFromTemplate(ctx, pool, agentID, "", soul.Overrides{}); err != nil {
+			log.Printf("spawn_topic_agent: soul create for %s: %v (continuing)", agentID, err)
+		}
+		// Render the soul to $MAQUINISTA_DIR/prompts/<agent>.md so a
+		// future Phase 3 runner integration can pass it as --system-prompt
+		// without re-querying the DB on every spawn. The file is harmless
+		// if no runner consumes it yet — operators can also read it for
+		// debugging.
+		if _, err := writeSoulPromptFile(ctx, pool, cfg, agentID); err != nil {
+			log.Printf("spawn_topic_agent: write soul prompt file: %v (continuing)", err)
+		}
+
 		if botState != nil {
 			botState.SetWindowRunner(windowID, cfg.DefaultRunner)
 			botState.SetWindowDisplayName(windowID, agentID)
@@ -242,4 +259,28 @@ func resolveRunnerCommand(cfg *config.Config, agentID, cwd string) (string, map[
 		cmd = "claude"
 	}
 	return cmd, env
+}
+
+// writeSoulPromptFile renders agent's soul to
+// $MAQUINISTA_DIR/prompts/<agent_id>.md. The path is returned so the
+// caller can export MAQUINISTA_AGENT_PROMPT / pass --system-prompt. Empty
+// string + nil error means "no soul row yet" — spawner skips injection.
+func writeSoulPromptFile(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, agentID string) (string, error) {
+	s, err := soul.Load(ctx, pool, agentID)
+	if err != nil {
+		if err == soul.ErrNotFound {
+			return "", nil
+		}
+		return "", err
+	}
+	dir := filepath.Join(cfg.MaquinistaDir, "prompts")
+	if mkerr := os.MkdirAll(dir, 0o755); mkerr != nil {
+		return "", fmt.Errorf("mkdir prompts: %w", mkerr)
+	}
+	path := filepath.Join(dir, agentID+".md")
+	rendered := soul.Render(*s, 32000)
+	if werr := os.WriteFile(path, []byte(rendered), 0o644); werr != nil {
+		return "", fmt.Errorf("write %s: %w", path, werr)
+	}
+	return path, nil
 }
