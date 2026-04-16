@@ -91,13 +91,18 @@ func Run() error {
 	// If the user launched the runner with AGENT_ID set, upsert an agents
 	// row so the bot's routing ladder can resolve Telegram messages to this
 	// session. Fail open — a DB blip here must not crash the Claude session.
-	registerAgentFromEnv(sessionName, windowID)
+	//
+	// Phase A (plans/active/json-state-migration.md): session_id, cwd, and
+	// window_name land as columns on agents alongside tmux metadata. Once
+	// the monitor sources read these from the DB the session_map.json
+	// writes above will be retired.
+	registerAgentFromEnv(sessionName, windowID, input.SessionID, input.CWD, windowName)
 	return nil
 }
 
 // registerAgentFromEnv upserts an agents row when AGENT_ID + DATABASE_URL are
 // set. Logs and swallows any error.
-func registerAgentFromEnv(sessionName, windowID string) {
+func registerAgentFromEnv(sessionName, windowID, sessionID, cwd, windowName string) {
 	agentID := strings.TrimSpace(os.Getenv("AGENT_ID"))
 	if agentID == "" {
 		return
@@ -126,20 +131,24 @@ func registerAgentFromEnv(sessionName, windowID string) {
 	if _, err := conn.Exec(ctx, `
 		INSERT INTO agents
 			(id, tmux_session, tmux_window, role, status, runner_type,
+			 session_id, cwd, window_name,
 			 started_at, last_seen, stop_requested)
-		VALUES ($1, $2, $3, 'user', 'running', $4, NOW(), NOW(), FALSE)
+		VALUES ($1, $2, $3, 'user', 'running', $4, $5, $6, $7, NOW(), NOW(), FALSE)
 		ON CONFLICT (id) DO UPDATE SET
 			tmux_session  = EXCLUDED.tmux_session,
 			tmux_window   = EXCLUDED.tmux_window,
 			status        = 'running',
 			runner_type   = EXCLUDED.runner_type,
+			session_id    = EXCLUDED.session_id,
+			cwd           = EXCLUDED.cwd,
+			window_name   = EXCLUDED.window_name,
 			last_seen     = NOW(),
 			stop_requested= FALSE
-	`, agentID, sessionName, windowID, runner); err != nil {
+	`, agentID, sessionName, windowID, runner, sessionID, cwd, windowName); err != nil {
 		log.Printf("hook: agents upsert for %s: %v", agentID, err)
 		return
 	}
-	log.Printf("hook: registered agent %s at %s:%s", agentID, sessionName, windowID)
+	log.Printf("hook: registered agent %s at %s:%s (session=%s)", agentID, sessionName, windowID, sessionID)
 }
 
 // EnsureInstalled checks if the hook is installed and installs it if not.

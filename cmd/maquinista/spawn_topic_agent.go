@@ -118,16 +118,19 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO agents
 				(id, tmux_session, tmux_window, role, status, runner_type,
+				 session_id, cwd, window_name,
 				 started_at, last_seen, stop_requested)
-			VALUES ($1, $2, $3, 'user', 'running', $4, NOW(), NOW(), FALSE)
+			VALUES ($1, $2, $3, 'user', 'running', $4, NULL, $5, $1, NOW(), NOW(), FALSE)
 			ON CONFLICT (id) DO UPDATE SET
 				tmux_session   = EXCLUDED.tmux_session,
 				tmux_window    = EXCLUDED.tmux_window,
 				status         = 'running',
 				runner_type    = EXCLUDED.runner_type,
+				cwd            = EXCLUDED.cwd,
+				window_name    = EXCLUDED.window_name,
 				last_seen      = NOW(),
 				stop_requested = FALSE
-		`, agentID, cfg.TmuxSessionName, windowID, cfg.DefaultRunner); err != nil {
+		`, agentID, cfg.TmuxSessionName, windowID, cfg.DefaultRunner, cwd); err != nil {
 			return "", fmt.Errorf("registering topic agent row: %w", err)
 		}
 
