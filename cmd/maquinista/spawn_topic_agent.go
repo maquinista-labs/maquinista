@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -104,6 +105,16 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		log.Printf("spawn_topic_agent: spawned %s at %s:%s (cwd=%s, runner=%s)",
 			agentID, cfg.TmuxSessionName, windowID, cwd, runnerCmd)
 
+		// Block until the runner's TUI is ready to accept keystrokes.
+		// Without this the first message's send-keys arrives before Claude
+		// has drawn its prompt — the text lands in the input buffer but the
+		// Enter is eaten by the boot screen, so nothing submits until the
+		// user presses Enter by hand.
+		if err := waitForRunnerReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
+			log.Printf("spawn_topic_agent: %s not ready within timeout: %v (first message may need manual Enter)",
+				agentID, err)
+		}
+
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO agents
 				(id, tmux_session, tmux_window, role, status, runner_type,
@@ -129,6 +140,53 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		}
 		return agentID, nil
 	}
+}
+
+// waitForRunnerReady polls the tmux pane until the interactive runner is
+// ready to accept input, or the timeout elapses. Detects the Claude TUI
+// prompt (`❯` chevron) and OpenCode's build-status bar; falls back to a
+// short settle delay for unknown runners. Tuned for the first-message
+// race where send-keys arrives before the TUI has drawn its prompt.
+func waitForRunnerReady(session, windowID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		text, err := tmux.CapturePane(session, windowID, false)
+		if err == nil && runnerReady(text) {
+			return nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// One last capture for the error message.
+	text, _ := tmux.CapturePane(session, windowID, false)
+	return fmt.Errorf("runner did not become ready in %s; last pane snippet: %q",
+		timeout, lastLine(text))
+}
+
+// runnerReady returns true when the pane text carries a known
+// "accepting input" marker. Keep the matches loose so minor TUI version
+// bumps don't break startup — readiness detection is best-effort; the
+// caller logs and continues on timeout anyway.
+func runnerReady(paneText string) bool {
+	switch {
+	// Claude Code prompt — "❯" chevron at the start of a line, plus the
+	// permissions footer that only renders once the TUI is live.
+	case strings.Contains(paneText, "\n❯") || strings.HasPrefix(paneText, "❯"):
+		return true
+	case strings.Contains(paneText, "bypass permissions on"):
+		return true
+	// OpenCode — the "Build" status bar appears once the TUI is up.
+	case strings.Contains(paneText, "Build "):
+		return true
+	}
+	return false
+}
+
+func lastLine(s string) string {
+	s = strings.TrimRight(s, "\n")
+	if i := strings.LastIndex(s, "\n"); i >= 0 {
+		return s[i+1:]
+	}
+	return s
 }
 
 // isLiveStatus matches an agent status against the "pane should be up"
