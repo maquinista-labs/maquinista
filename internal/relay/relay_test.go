@@ -199,3 +199,111 @@ func TestProcessOne_SelfObserverCollapsedByUnique(t *testing.T) {
 		t.Errorf("delivery rows=%d, want 1 (origin+self-observer dedup)", count)
 	}
 }
+
+// TestA2A_MentionByHandle_ResolvesCanonicalID verifies that mentions can
+// target an agent by its friendly handle (agents.handle) and the
+// resulting agent_inbox row is keyed by the canonical agents.id.
+func TestA2A_MentionByHandle_ResolvesCanonicalID(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	// Give beta a handle.
+	mustExec(t, pool, `UPDATE agents SET handle='reviewer' WHERE id='beta'`)
+
+	outboxID := uuid.New()
+	mustExec(t, pool, `
+		INSERT INTO agent_outbox (id, agent_id, content)
+		VALUES ($1, 'alpha', $2::jsonb)
+	`, outboxID, `{"text":"handing off to [@reviewer: check PR #42]"}`)
+
+	if ok, err := ProcessOne(ctx, pool, "w1"); err != nil || !ok {
+		t.Fatalf("ProcessOne: ok=%v err=%v", ok, err)
+	}
+
+	var count int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE agent_id='beta' AND from_kind='agent' AND from_id='alpha'`).Scan(&count)
+	if count != 1 {
+		t.Errorf("beta inbox rows = %d, want 1 (handle mention should resolve to canonical id)", count)
+	}
+}
+
+// TestA2A_UnknownMention_SilentlyDropped: a mention of a non-existent
+// agent must not FK-fail the relay — it's silently skipped.
+func TestA2A_UnknownMention_SilentlyDropped(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	outboxID := uuid.New()
+	mustExec(t, pool, `
+		INSERT INTO agent_outbox (id, agent_id, content)
+		VALUES ($1, 'alpha', $2::jsonb)
+	`, outboxID, `{"text":"hey [@ghost: hi] and [@beta: real one]"}`)
+
+	ok, err := ProcessOne(ctx, pool, "w1")
+	if err != nil || !ok {
+		t.Fatalf("ProcessOne failed on unknown mention: ok=%v err=%v", ok, err)
+	}
+
+	var betaCount, ghostCount int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE agent_id='beta'`).Scan(&betaCount)
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE agent_id='ghost'`).Scan(&ghostCount)
+	if betaCount != 1 {
+		t.Errorf("beta inbox count = %d, want 1", betaCount)
+	}
+	if ghostCount != 0 {
+		t.Errorf("ghost inbox count = %d, want 0 (should be silently skipped)", ghostCount)
+	}
+}
+
+// TestA2A_SelfMention_Skipped: an agent mentioning its own id shouldn't
+// enqueue a message to itself — loop guard.
+func TestA2A_SelfMention_Skipped(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	outboxID := uuid.New()
+	mustExec(t, pool, `
+		INSERT INTO agent_outbox (id, agent_id, content)
+		VALUES ($1, 'alpha', $2::jsonb)
+	`, outboxID, `{"text":"note to self: [@alpha: remember]"}`)
+
+	if ok, err := ProcessOne(ctx, pool, "w1"); err != nil || !ok {
+		t.Fatalf("ProcessOne: ok=%v err=%v", ok, err)
+	}
+
+	var selfCount int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE agent_id='alpha' AND from_kind='agent' AND from_id='alpha'`).Scan(&selfCount)
+	if selfCount != 0 {
+		t.Errorf("alpha → alpha inbox count = %d, want 0 (self-mention must be skipped)", selfCount)
+	}
+}
+
+// TestA2A_Idempotent_ReplaySameOutbox: if the relay replays the same
+// outbox row (e.g. after a crash), the mention fanout must not
+// double-deliver. Uses the (origin_channel, external_msg_id) UNIQUE.
+func TestA2A_Idempotent_ReplaySameOutbox(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	outboxID := uuid.New()
+	mustExec(t, pool, `
+		INSERT INTO agent_outbox (id, agent_id, content)
+		VALUES ($1, 'alpha', $2::jsonb)
+	`, outboxID, `{"text":"[@beta: please verify]"}`)
+
+	if ok, err := ProcessOne(ctx, pool, "w1"); err != nil || !ok {
+		t.Fatalf("first ProcessOne: ok=%v err=%v", ok, err)
+	}
+
+	// Force the outbox row back to pending so ProcessOne sees it again.
+	mustExec(t, pool, `UPDATE agent_outbox SET status='pending' WHERE id=$1`, outboxID)
+	if ok, err := ProcessOne(ctx, pool, "w1"); err != nil || !ok {
+		t.Fatalf("second ProcessOne: ok=%v err=%v", ok, err)
+	}
+
+	var count int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE agent_id='beta' AND from_kind='agent' AND from_id='alpha'`).Scan(&count)
+	if count != 1 {
+		t.Errorf("beta inbox count after replay = %d, want 1 (unique(origin_channel,external_msg_id) must dedupe)", count)
+	}
+}

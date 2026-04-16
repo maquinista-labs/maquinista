@@ -100,7 +100,7 @@ func ProcessOne(ctx context.Context, pool *pgxpool.Pool, workerID string) (bool,
 	}
 
 	mentions := mergeMentions(mentionsJSON, content)
-	inserted, err := enqueueMentions(ctx, tx, agentID, conversationID, mentions)
+	inserted, err := enqueueMentions(ctx, tx, id, agentID, conversationID, mentions)
 	if err != nil {
 		return false, fmt.Errorf("enqueue mentions: %w", err)
 	}
@@ -196,21 +196,73 @@ func mergeMentions(mentionsJSON, content []byte) []Mention {
 	return out
 }
 
-func enqueueMentions(ctx context.Context, tx pgx.Tx, fromAgent string, conversationID *uuid.UUID, mentions []Mention) (int, error) {
+// enqueueMentions resolves each mention token to a canonical agent id
+// (agents.id OR agents.handle, case-insensitive), drops self-mentions and
+// tokens that don't match any agent, then inserts one agent_inbox row per
+// target. Idempotent via the (origin_channel, external_msg_id) unique
+// index: origin_channel='a2a' + external_msg_id='<outbox_id>:<target>' so
+// a crash-restart of the relay doesn't double-deliver.
+//
+// Phase 1 of plans/active/agent-to-agent-communication.md.
+func enqueueMentions(
+	ctx context.Context,
+	tx pgx.Tx,
+	outboxID uuid.UUID,
+	fromAgent string,
+	conversationID *uuid.UUID,
+	mentions []Mention,
+) (int, error) {
 	inserted := 0
 	for _, m := range mentions {
+		canonical, err := resolveAgentToken(ctx, tx, m.AgentID)
+		if err != nil {
+			return inserted, fmt.Errorf("resolve mention %q: %w", m.AgentID, err)
+		}
+		if canonical == "" {
+			// Silently skip — mention of a non-existent agent (typo,
+			// agent archived/deleted) should not FK-fail the whole relay.
+			continue
+		}
+		if canonical == fromAgent {
+			// Skip self-mention; keeps replies from looping back to the
+			// producer.
+			continue
+		}
 		content, _ := json.Marshal(map[string]string{"type": "text", "text": m.Text})
+		externalMsgID := outboxID.String() + ":" + canonical
 		tag, err := tx.Exec(ctx, `
 			INSERT INTO agent_inbox
-				(agent_id, conversation_id, from_kind, from_id, content)
-			VALUES ($1, $2, 'agent', $3, $4::jsonb)
-		`, m.AgentID, conversationID, fromAgent, content)
+				(agent_id, conversation_id, from_kind, from_id,
+				 origin_channel, external_msg_id, content)
+			VALUES ($1, $2, 'agent', $3, 'a2a', $4, $5::jsonb)
+			ON CONFLICT (origin_channel, external_msg_id) DO NOTHING
+		`, canonical, conversationID, fromAgent, externalMsgID, content)
 		if err != nil {
-			return inserted, fmt.Errorf("insert mention for %s: %w", m.AgentID, err)
+			return inserted, fmt.Errorf("insert mention for %s: %w", canonical, err)
 		}
 		if tag.RowsAffected() > 0 {
 			inserted++
 		}
 	}
 	return inserted, nil
+}
+
+// resolveAgentToken returns the canonical agents.id for a token that may
+// be an id or a handle (case-insensitive). Returns ("", nil) if no match.
+// Local copy of internal/routing.ResolveAgentByToken so the relay avoids
+// taking a dependency on the routing package.
+func resolveAgentToken(ctx context.Context, tx pgx.Tx, token string) (string, error) {
+	if token == "" {
+		return "", nil
+	}
+	var id string
+	err := tx.QueryRow(ctx, `
+		SELECT id FROM agents
+		WHERE id = $1 OR LOWER(handle) = LOWER($1)
+		LIMIT 1
+	`, token).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
 }
