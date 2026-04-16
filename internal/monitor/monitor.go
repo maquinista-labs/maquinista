@@ -131,8 +131,17 @@ func (m *Monitor) poll() {
 				continue
 			}
 
-			// Route to directly bound users
-			users := m.state.FindUsersForWindow(sess.WindowID)
+			// Route to directly bound users.
+			// Prefer the "active thread" — the single most recent (user, thread)
+			// to route a message to this window — when available. This avoids
+			// fanning out a reply to every topic that has ever bound to a shared
+			// agent window via the §8.1 tier-3 ladder (cross-topic leak).
+			var users []state.UserThread
+			if ut, ok := m.state.GetActiveThread(sess.WindowID); ok {
+				users = []state.UserThread{ut}
+			} else {
+				users = m.state.FindUsersForWindow(sess.WindowID)
+			}
 			for _, ut := range users {
 				chatID, ok := m.state.GetGroupChatID(ut.UserID, ut.ThreadID)
 				if !ok {

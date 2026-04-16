@@ -111,6 +111,10 @@ func (b *Bot) syncAgentStateFor(ctx context.Context, pool *pgxpool.Pool, agentID
 		b.state.SetWindowRunner(window, runner)
 	}
 	b.state.SetWindowDisplayName(window, agentID)
+	// Record the originating topic so the monitor sends the reply back only
+	// to this (user, thread), preventing cross-topic leaks when multiple
+	// topics bind to the same shared agent window via the §8.1 tier-3 ladder.
+	b.state.SetActiveThread(window, userID, threadID)
 	b.saveState()
 }
 

@@ -159,6 +159,52 @@ func TestProjectBindings(t *testing.T) {
 	}
 }
 
+func TestActiveThread(t *testing.T) {
+	s := NewState()
+	s.BindThread("u1", "t1", "@1")
+	s.BindThread("u1", "t2", "@1") // two topics bound to same window (shared agent)
+
+	// Before any activity, no active thread.
+	if _, ok := s.GetActiveThread("@1"); ok {
+		t.Error("should have no active thread initially")
+	}
+
+	// Topic t2 sends a message — it becomes active.
+	s.SetActiveThread("@1", "u1", "t2")
+	ut, ok := s.GetActiveThread("@1")
+	if !ok || ut.UserID != "u1" || ut.ThreadID != "t2" {
+		t.Errorf("expected (u1,t2) active, got %+v ok=%v", ut, ok)
+	}
+
+	// t1 takes over.
+	s.SetActiveThread("@1", "u1", "t1")
+	ut, _ = s.GetActiveThread("@1")
+	if ut.ThreadID != "t1" {
+		t.Errorf("expected t1 active, got %+v", ut)
+	}
+
+	// Unbinding the active thread clears it.
+	s.UnbindThread("u1", "t1")
+	if _, ok := s.GetActiveThread("@1"); ok {
+		t.Error("unbinding active thread should clear ActiveThreads[@1]")
+	}
+
+	// Unbinding a non-active thread does not clear it.
+	s.SetActiveThread("@1", "u1", "t2")
+	s.BindThread("u1", "t3", "@1")
+	s.UnbindThread("u1", "t3")
+	ut, ok = s.GetActiveThread("@1")
+	if !ok || ut.ThreadID != "t2" {
+		t.Errorf("expected (u1,t2) still active, got %+v ok=%v", ut, ok)
+	}
+
+	// RemoveWindowState clears active thread.
+	s.RemoveWindowState("@1")
+	if _, ok := s.GetActiveThread("@1"); ok {
+		t.Error("RemoveWindowState should clear ActiveThreads")
+	}
+}
+
 func TestAllBoundWindowIDs(t *testing.T) {
 	s := NewState()
 	s.BindThread("u1", "t1", "@1")

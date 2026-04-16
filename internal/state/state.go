@@ -39,6 +39,7 @@ type State struct {
 	ProjectBindings    map[string]string            `json:"project_bindings"`     // thread_id → project_id
 	WorktreeBindings   map[string]WorktreeInfo      `json:"worktree_bindings"`    // thread_id → worktree info
 	WindowRunners      map[string]string            `json:"window_runners"`       // window_id → runner_name
+	ActiveThreads      map[string]UserThread        `json:"active_threads"`       // window_id → last (user, thread) that routed to this window
 }
 
 // NewState creates a new empty state.
@@ -52,6 +53,7 @@ func NewState() *State {
 		ProjectBindings:    make(map[string]string),
 		WorktreeBindings:   make(map[string]WorktreeInfo),
 		WindowRunners:      make(map[string]string),
+		ActiveThreads:      make(map[string]UserThread),
 	}
 }
 
@@ -86,6 +88,9 @@ func Load(path string) (*State, error) {
 	if s.WindowRunners == nil {
 		s.WindowRunners = make(map[string]string)
 	}
+	if s.ActiveThreads == nil {
+		s.ActiveThreads = make(map[string]UserThread)
+	}
 	return s, nil
 }
 
@@ -110,10 +115,19 @@ func (s *State) BindThread(userID, threadID, windowID string) {
 func (s *State) UnbindThread(userID, threadID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var windowID string
 	if m := s.ThreadBindings[userID]; m != nil {
+		windowID = m[threadID]
 		delete(m, threadID)
 		if len(m) == 0 {
 			delete(s.ThreadBindings, userID)
+		}
+	}
+	// If this (user, thread) was the active sender for the window, clear it
+	// so the next inbound message re-establishes who hears the reply.
+	if windowID != "" {
+		if at, ok := s.ActiveThreads[windowID]; ok && at.UserID == userID && at.ThreadID == threadID {
+			delete(s.ActiveThreads, windowID)
 		}
 	}
 }
@@ -144,6 +158,36 @@ func (s *State) FindUsersForWindow(windowID string) []UserThread {
 	return result
 }
 
+// SetActiveThread records the most recent (user, thread) pair that routed a
+// message to windowID. Used by the monitor to send an agent's reply back to
+// the originating topic only, instead of fanning it out to every topic that
+// ever bound to this window (which happens when a shared/default agent is
+// reached from multiple topics via the §8.1 tier-3 ladder).
+func (s *State) SetActiveThread(windowID, userID, threadID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ActiveThreads == nil {
+		s.ActiveThreads = make(map[string]UserThread)
+	}
+	s.ActiveThreads[windowID] = UserThread{UserID: userID, ThreadID: threadID}
+}
+
+// GetActiveThread returns the most recent (user, thread) pair that routed a
+// message to windowID, if any.
+func (s *State) GetActiveThread(windowID string) (UserThread, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	ut, ok := s.ActiveThreads[windowID]
+	return ut, ok
+}
+
+// ClearActiveThread drops the active-thread record for windowID.
+func (s *State) ClearActiveThread(windowID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.ActiveThreads, windowID)
+}
+
 // SetWindowState sets the state for a window.
 func (s *State) SetWindowState(windowID string, ws WindowState) {
 	s.mu.Lock()
@@ -166,6 +210,7 @@ func (s *State) RemoveWindowState(windowID string) {
 	delete(s.WindowStates, windowID)
 	delete(s.WindowDisplayNames, windowID)
 	delete(s.WindowRunners, windowID)
+	delete(s.ActiveThreads, windowID)
 	// Remove window from all user offsets
 	for uid := range s.UserWindowOffsets {
 		delete(s.UserWindowOffsets[uid], windowID)
