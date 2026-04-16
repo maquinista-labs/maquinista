@@ -56,7 +56,7 @@ func TestClaudeSource_HasFileChanged(t *testing.T) {
 		MaquinistaDir:            dir,
 		MonitorPollInterval: 2.0,
 	}
-	cs := NewClaudeSource(cfg, state.NewState(), state.NewMonitorState())
+	cs := NewClaudeSource(cfg, nil, state.NewState(), state.NewMonitorState())
 
 	// First check should return true
 	if !cs.hasFileChanged(path) {
@@ -83,7 +83,7 @@ func TestClaudeSource_HasFileChanged_NonExistent(t *testing.T) {
 		MaquinistaDir:            t.TempDir(),
 		MonitorPollInterval: 2.0,
 	}
-	cs := NewClaudeSource(cfg, state.NewState(), state.NewMonitorState())
+	cs := NewClaudeSource(cfg, nil, state.NewState(), state.NewMonitorState())
 
 	if cs.hasFileChanged("/nonexistent/file.jsonl") {
 		t.Error("nonexistent file should not detect change")
@@ -106,7 +106,7 @@ func TestClaudeSource_ReadNewEntries_Truncation(t *testing.T) {
 	// Set offset beyond file size to simulate /clear truncation
 	ms.UpdateOffset("test:@1", "test-session", path, 99999)
 
-	cs := NewClaudeSource(cfg, state.NewState(), ms)
+	cs := NewClaudeSource(cfg, nil, state.NewState(), ms)
 	// Populate lastSessionMap so ReadNewEntries can find the entry
 	cs.lastSessionMap = map[string]state.SessionMapEntry{
 		"test:@1": {SessionID: "test-session", CWD: dir},
@@ -140,7 +140,7 @@ func TestClaudeSource_DiscoverSessions_RemovesStale(t *testing.T) {
 	ms := state.NewMonitorState()
 	ms.UpdateOffset("old:@1", "old", "/some/path", 100)
 
-	cs := NewClaudeSource(cfg, state.NewState(), ms)
+	cs := NewClaudeSource(cfg, nil, state.NewState(), ms)
 	cs.lastSessionMap = map[string]state.SessionMapEntry{
 		"old:@1": {SessionID: "old"},
 	}
@@ -178,7 +178,7 @@ func TestClaudeSource_SearchSessionsIndex(t *testing.T) {
 		MaquinistaDir:            t.TempDir(),
 		MonitorPollInterval: 2.0,
 	}
-	cs := NewClaudeSource(cfg, state.NewState(), state.NewMonitorState())
+	cs := NewClaudeSource(cfg, nil, state.NewState(), state.NewMonitorState())
 
 	path := cs.searchSessionsIndex(
 		filepath.Join(projectDir, "sessions-index.json"),
@@ -199,7 +199,7 @@ func TestClaudeSource_SearchJSONLFiles(t *testing.T) {
 		MaquinistaDir:            t.TempDir(),
 		MonitorPollInterval: 2.0,
 	}
-	cs := NewClaudeSource(cfg, state.NewState(), state.NewMonitorState())
+	cs := NewClaudeSource(cfg, nil, state.NewState(), state.NewMonitorState())
 
 	path := cs.searchJSONLFiles(dir, "abc-123")
 	if path == "" {

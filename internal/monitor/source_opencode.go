@@ -1,6 +1,7 @@
 package monitor
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,16 +9,22 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	_ "modernc.org/sqlite"
 )
 
-// OpenCodeSource implements TranscriptSource for OpenCode.
-// It discovers sessions via session_map.json and reads transcript parts from OpenCode's SQLite database.
+// OpenCodeSource implements TranscriptSource for OpenCode. Session
+// discovery pulls tmux + cwd + window-created-at from Postgres agents
+// (Phase A of plans/active/json-state-migration.md), then cross-references
+// OpenCode's own SQLite DB to find the runner session id — which we write
+// back to agents.session_id so the bot can attribute subsequent responses.
 type OpenCodeSource struct {
 	config         *config.Config
+	pool           *pgxpool.Pool
 	appState       *state.State
 	monitorState   *state.MonitorState
 	dbPath         string
@@ -27,9 +34,10 @@ type OpenCodeSource struct {
 }
 
 // NewOpenCodeSource creates a new OpenCodeSource.
-func NewOpenCodeSource(cfg *config.Config, st *state.State, ms *state.MonitorState) *OpenCodeSource {
+func NewOpenCodeSource(cfg *config.Config, pool *pgxpool.Pool, st *state.State, ms *state.MonitorState) *OpenCodeSource {
 	return &OpenCodeSource{
 		config:         cfg,
+		pool:           pool,
 		appState:       st,
 		monitorState:   ms,
 		dbPath:         openCodeDBPath(),
@@ -83,23 +91,28 @@ func (o *OpenCodeSource) resetDB() {
 }
 
 func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
-	sessionMapPath := filepath.Join(o.config.MaquinistaDir, "session_map.json")
-	sm, err := state.LoadSessionMap(sessionMapPath)
+	if o.pool == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	sm, windowCreatedAt, err := loadOpenCodeSessionMap(ctx, o.pool)
 	if err != nil {
+		log.Printf("opencode source: session discovery: %v", err)
 		return nil
 	}
 
-	// Clean up stale sessions
+	// Clean up stale sessions.
 	for key := range o.lastSessionMap {
 		if _, ok := sm[key]; !ok {
 			o.monitorState.RemoveSession(key)
 		}
 	}
 
-	// Discover or re-discover session IDs.
-	// OpenCode may create new sessions for the same directory (e.g. on restart),
-	// so we always check the latest session and update if it changed.
-	// Only discover for opencode-owned windows to avoid overwriting Claude session IDs.
+	// Discover or re-discover session IDs. OpenCode may create new sessions
+	// for the same directory (e.g. on restart), so we always check the
+	// latest session and update if it changed.
 	for key, entry := range sm {
 		windowID := windowIDFromSessionKey(key)
 		if windowID == "" {
@@ -109,30 +122,28 @@ func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
 			continue
 		}
 
-		discovered, err := o.discoverSession(entry.CWD, entry.WindowCreatedAt)
-		if err != nil {
-			log.Printf("OpenCode: failed to discover session for %s (window %s): %v", entry.CWD, windowID, err)
+		discovered, derr := o.discoverSession(entry.CWD, windowCreatedAt[key])
+		if derr != nil {
+			log.Printf("OpenCode: failed to discover session for %s (window %s): %v", entry.CWD, windowID, derr)
 			continue
 		}
 		if discovered == entry.SessionID {
-			continue // unchanged
+			continue
 		}
 		old := entry.SessionID
 		entry.SessionID = discovered
 		sm[key] = entry
 
-		// Persist discovered session ID
-		_ = state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
-			if e, ok := data[key]; ok {
-				e.SessionID = discovered
-				data[key] = e
-			}
-		})
+		// Persist discovered session id to agents.session_id so the bot and
+		// follow-up polls see it without rediscovering.
+		if _, uerr := o.pool.Exec(ctx, `
+			UPDATE agents SET session_id=$1, last_seen=NOW()
+			WHERE tmux_session=$2 AND tmux_window=$3
+		`, discovered, strings.SplitN(key, ":", 2)[0], strings.SplitN(key, ":", 2)[1]); uerr != nil {
+			log.Printf("OpenCode: persist session_id: %v", uerr)
+		}
 
 		if old == "" {
-			// New window: initialize offset to current session time to avoid replaying history.
-			// OpenCode shares one session per directory, so multiple windows would all see
-			// historical messages if we started from offset 0.
 			currentTime := o.getCurrentTimeUpdated(discovered)
 			if currentTime > 0 {
 				o.monitorState.UpdateOffset(key, discovered, "opencode:sqlite", currentTime)
@@ -141,7 +152,6 @@ func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
 			}
 			log.Printf("OpenCode session discovered: %s -> %s (offset: %d)", entry.CWD, discovered, currentTime)
 		} else {
-			// Session changed: reset offset so we read from the start of the new session
 			o.monitorState.RemoveSession(key)
 			log.Printf("OpenCode session changed: %s -> %s (was %s)", entry.CWD, discovered, old)
 		}
@@ -150,13 +160,12 @@ func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
 	var sessions []ActiveSession
 	for key, entry := range sm {
 		if entry.SessionID == "" {
-			continue // not yet discovered
+			continue
 		}
 		windowID := windowIDFromSessionKey(key)
 		if windowID == "" {
 			continue
 		}
-		// Only claim sessions owned by this source
 		if o.appState.GetWindowRunner(windowID) != "opencode" {
 			continue
 		}
@@ -168,6 +177,44 @@ func (o *OpenCodeSource) DiscoverSessions() []ActiveSession {
 
 	o.lastSessionMap = sm
 	return sessions
+}
+
+// loadOpenCodeSessionMap returns (sessionMap, windowCreatedAt-in-unix-ms)
+// for every live opencode agent. The started_at of the agents row stands
+// in for "window creation time" so OpenCode's time-scoped session-discovery
+// query can isolate sessions to a specific window spawn.
+func loadOpenCodeSessionMap(ctx context.Context, pool *pgxpool.Pool) (map[string]state.SessionMapEntry, map[string]int64, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT tmux_session, tmux_window,
+		       COALESCE(session_id,''), COALESCE(cwd,''), COALESCE(window_name,''),
+		       COALESCE(EXTRACT(EPOCH FROM started_at)*1000, 0)::bigint
+		FROM agents
+		WHERE runner_type = 'opencode'
+		  AND status IN ('running','working','idle')
+		  AND tmux_session <> '' AND tmux_window <> ''
+	`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	sm := map[string]state.SessionMapEntry{}
+	createdAt := map[string]int64{}
+	for rows.Next() {
+		var tmuxSession, tmuxWindow, sessionID, cwd, windowName string
+		var startedAtMS int64
+		if err := rows.Scan(&tmuxSession, &tmuxWindow, &sessionID, &cwd, &windowName, &startedAtMS); err != nil {
+			return nil, nil, err
+		}
+		key := tmuxSession + ":" + tmuxWindow
+		sm[key] = state.SessionMapEntry{
+			SessionID:  sessionID,
+			CWD:        cwd,
+			WindowName: windowName,
+		}
+		createdAt[key] = startedAtMS
+	}
+	return sm, createdAt, rows.Err()
 }
 
 // discoverSession finds the OpenCode session for a given directory.

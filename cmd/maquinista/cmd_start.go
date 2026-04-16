@@ -170,13 +170,24 @@ func runStart() error {
 	q := queue.New(b.API())
 	b.SetQueue(q)
 
-	claudeSrc := monitor.NewClaudeSource(cfg, b.State(), ms)
+	// Ensure a DB pool is available before constructing monitor sources — the
+	// Phase A DB-backed session discovery requires it. Sources tolerate a
+	// nil pool (no sessions discovered until the pool lands).
+	if pool == nil && cfg.DatabaseURL != "" {
+		if p, dbErr := db.Connect(cfg.DatabaseURL); dbErr != nil {
+			log.Printf("monitor: cannot connect DB: %v", dbErr)
+		} else {
+			pool = p
+		}
+	}
+
+	claudeSrc := monitor.NewClaudeSource(cfg, pool, b.State(), ms)
 	monitor.RegisterSource("claude", claudeSrc)
 
-	opencodeSrc := monitor.NewOpenCodeSource(cfg, b.State(), ms)
+	opencodeSrc := monitor.NewOpenCodeSource(cfg, pool, b.State(), ms)
 	monitor.RegisterSource("opencode", opencodeSrc)
 
-	openclaudeSrc := monitor.NewOpenClaudeSource(cfg, b.State(), ms)
+	openclaudeSrc := monitor.NewOpenClaudeSource(cfg, pool, b.State(), ms)
 	monitor.RegisterSource("openclaude", openclaudeSrc)
 
 	mon := monitor.New(cfg, b.State(), ms, q)

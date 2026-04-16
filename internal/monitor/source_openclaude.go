@@ -2,6 +2,7 @@ package monitor
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"log"
 	"os"
@@ -9,15 +10,18 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
-// OpenClaudeSource implements TranscriptSource for OpenClaude.
-// It discovers sessions via session_map.json and reads JSONL transcript files.
-// OpenClaude stores transcripts in the same ~/.claude/projects/ structure as Claude Code.
+// OpenClaudeSource implements TranscriptSource for OpenClaude, a
+// Claude-compatible fork. Session discovery flows through the same
+// DB-backed path as ClaudeSource (Phase A of
+// plans/active/json-state-migration.md).
 type OpenClaudeSource struct {
 	config         *config.Config
+	pool           *pgxpool.Pool
 	appState       *state.State
 	monitorState   *state.MonitorState
 	pendingTools   map[string]PendingTool
@@ -26,9 +30,10 @@ type OpenClaudeSource struct {
 }
 
 // NewOpenClaudeSource creates a new OpenClaudeSource.
-func NewOpenClaudeSource(cfg *config.Config, st *state.State, ms *state.MonitorState) *OpenClaudeSource {
+func NewOpenClaudeSource(cfg *config.Config, pool *pgxpool.Pool, st *state.State, ms *state.MonitorState) *OpenClaudeSource {
 	return &OpenClaudeSource{
 		config:         cfg,
+		pool:           pool,
 		appState:       st,
 		monitorState:   ms,
 		pendingTools:   make(map[string]PendingTool),
@@ -42,13 +47,18 @@ func (o *OpenClaudeSource) Name() string {
 }
 
 func (o *OpenClaudeSource) DiscoverSessions() []ActiveSession {
-	sessionMapPath := filepath.Join(o.config.MaquinistaDir, "session_map.json")
-	sm, err := state.LoadSessionMap(sessionMapPath)
+	if o.pool == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	sm, err := loadRunnerSessionMap(ctx, o.pool, "openclaude")
 	if err != nil {
+		log.Printf("openclaude source: session discovery: %v", err)
 		return nil
 	}
 
-	// Detect changes: clean up stale sessions
 	for key := range o.lastSessionMap {
 		if _, ok := sm[key]; !ok {
 			o.monitorState.RemoveSession(key)
@@ -62,7 +72,6 @@ func (o *OpenClaudeSource) DiscoverSessions() []ActiveSession {
 		if windowID == "" {
 			continue
 		}
-		// Only claim sessions owned by this source
 		if o.appState.GetWindowRunner(windowID) != "openclaude" {
 			continue
 		}

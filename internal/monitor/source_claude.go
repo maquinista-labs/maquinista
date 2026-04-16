@@ -2,21 +2,27 @@ package monitor
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
+	"errors"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
 // ClaudeSource implements TranscriptSource for Claude Code.
-// It discovers sessions via session_map.json and reads JSONL transcript files.
+// Discovers sessions by reading agents.session_id/cwd from Postgres (Phase A
+// of plans/active/json-state-migration.md — session_map.json is retired).
 type ClaudeSource struct {
 	config         *config.Config
+	pool           *pgxpool.Pool
 	appState       *state.State
 	monitorState   *state.MonitorState
 	pendingTools   map[string]PendingTool
@@ -24,10 +30,13 @@ type ClaudeSource struct {
 	lastSessionMap map[string]state.SessionMapEntry
 }
 
-// NewClaudeSource creates a new ClaudeSource.
-func NewClaudeSource(cfg *config.Config, st *state.State, ms *state.MonitorState) *ClaudeSource {
+// NewClaudeSource creates a new ClaudeSource. The pool is required for the
+// Phase A DB-backed session discovery; a nil pool yields an empty session
+// set (nothing to route) until the pool becomes available.
+func NewClaudeSource(cfg *config.Config, pool *pgxpool.Pool, st *state.State, ms *state.MonitorState) *ClaudeSource {
 	return &ClaudeSource{
 		config:         cfg,
+		pool:           pool,
 		appState:       st,
 		monitorState:   ms,
 		pendingTools:   make(map[string]PendingTool),
@@ -41,13 +50,22 @@ func (c *ClaudeSource) Name() string {
 }
 
 func (c *ClaudeSource) DiscoverSessions() []ActiveSession {
-	sessionMapPath := filepath.Join(c.config.MaquinistaDir, "session_map.json")
-	sm, err := state.LoadSessionMap(sessionMapPath)
-	if err != nil {
-		return nil
+	var sm map[string]state.SessionMapEntry
+	if c.pool != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		loaded, err := loadRunnerSessionMap(ctx, c.pool, "claude")
+		if err != nil {
+			log.Printf("claude source: session discovery: %v", err)
+			return nil
+		}
+		sm = loaded
+	} else {
+		sm = map[string]state.SessionMapEntry{}
 	}
 
-	// Detect changes: clean up stale sessions
+	// Detect changes: clean up stale sessions.
 	for key := range c.lastSessionMap {
 		if _, ok := sm[key]; !ok {
 			c.monitorState.RemoveSession(key)
@@ -61,7 +79,7 @@ func (c *ClaudeSource) DiscoverSessions() []ActiveSession {
 		if windowID == "" {
 			continue
 		}
-		// Only claim sessions owned by this source
+		// Only claim sessions owned by this source.
 		if c.appState.GetWindowRunner(windowID) != "claude" {
 			continue
 		}
@@ -73,6 +91,43 @@ func (c *ClaudeSource) DiscoverSessions() []ActiveSession {
 
 	c.lastSessionMap = sm
 	return sessions
+}
+
+// loadRunnerSessionMap returns {tmux_session:tmux_window → SessionMapEntry}
+// for every live agent of the given runner type. Replaces the JSON-backed
+// state.LoadSessionMap per plans/active/json-state-migration.md Phase A.
+// Rows missing session_id or cwd are skipped — the runner hasn't created
+// its session yet, so there's nothing to tail.
+func loadRunnerSessionMap(ctx context.Context, pool *pgxpool.Pool, runnerType string) (map[string]state.SessionMapEntry, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT tmux_session, tmux_window,
+		       COALESCE(session_id,''), COALESCE(cwd,''), COALESCE(window_name,'')
+		FROM agents
+		WHERE runner_type = $1
+		  AND status IN ('running','working','idle')
+		  AND tmux_session <> '' AND tmux_window <> ''
+	`, runnerType)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return map[string]state.SessionMapEntry{}, nil
+		}
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := map[string]state.SessionMapEntry{}
+	for rows.Next() {
+		var tmuxSession, tmuxWindow, sessionID, cwd, windowName string
+		if err := rows.Scan(&tmuxSession, &tmuxWindow, &sessionID, &cwd, &windowName); err != nil {
+			return nil, err
+		}
+		out[tmuxSession+":"+tmuxWindow] = state.SessionMapEntry{
+			SessionID:  sessionID,
+			CWD:        cwd,
+			WindowName: windowName,
+		}
+	}
+	return out, rows.Err()
 }
 
 func (c *ClaudeSource) ReadNewEntries(session ActiveSession, lastOffset int64) ([]ParsedEntry, int64, error) {
