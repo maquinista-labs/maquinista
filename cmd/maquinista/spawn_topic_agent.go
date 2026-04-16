@@ -98,54 +98,31 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			return "", fmt.Errorf("ensuring tmux session: %w", err)
 		}
 
-		runnerCmd, env := resolveRunnerCommand(cfg, agentID, cwd)
-
-		windowID, err := tmux.NewWindow(cfg.TmuxSessionName, agentID, cwd, runnerCmd, env)
-		if err != nil {
-			return "", fmt.Errorf("spawning topic agent window: %w", err)
-		}
-		log.Printf("spawn_topic_agent: spawned %s at %s:%s (cwd=%s, runner=%s)",
-			agentID, cfg.TmuxSessionName, windowID, cwd, runnerCmd)
-
-		// Block until the runner's TUI is ready to accept keystrokes.
-		// Without this the first message's send-keys arrives before Claude
-		// has drawn its prompt — the text lands in the input buffer but the
-		// Enter is eaten by the boot screen, so nothing submits until the
-		// user presses Enter by hand.
-		if err := waitForRunnerReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
-			log.Printf("spawn_topic_agent: %s not ready within timeout: %v (first message may need manual Enter)",
-				agentID, err)
-		}
-
+		// Pre-register an agents row (status='stopped', no tmux_window yet)
+		// so the soul's FK resolves. We flip to 'running' with the real
+		// tmux_window after the pane is up.
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO agents
 				(id, tmux_session, tmux_window, role, status, runner_type,
 				 session_id, cwd, window_name,
 				 started_at, last_seen, stop_requested)
-			VALUES ($1, $2, $3, 'user', 'running', $4, NULL, $5, $1, NOW(), NOW(), FALSE)
+			VALUES ($1, $2, '', 'user', 'stopped', $3, NULL, $4, $1, NOW(), NOW(), FALSE)
 			ON CONFLICT (id) DO UPDATE SET
 				tmux_session   = EXCLUDED.tmux_session,
-				tmux_window    = EXCLUDED.tmux_window,
-				status         = 'running',
 				runner_type    = EXCLUDED.runner_type,
 				cwd            = EXCLUDED.cwd,
 				window_name    = EXCLUDED.window_name,
-				last_seen      = NOW(),
 				stop_requested = FALSE
-		`, agentID, cfg.TmuxSessionName, windowID, cfg.DefaultRunner, cwd); err != nil {
-			return "", fmt.Errorf("registering topic agent row: %w", err)
+		`, agentID, cfg.TmuxSessionName, cfg.DefaultRunner, cwd); err != nil {
+			return "", fmt.Errorf("pre-registering topic agent row: %w", err)
 		}
 
-		// Create a soul row from the default template. Per
-		// plans/active/agent-soul-db-state.md Phase 2 every persistent
-		// agent gets structured identity at creation time; failure is
-		// logged but non-fatal (agent still boots with empty soul).
+		// Create soul (default template), seed memory blocks, render soul
+		// file — all done BEFORE tmux spawn so the runner command can use
+		// --system-prompt when the runner supports it (Claude / OpenClaude).
 		if err := soul.CreateFromTemplate(ctx, pool, agentID, "", soul.Overrides{}); err != nil {
 			log.Printf("spawn_topic_agent: soul create for %s: %v (continuing)", agentID, err)
 		}
-		// Seed default core memory blocks (persona, human, task-note).
-		// The persona block is pre-populated from the soul's core_truths
-		// so the agent starts with its identity in scratchable context.
 		var seedPersona string
 		if s, lerr := soul.Load(ctx, pool, agentID); lerr == nil && s != nil {
 			seedPersona = s.CoreTruths
@@ -153,13 +130,33 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		if err := memory.SeedDefaultBlocks(ctx, pool, agentID, seedPersona); err != nil {
 			log.Printf("spawn_topic_agent: seed memory blocks for %s: %v (continuing)", agentID, err)
 		}
-		// Render the soul to $MAQUINISTA_DIR/prompts/<agent>.md so a
-		// future Phase 3 runner integration can pass it as --system-prompt
-		// without re-querying the DB on every spawn. The file is harmless
-		// if no runner consumes it yet — operators can also read it for
-		// debugging.
-		if _, err := writeSoulPromptFile(ctx, pool, cfg, agentID); err != nil {
-			log.Printf("spawn_topic_agent: write soul prompt file: %v (continuing)", err)
+		soulPromptPath, serr := writeSoulPromptFile(ctx, pool, cfg, agentID)
+		if serr != nil {
+			log.Printf("spawn_topic_agent: write soul prompt file: %v (continuing)", serr)
+		}
+
+		runnerCmd, env := resolveRunnerCommand(cfg, agentID, cwd, soulPromptPath)
+
+		windowID, err := tmux.NewWindow(cfg.TmuxSessionName, agentID, cwd, runnerCmd, env)
+		if err != nil {
+			return "", fmt.Errorf("spawning topic agent window: %w", err)
+		}
+		log.Printf("spawn_topic_agent: spawned %s at %s:%s (cwd=%s, runner=%s, soul=%v)",
+			agentID, cfg.TmuxSessionName, windowID, cwd, runnerCmd, soulPromptPath != "")
+
+		// Block until the runner's TUI is ready to accept keystrokes.
+		if err := waitForRunnerReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
+			log.Printf("spawn_topic_agent: %s not ready within timeout: %v (first message may need manual Enter)",
+				agentID, err)
+		}
+
+		// Flip the agents row to running and publish the real tmux_window.
+		if _, err := pool.Exec(ctx, `
+			UPDATE agents
+			SET tmux_window = $2, status = 'running', last_seen = NOW()
+			WHERE id = $1
+		`, agentID, windowID); err != nil {
+			return "", fmt.Errorf("finalizing topic agent row: %w", err)
 		}
 
 		if botState != nil {
@@ -249,9 +246,12 @@ func tmuxWindowExists(session, windowID string) bool {
 }
 
 // resolveRunnerCommand picks the shell command line for the configured
-// runner. Factored out so spawn_topic_agent and any future spawn callers
-// stay consistent on sandbox / skip-permissions flags.
-func resolveRunnerCommand(cfg *config.Config, agentID, cwd string) (string, map[string]string) {
+// runner. When soulPromptPath is non-empty and the runner understands a
+// system-prompt file (Claude-family), the command is rewritten to inject
+// it via `--system-prompt "$(cat FILE)"` so the agent boots with its soul.
+// Runners without that flag (OpenCode) fall back to LaunchCommand — the
+// soul still lives on disk for future integration.
+func resolveRunnerCommand(cfg *config.Config, agentID, cwd, soulPromptPath string) (string, map[string]string) {
 	env := map[string]string{
 		"AGENT_ID":    agentID,
 		"RUNNER_TYPE": cfg.DefaultRunner,
@@ -259,15 +259,31 @@ func resolveRunnerCommand(cfg *config.Config, agentID, cwd string) (string, map[
 	if cfg.DatabaseURL != "" {
 		env["DATABASE_URL"] = cfg.DatabaseURL
 	}
-	if r, err := runner.Get(cfg.DefaultRunner); err == nil {
-		for k, v := range r.EnvOverrides() {
-			env[k] = v
-		}
-		return r.LaunchCommand(runner.Config{WorkDir: cwd, Env: env}), env
+	if soulPromptPath != "" {
+		env["MAQUINISTA_AGENT_PROMPT"] = soulPromptPath
 	}
-	cmd := cfg.ClaudeCommand
-	if cmd == "" {
-		cmd = "claude"
+	r, rerr := runner.Get(cfg.DefaultRunner)
+	if rerr != nil {
+		cmd := cfg.ClaudeCommand
+		if cmd == "" {
+			cmd = "claude"
+		}
+		return cmd, env
+	}
+	for k, v := range r.EnvOverrides() {
+		env[k] = v
+	}
+
+	cmd := r.LaunchCommand(runner.Config{WorkDir: cwd, Env: env})
+	if soulPromptPath == "" {
+		return cmd, env
+	}
+	switch r.Name() {
+	case "claude", "openclaude":
+		// Both accept `--system-prompt "$(cat FILE)"`; append it so the
+		// soul lands as the system prompt without replacing the launch
+		// flags (IS_SANDBOX=1, --dangerously-skip-permissions, …).
+		cmd = fmt.Sprintf(`%s --system-prompt "$(cat %s)"`, cmd, soulPromptPath)
 	}
 	return cmd, env
 }

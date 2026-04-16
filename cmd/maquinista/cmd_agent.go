@@ -1,0 +1,282 @@
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/maquinista-labs/maquinista/internal/soul"
+	"github.com/spf13/cobra"
+)
+
+// Phase 3 of plans/active/multi-agent-registry.md — manage persistent
+// agent rows (role='user') from the CLI. Task-scoped agents (task_id
+// != NULL) are owned by the orchestrator; these subcommands don't
+// touch them.
+
+var agentCmd = &cobra.Command{
+	Use:   "agent",
+	Short: "Manage persistent agents (add / archive / kill)",
+}
+
+var (
+	agentAddRunner       string
+	agentAddRole         string
+	agentAddCWD          string
+	agentAddHandle       string
+	agentAddSoulTemplate string
+	agentAddSystemPrompt string
+	agentAddPersona      string
+)
+
+var agentAddCmd = &cobra.Command{
+	Use:   "add <agent-id>",
+	Short: "Insert a new agent row + soul + default memory blocks",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runAgentAdd(args[0])
+	},
+}
+
+var agentArchiveCmd = &cobra.Command{
+	Use:   "archive <agent-id>",
+	Short: "Archive an agent (status='archived'); keeps history and bindings",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runAgentArchive(args[0])
+	},
+}
+
+var agentKillCmd = &cobra.Command{
+	Use:   "kill <agent-id>",
+	Short: "Signal the agent's runner to exit (stop_requested=TRUE)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runAgentKill(args[0])
+	},
+}
+
+var agentEditCmd = &cobra.Command{
+	Use:   "edit <agent-id>",
+	Short: "Update agent-level settings (persona / system prompt / runner / cwd)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runAgentEdit(args[0])
+	},
+}
+
+func init() {
+	agentAddCmd.Flags().StringVar(&agentAddRunner, "runner", "claude", "runner_type (claude, openclaude, opencode, custom)")
+	agentAddCmd.Flags().StringVar(&agentAddRole, "role", "user", "agent role (user | executor)")
+	agentAddCmd.Flags().StringVar(&agentAddCWD, "cwd", "", "agent working directory")
+	agentAddCmd.Flags().StringVar(&agentAddHandle, "handle", "", "friendly @-handle (unique, lowercase a-z0-9_-)")
+	agentAddCmd.Flags().StringVar(&agentAddSoulTemplate, "soul-template", "", "soul template id (default: 'default')")
+	agentAddCmd.Flags().StringVar(&agentAddSystemPrompt, "system-prompt", "", "file to load into agent_settings.system_prompt")
+	agentAddCmd.Flags().StringVar(&agentAddPersona, "persona", "", "agent_settings.persona text")
+
+	agentEditCmd.Flags().StringVar(&agentAddRunner, "runner", "", "new runner_type")
+	agentEditCmd.Flags().StringVar(&agentAddCWD, "cwd", "", "new agent working directory")
+	agentEditCmd.Flags().StringVar(&agentAddSystemPrompt, "system-prompt", "", "new system prompt file")
+	agentEditCmd.Flags().StringVar(&agentAddPersona, "persona", "", "new persona text")
+
+	agentCmd.AddCommand(agentAddCmd, agentArchiveCmd, agentKillCmd, agentEditCmd)
+	rootCmd.AddCommand(agentCmd)
+}
+
+func runAgentAdd(id string) error {
+	if err := connectDB(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cwd := agentAddCWD
+	if cwd == "" {
+		if wd, err := os.Getwd(); err == nil {
+			cwd = wd
+		}
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Insert the agents row (status='stopped' until the start daemon or
+	// tier-3 routing spawns a runner).
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agents
+			(id, tmux_session, tmux_window, role, status, runner_type,
+			 cwd, window_name, started_at, last_seen, stop_requested)
+		VALUES ($1, 'maquinista', '', $2, 'stopped', $3, $4, $1, NOW(), NOW(), FALSE)
+	`, id, agentAddRole, agentAddRunner, cwd); err != nil {
+		return fmt.Errorf("insert agent %s: %w", id, err)
+	}
+
+	// Handle (optional; validated by the DB partial-unique index).
+	if agentAddHandle != "" {
+		normalized := strings.ToLower(agentAddHandle)
+		if _, err := tx.Exec(ctx, `UPDATE agents SET handle=$1 WHERE id=$2`, normalized, id); err != nil {
+			return fmt.Errorf("set handle: %w", err)
+		}
+	}
+
+	// agent_settings — optional persona / system_prompt.
+	sysPrompt := ""
+	if agentAddSystemPrompt != "" {
+		b, err := os.ReadFile(agentAddSystemPrompt)
+		if err != nil {
+			return fmt.Errorf("read --system-prompt file: %w", err)
+		}
+		sysPrompt = string(b)
+	}
+	if sysPrompt != "" || agentAddPersona != "" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO agent_settings (agent_id, persona, system_prompt)
+			VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
+			ON CONFLICT (agent_id) DO UPDATE SET
+				persona       = COALESCE(EXCLUDED.persona, agent_settings.persona),
+				system_prompt = COALESCE(EXCLUDED.system_prompt, agent_settings.system_prompt),
+				updated_at    = NOW()
+		`, id, agentAddPersona, sysPrompt); err != nil {
+			return fmt.Errorf("agent_settings upsert: %w", err)
+		}
+	}
+
+	// Soul: clone from template. Overrides from --persona if supplied (the
+	// operator typically means "this is the agent's self-description").
+	var overrides soul.Overrides
+	if agentAddPersona != "" {
+		overrides.CoreTruths = &agentAddPersona
+	}
+	if err := soul.CreateFromTemplate(ctx, tx, id, agentAddSoulTemplate, overrides); err != nil {
+		return fmt.Errorf("soul create: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	fmt.Printf("Added agent %s (runner=%s, cwd=%s)\n", id, agentAddRunner, cwd)
+	return nil
+}
+
+func runAgentArchive(id string) error {
+	if err := connectDB(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	tag, err := pool.Exec(ctx, `
+		UPDATE agents SET status='archived', stop_requested=TRUE, last_seen=NOW()
+		WHERE id=$1
+	`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("no such agent: %s", id)
+	}
+	fmt.Printf("Archived %s\n", id)
+	return nil
+}
+
+func runAgentKill(id string) error {
+	if err := connectDB(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	tag, err := pool.Exec(ctx, `
+		UPDATE agents SET stop_requested=TRUE, last_seen=NOW()
+		WHERE id=$1
+	`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("no such agent: %s", id)
+	}
+	fmt.Printf("Kill requested for %s — the agent_stop NOTIFY will signal the sidecar\n", id)
+	return nil
+}
+
+func runAgentEdit(id string) error {
+	if err := connectDB(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Verify the agent exists first.
+	var role string
+	if err := pool.QueryRow(ctx, `SELECT role FROM agents WHERE id=$1`, id).Scan(&role); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("no such agent: %s", id)
+		}
+		return err
+	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if agentAddRunner != "" {
+		if _, err := tx.Exec(ctx, `UPDATE agents SET runner_type=$1 WHERE id=$2`, agentAddRunner, id); err != nil {
+			return fmt.Errorf("set runner_type: %w", err)
+		}
+	}
+	if agentAddCWD != "" {
+		if _, err := tx.Exec(ctx, `UPDATE agents SET cwd=$1 WHERE id=$2`, agentAddCWD, id); err != nil {
+			return fmt.Errorf("set cwd: %w", err)
+		}
+	}
+	if agentAddSystemPrompt != "" {
+		b, err := os.ReadFile(agentAddSystemPrompt)
+		if err != nil {
+			return fmt.Errorf("read --system-prompt file: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO agent_settings (agent_id, system_prompt)
+			VALUES ($1, $2)
+			ON CONFLICT (agent_id) DO UPDATE SET
+				system_prompt = EXCLUDED.system_prompt,
+				updated_at    = NOW()
+		`, id, string(b)); err != nil {
+			return fmt.Errorf("agent_settings.system_prompt: %w", err)
+		}
+	}
+	if agentAddPersona != "" {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO agent_settings (agent_id, persona)
+			VALUES ($1, $2)
+			ON CONFLICT (agent_id) DO UPDATE SET
+				persona    = EXCLUDED.persona,
+				updated_at = NOW()
+		`, id, agentAddPersona); err != nil {
+			return fmt.Errorf("agent_settings.persona: %w", err)
+		}
+		// Mirror into soul.core_truths so the rendered system prompt
+		// actually reflects the new persona.
+		if s, err := soul.Load(ctx, tx, id); err == nil {
+			s.CoreTruths = agentAddPersona
+			if err := soul.Upsert(ctx, tx, *s); err != nil {
+				return fmt.Errorf("soul.Upsert: %w", err)
+			}
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	fmt.Printf("Edited %s\n", id)
+	return nil
+}
