@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
@@ -24,7 +26,7 @@ import (
 //
 // Precedence for the agent id: --agent flag > MAQUINISTA_DEFAULT_AGENT env
 // > cfg.DefaultAgent (populated from env with fallback "maquinista").
-func ensureDefaultAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool) error {
+func ensureDefaultAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, botState *state.State) error {
 	if startNoAgent {
 		return nil
 	}
@@ -157,6 +159,17 @@ func ensureDefaultAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.P
 		return fmt.Errorf("registering default agent row: %w", err)
 	}
 	log.Printf("default agent: registered %s in agents table", agentID)
+
+	// Mirror runner + display-name into state.json so the monitor (which
+	// still keys off those maps) picks up this window. The user/thread
+	// binding is written by the routing ladder on first message.
+	if botState != nil {
+		botState.SetWindowRunner(windowID, cfg.DefaultRunner)
+		botState.SetWindowDisplayName(windowID, agentID)
+		if err := botState.Save(filepath.Join(cfg.MaquinistaDir, "state.json")); err != nil {
+			log.Printf("default agent: state.Save: %v", err)
+		}
+	}
 	return nil
 }
 

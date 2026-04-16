@@ -76,10 +76,42 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 		return
 	}
 
+	// Keep state.json bindings in sync with topic_agent_bindings so the
+	// monitor (which still reads state.*) can route responses back. See
+	// plans/json-state-migration.md Phase B for the proper fix that
+	// drops this dual-write.
+	b.syncAgentStateFor(ctx, pool, res.AgentID, userID, threadID, chatID)
+
 	if !b.routeTextViaInbox(msg, res.AgentID, res.Text) {
 		log.Printf("mailbox.inbound: routing failed for %s", res.AgentID)
 		b.reply(chatID, getThreadID(msg), "Error: agent mailbox write failed. Check DATABASE_URL.")
 	}
+}
+
+// syncAgentStateFor populates the in-memory state.json maps the legacy
+// monitor relies on (thread→window, user+thread→chat, window→runner)
+// from the agents + bindings tables. Swallows errors — a stale
+// state.json doesn't break routing, it just means responses don't
+// reach Telegram.
+func (b *Bot) syncAgentStateFor(ctx context.Context, pool *pgxpool.Pool, agentID, userID, threadID string, chatID int64) {
+	if pool == nil || agentID == "" {
+		return
+	}
+	var window, runner string
+	err := pool.QueryRow(ctx, `
+		SELECT COALESCE(tmux_window,''), COALESCE(runner_type,'')
+		FROM agents WHERE id=$1
+	`, agentID).Scan(&window, &runner)
+	if err != nil || window == "" {
+		return
+	}
+	b.state.BindThread(userID, threadID, window)
+	b.state.SetGroupChatID(userID, threadID, chatID)
+	if runner != "" {
+		b.state.SetWindowRunner(window, runner)
+	}
+	b.state.SetWindowDisplayName(window, agentID)
+	b.saveState()
 }
 
 // agentExists returns true if agent_id is present in agents. Fail-open on

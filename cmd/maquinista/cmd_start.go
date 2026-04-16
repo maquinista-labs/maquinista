@@ -250,7 +250,7 @@ func runStart() error {
 		// can send a Telegram message without manually booting a runner.
 		// The SessionStart hook inside the spawned pane upserts the agents
 		// row; no DB write happens here.
-		if err := ensureDefaultAgent(ctx, cfg, pool); err != nil {
+		if err := ensureDefaultAgent(ctx, cfg, pool, b.State()); err != nil {
 			log.Printf("default agent: %v", err)
 		}
 	} else {

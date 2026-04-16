@@ -163,6 +163,10 @@ func (b *Bot) handleAgentPickSel(cq *tgbotapi.CallbackQuery, st *agentPickerStat
 		return
 	}
 
+	// Mirror the binding into state.json so the legacy monitor can fan
+	// responses back to this topic.
+	b.syncAgentStateFor(ctx, pool, agentID, userIDStr, threadIDStr, chatID)
+
 	b.editMessageText(chatID, messageID, fmt.Sprintf("Bound @%s to this topic.", agentID))
 
 	if pending == "" {
