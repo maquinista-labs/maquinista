@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/memory"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/state"
@@ -141,6 +142,16 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		// logged but non-fatal (agent still boots with empty soul).
 		if err := soul.CreateFromTemplate(ctx, pool, agentID, "", soul.Overrides{}); err != nil {
 			log.Printf("spawn_topic_agent: soul create for %s: %v (continuing)", agentID, err)
+		}
+		// Seed default core memory blocks (persona, human, task-note).
+		// The persona block is pre-populated from the soul's core_truths
+		// so the agent starts with its identity in scratchable context.
+		var seedPersona string
+		if s, lerr := soul.Load(ctx, pool, agentID); lerr == nil && s != nil {
+			seedPersona = s.CoreTruths
+		}
+		if err := memory.SeedDefaultBlocks(ctx, pool, agentID, seedPersona); err != nil {
+			log.Printf("spawn_topic_agent: seed memory blocks for %s: %v (continuing)", agentID, err)
 		}
 		// Render the soul to $MAQUINISTA_DIR/prompts/<agent>.md so a
 		// future Phase 3 runner integration can pass it as --system-prompt
