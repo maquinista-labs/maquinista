@@ -266,6 +266,68 @@ func TestSearch_FTSMatchesKeywords(t *testing.T) {
 	}
 }
 
+func TestSearchShared_IncludesProjectAndGlobal(t *testing.T) {
+	pool, _ := dbtest.PgContainer(t)
+	if _, err := db.RunMigrations(pool); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO agents (id, tmux_session, tmux_window) VALUES ('alice','s','a'),('bob','s','b')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Alice's private fact.
+	if _, err := Remember(ctx, pool, Memory{
+		AgentID: "alice", Dimension: "agent", Tier: "long_term", Category: "fact",
+		Title: "alice-only secret", Body: "Alice prefers rust.", Source: "operator",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Project-scoped fact — both agents should see it if they join the project.
+	if _, err := Remember(ctx, pool, Memory{
+		AgentID: "alice", Dimension: "agent", Tier: "long_term", Category: "project",
+		Title: "prj fact", Body: "Project uses Postgres 5434.", Source: "operator",
+		OwnerScope: "project", OwnerRef: "prj-x",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Global fact — any agent sees it.
+	if _, err := Remember(ctx, pool, Memory{
+		AgentID: "alice", Dimension: "agent", Tier: "long_term", Category: "reference",
+		Title: "global guide", Body: "Go slices are reference types.", Source: "operator",
+		OwnerScope: "global",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob, not in the project, searches. Should find global only.
+	hits, err := SearchShared(ctx, pool, "bob", "", "Go slices", ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 {
+		t.Fatal("bob should see the global fact")
+	}
+
+	// Bob joined prj-x, searches for Postgres. Should find project-scoped row.
+	hits, err = SearchShared(ctx, pool, "bob", "prj-x", "Postgres", ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) == 0 {
+		t.Error("bob (in prj-x) should see the project-scoped fact")
+	}
+
+	// Bob searches for alice-only data — must not appear (scope=agent).
+	hits, err = SearchShared(ctx, pool, "bob", "prj-x", "rust", ListFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(hits) > 0 {
+		t.Errorf("bob should not see alice's private fact, got %+v", hits)
+	}
+}
+
 func TestFetchForInjection_PinnedAndLongTerm(t *testing.T) {
 	ctx, _, _, tearDown := setupPool(t)
 	defer tearDown()

@@ -195,12 +195,17 @@ type Memory struct {
 	Tags       []string
 	Pinned     bool
 	Score      float32
+	OwnerScope string // 'agent' | 'project' | 'global'  (phase 5)
+	OwnerRef   string // project id when OwnerScope='project'
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
 	ExpiresAt  *time.Time
 }
 
 // Remember inserts a new archival passage. Returns the new id.
+// OwnerScope defaults to 'agent' when empty (per-agent memory, existing
+// behavior). Set to 'project' + OwnerRef=<project_id> or 'global' to
+// share across agents (see Phase 5 of agent-memory-db.md).
 func Remember(ctx context.Context, q Querier, m Memory) (int64, error) {
 	if err := validateMemory(m); err != nil {
 		return 0, err
@@ -208,15 +213,20 @@ func Remember(ctx context.Context, q Querier, m Memory) (int64, error) {
 	if m.Tags == nil {
 		m.Tags = []string{}
 	}
+	if m.OwnerScope == "" {
+		m.OwnerScope = "agent"
+	}
 	var id int64
 	err := q.QueryRow(ctx, `
 		INSERT INTO agent_memories
 			(agent_id, dimension, tier, category, title, body,
-			 source, source_ref, tags, pinned, score, expires_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+			 source, source_ref, tags, pinned, score, expires_at,
+			 owner_scope, owner_ref)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 		RETURNING id
 	`, m.AgentID, m.Dimension, m.Tier, m.Category, m.Title, m.Body,
 		m.Source, nullIfEmpty(m.SourceRef), m.Tags, m.Pinned, m.Score, m.ExpiresAt,
+		m.OwnerScope, nullIfEmpty(m.OwnerRef),
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("remember: %w", err)
@@ -333,6 +343,43 @@ func scanMemoryRows(rows pgx.Rows, agentID string) ([]Memory, error) {
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// SearchShared extends Search to include archival passages owned at
+// higher scopes — 'project' (when projectID is non-empty) and 'global'
+// rows. Useful when an agent wants to consult shared facts across a
+// project. Phase 5 of agent-memory-db.md.
+func SearchShared(ctx context.Context, q Querier, agentID, projectID, query string, f ListFilter) ([]Memory, error) {
+	limit := f.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	var projParam any
+	if projectID != "" {
+		projParam = projectID
+	}
+	rows, err := q.Query(ctx, `
+		SELECT m.id, m.dimension, m.tier, m.category, m.title, m.body,
+		       m.source, COALESCE(m.source_ref,''), m.tags, m.pinned, m.score,
+		       m.created_at, m.updated_at, m.expires_at
+		FROM agent_memories m, plainto_tsquery('simple', $3) qq
+		WHERE (m.expires_at IS NULL OR m.expires_at > NOW())
+		  AND ($4 = '' OR m.dimension = $4)
+		  AND ($5 = '' OR m.tier = $5)
+		  AND ($6 = '' OR m.category = $6)
+		  AND m.tsv @@ qq
+		  AND (
+		       (m.owner_scope = 'agent'  AND m.agent_id = $1)
+		    OR (m.owner_scope = 'project' AND m.owner_ref = $2::text)
+		    OR  m.owner_scope = 'global'
+		  )
+		ORDER BY m.pinned DESC, ts_rank(m.tsv, qq) DESC, m.created_at DESC
+		LIMIT $7
+	`, agentID, projParam, query, f.Dimension, f.Tier, f.Category, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanMemoryRows(rows, agentID)
 }
 
 // Pin flips the pinned flag on a passage.
