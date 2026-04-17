@@ -11,6 +11,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maquinista-labs/maquinista/internal/memory"
 	"github.com/maquinista-labs/maquinista/internal/routing"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
@@ -83,6 +84,14 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 	// plans/active/json-state-migration.md Phase B for the proper fix that
 	// drops this dual-write.
 	b.syncAgentStateFor(ctx, pool, res.AgentID, userID, threadID, chatID)
+
+	// Auto-flush heuristic (agent-memory-db.md Phase 4): if the message
+	// carries an explicit "remember that …" / "I prefer …" phrase,
+	// upsert an archival passage before routing. Best-effort — failure
+	// logs and continues.
+	if _, fact, matched := memory.AutoFlush(ctx, pool, res.AgentID, res.Text); matched {
+		log.Printf("autoflush: %s remembered %q", res.AgentID, fact)
+	}
 
 	if !b.routeTextViaInbox(msg, res.AgentID, res.Text) {
 		log.Printf("mailbox.inbound: routing failed for %s", res.AgentID)
