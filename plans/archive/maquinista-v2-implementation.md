@@ -93,18 +93,15 @@ All schema SQL lives under `internal/db/migrations/`. All tests live beside the 
 - Flag off: message routes via legacy path; flag on: message routes via inbox path. Both paths hit the same pane; outputs are indistinguishable.
 - Flip flag on a single staging topic for a week; monitor inbox metrics for stuck rows.
 
-### Task 1.7 — Extract sidecar into `internal/sidecar/`
+### Task 1.7 — Extract sidecar into `internal/sidecar/`  — **NOT DONE, see `active/per-agent-sidecar.md`**
 
-**Depends on:** 1.6.
-
-**Deliverable:** `internal/sidecar/` package providing `SidecarRunner` that owns (a) the pty driver and (b) the JSONL transcript tail for one agent. Orchestrator spawns one sidecar goroutine per live agent on `orchestrator.spawn`. `internal/monitor/` collapses into the sidecar — the standalone monitor process goes away.
-
-**Testing:**
-
-- Unit tests for the sidecar's claim/drive/ack loop using a fake runner that writes a scripted JSONL transcript.
-- Crash: kill the sidecar mid-turn via `SIGTERM`; assert the row stays `processing` with `claimed_by`; restart supervisor; assert claim-expiry reclaim replays to `pending`.
-- Lease expiry: set lease to 5s in test, stall the fake runner, assert reaper returns row to `pending` exactly once.
-- Parity with task 1.5's shadow mode: sidecar-produced outbox rows match legacy-monitor-produced outbox rows byte-for-byte.
+Original deliverable rehomed: a per-agent sidecar goroutine (pty
+driver + transcript tail), with monitor sources folded in and the
+single-process `mailbox_consumer` retired. What actually shipped is
+the skeleton `internal/sidecar/sidecar.go` plus
+`cmd/maquinista/mailbox_consumer.go` as a single-process consumer. The
+per-agent promotion is an open track tracked under
+`active/per-agent-sidecar.md`.
 
 ### Task 1.8 — Routing ladder (§8.1)
 
@@ -128,18 +125,30 @@ Add `/agent_rename <handle>` to set the handle on the current topic's owner agen
 - `/agent_rename` validation: accepts valid handles, rejects regex violations, reserved prefix `t-`, and uniqueness collisions.
 - Concurrency: two humans in the same topic racing tier-3 spawn → partial unique index forces one winner; second request reads the committed row and proceeds.
 
-### Task 1.9 — Retire legacy paths
+### Task 1.9 — Retire legacy paths  — **PARTIAL, see `active/retire-legacy-tmux-paths.md`**
 
-**Depends on:** 1.8, plus a week of clean shadow-mode metrics from task 1.7.
+What actually shipped:
 
-**Deliverable:** delete (a) `internal/queue/queue.go`, (b) `state.ThreadBindings` in-memory map + `session_map.json` reader/writer, (c) direct `tmux.SendKeysWithDelay` calls from `internal/bot/handlers.go`, (d) the in-process bridge from task 1.6. Move session-id writes into `agent_topic_sessions` via `hook/hook.go`.
+- ✅ `session_map.json` readers/writers deleted (see
+  `active/json-state-migration.md` Phase A).
+- ✅ `state.ThreadBindings` made DB-authoritative when `SetPool` is
+  called (Phase B1 of the same plan); the in-memory map is now a
+  test-only fallback.
+- ✅ Direct `tmux.SendKeysWithDelay` removed from
+  `internal/bot/handlers.go`'s inbound path — the routing ladder
+  writes to `agent_inbox` instead.
 
-**Testing:**
+Still pending:
 
-- `go test ./...` green.
-- `go vet ./...` clean.
-- End-to-end: fresh staging env, bring up bot + relay + dispatcher + sidecars, run a 100-message interaction sequence across 3 topics and 2 agents; zero errors, zero lost messages, zero duplicates.
-- Observability check: `SELECT count(*) FROM agent_inbox WHERE status='processing' AND claimed_at < NOW() - INTERVAL '10 min'` returns 0.
+- ❌ `internal/queue/queue.go` — still imported.
+- ❌ `tmux.SendKeysWithDelay` in `commands.go`,
+  `directory_browser.go`, `handlers.go` (bash mode), `planner_commands.go`,
+  `recovery.go`, `window_picker.go`, `mailbox_consumer.go`.
+- ❌ In-process mailbox bridge is now `cmd/maquinista/mailbox_consumer.go`
+  which itself retires when `active/per-agent-sidecar.md` Phase 1
+  lands.
+
+Ongoing work lives in `active/retire-legacy-tmux-paths.md`.
 
 ---
 

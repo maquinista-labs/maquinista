@@ -14,14 +14,17 @@
 
 | Plan | Status | Notes |
 |---|---|---|
-| [`active/agent-soul-db-state.md`](active/agent-soul-db-state.md) | not started | DB-backed persona / identity. Unblocked. |
-| [`active/agent-memory-db.md`](active/agent-memory-db.md) | not started | Persistent memory blocks + archives. Depends on soul. |
-| [`active/agent-to-agent-communication.md`](active/agent-to-agent-communication.md) | partial (40%) | Mailbox schema landed; mention fan-out, `ask_agent`, sub-agent spawning pending. |
+| [`active/agent-soul-db-state.md`](active/agent-soul-db-state.md) | shipped (Phases 1–4) | DB-backed persona / identity + soul CLI + injection scanner. |
+| [`active/agent-memory-db.md`](active/agent-memory-db.md) | shipped (Phases 0–5, Phase 2 behind pgvector availability) | Blocks + archival passages + FTS + auto-flush + cross-agent archives. |
+| [`active/agent-to-agent-communication.md`](active/agent-to-agent-communication.md) | shipped (Phases 1–4) | Mention fanout, a2a conversation threading, sync AskAgent, sub-agent spawning with allow_delegation gate. |
 | [`active/checkpoint-rollback.md`](active/checkpoint-rollback.md) | not started | Shadow-git commits per tool. Blocked on per-agent sidecar. |
 | [`active/dashboard.md`](active/dashboard.md) | not started | Mobile-first SSE/HTMX observability. Read-only Phase 1 is low-friction. |
-| [`active/json-state-migration.md`](active/json-state-migration.md) | partial (40%) | Phase A schema shipped (migration 012); file readers/writers still around. |
-| [`active/multi-agent-registry.md`](active/multi-agent-registry.md) | partial (50%) | Phase 1 reconcile loop shipped. Phase 2–3 (inject settings at spawn + `maquinista agent add/edit` CLI) pending. |
-| [`active/opencode-integration.md`](active/opencode-integration.md) | partial (20%) | OC-01..04 (MonitorProfile, PlannerCommand, session tracking, LaunchCommand) all pending. |
+| [`active/json-state-migration.md`](active/json-state-migration.md) | shipped (Phases A + B) | session_map.json retired, state.json Phase B dual-writes routed through Postgres, file removed on startup when pool is set. |
+| [`active/multi-agent-registry.md`](active/multi-agent-registry.md) | shipped (Phases 1–3) | Reconcile loop, spawn-time soul injection, `maquinista agent add/edit/archive/kill/spawn` CLI. |
+| [`active/opencode-integration.md`](active/opencode-integration.md) | shipped (OC-01..06) | MonitorProfile, PlannerCommand role-framing, session-map fallback, LaunchCommand permission, model default, observed TUI profile. |
+| [`active/per-agent-sidecar.md`](active/per-agent-sidecar.md) | not started | Rehomed from archived Task 1.7 — one sidecar goroutine per live agent, monitor tailing folded in, lease reaper. |
+| [`active/retire-legacy-tmux-paths.md`](active/retire-legacy-tmux-paths.md) | partial | Rehomed from archived Task 1.9 — some legacy survives (`internal/queue/`, several `SendKeysWithDelay` call sites, the single-process `mailbox_consumer`). |
+| [`active/resume-memory-refresh.md`](active/resume-memory-refresh.md) | not started | First-turn catch-up inject so `claude --resume <sid>` picks up memory / soul deltas written while the daemon was down. |
 | [`active/pi-integration.md`](active/pi-integration.md) | not started | Add pi (`@mariozechner/pi-coding-agent`) as a fourth runner — `PiRunner`, `PiProfile`, `PiSource`. |
 | [`active/productization-saas.md`](active/productization-saas.md) | not started | Multi-tenant SaaS turn — workspaces, RLS, billing, onboarding, pricing. Depends on dashboard auth. |
 
@@ -38,7 +41,7 @@
 | Plan | Why archived |
 |---|---|
 | [`archive/per-topic-agent-pivot.md`](archive/per-topic-agent-pivot.md) | Shipped in commits 3.19 / 3.20 / 3.21. Tier-3 spawns per-topic agents, `/agent_*` command family, migrations 013 + 014. |
-| [`archive/maquinista-v2-implementation.md`](archive/maquinista-v2-implementation.md) | Phase 1–3 task list ~95% complete. Task 3.6–3.7 cleanup audit outstanding but no further planning needed. |
+| [`archive/maquinista-v2-implementation.md`](archive/maquinista-v2-implementation.md) | Task list. Phase 2 scheduler + Phase 3 task pipeline are shipped. Tasks **1.7** (per-agent sidecar) and **1.9** (retire legacy paths) were **not** fully delivered — rehomed into the active plans above. Task 3.6–3.7 cleanup audit outstanding. |
 | [`archive/execution_plan.md`](archive/execution_plan.md) | Wave 1–5 shipped. Wave 6 Track A (spec parser) deferred; reintroduce if needed. |
 | [`archive/minuano-turso-agentfs-migration.md`](archive/minuano-turso-agentfs-migration.md) | Obsoleted by §0 (Postgres as system of record). Kept as historical reference. |
 
