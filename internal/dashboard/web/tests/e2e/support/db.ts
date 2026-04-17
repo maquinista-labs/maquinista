@@ -236,6 +236,52 @@ export async function insertScheduledJob(args: {
   return id;
 }
 
+/** seedOperator inserts a PBKDF2-hashed operator credential.
+ * Exposed for auth specs that need a known username/password. */
+export async function seedOperator(username: string, password: string) {
+  const { pbkdf2Sync, randomBytes } = await import("node:crypto");
+  const salt = randomBytes(16).toString("hex");
+  const iter = 1000; // fast for tests
+  const hash = pbkdf2Sync(password, salt, iter, 32, "sha256").toString("hex");
+  await withDb((c) =>
+    c.query(
+      `INSERT INTO operator_credentials
+         (username, pbkdf2_hash, salt, iter)
+       VALUES ($1,$2,$3,$4)
+       ON CONFLICT (username) DO UPDATE SET
+         pbkdf2_hash=EXCLUDED.pbkdf2_hash, salt=EXCLUDED.salt,
+         iter=EXCLUDED.iter, failed_attempts=0, locked_until=NULL`,
+      [username, hash, salt, iter],
+    ),
+  );
+}
+
+/** truncateAuth wipes sessions + credentials — used by auth specs. */
+export async function truncateAuth() {
+  await withDb(async (c) => {
+    await c.query("TRUNCATE TABLE dashboard_sessions CASCADE");
+    await c.query("TRUNCATE TABLE dashboard_audit CASCADE");
+    await c.query("TRUNCATE TABLE operator_credentials CASCADE");
+  });
+}
+
+/** countAudit returns the number of dashboard_audit rows with
+ * matching action + ok filter. */
+export async function countAudit(
+  action: string,
+  ok?: boolean,
+): Promise<number> {
+  return withDb(async (c) => {
+    const where = ok === undefined ? "action = $1" : "action = $1 AND ok = $2";
+    const params: unknown[] = ok === undefined ? [action] : [action, ok];
+    const { rows } = await c.query(
+      `SELECT COUNT(*)::int AS n FROM dashboard_audit WHERE ${where}`,
+      params,
+    );
+    return rows[0].n as number;
+  });
+}
+
 /** insertWebhookHandler writes one webhook_handlers row. */
 export async function insertWebhookHandler(args: {
   name: string;
