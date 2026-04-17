@@ -11,6 +11,8 @@ func clearEnv() {
 		"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "ALLOWED_GROUPS",
 		"MAQUINISTA_DIR", "TMUX_SESSION_NAME", "CLAUDE_COMMAND",
 		"MONITOR_POLL_INTERVAL", "DATABASE_URL",
+		"MAQUINISTA_DASHBOARD_LISTEN", "MAQUINISTA_DASHBOARD_AUTH",
+		"MAQUINISTA_DASHBOARD_THEME", "MAQUINISTA_DASHBOARD_NODE_BIN",
 	} {
 		os.Unsetenv(key)
 	}
@@ -217,5 +219,96 @@ func TestLoad_FromEnvFile(t *testing.T) {
 	}
 	if cfg.TelegramBotToken != "file-token" {
 		t.Errorf("token = %q, want file-token", cfg.TelegramBotToken)
+	}
+}
+
+// --- dashboard config ------------------------------------------------------
+
+func TestLoadDashboard_Defaults(t *testing.T) {
+	clearEnv()
+	cfg := loadDashboardConfig()
+	if cfg.Listen != "127.0.0.1:8900" {
+		t.Errorf("Listen = %q, want 127.0.0.1:8900", cfg.Listen)
+	}
+	if cfg.AuthMode != "none" {
+		t.Errorf("AuthMode = %q, want none", cfg.AuthMode)
+	}
+	if cfg.ThemeDefault != "system" {
+		t.Errorf("ThemeDefault = %q, want system", cfg.ThemeDefault)
+	}
+	if cfg.NodeBin != "node" {
+		t.Errorf("NodeBin = %q, want node", cfg.NodeBin)
+	}
+}
+
+func TestLoadDashboard_Overrides(t *testing.T) {
+	clearEnv()
+	os.Setenv("MAQUINISTA_DASHBOARD_LISTEN", "0.0.0.0:9000")
+	os.Setenv("MAQUINISTA_DASHBOARD_AUTH", "password")
+	os.Setenv("MAQUINISTA_DASHBOARD_THEME", "dark")
+	os.Setenv("MAQUINISTA_DASHBOARD_NODE_BIN", "/opt/node/bin/node")
+	cfg := loadDashboardConfig()
+	if cfg.Listen != "0.0.0.0:9000" {
+		t.Errorf("Listen = %q", cfg.Listen)
+	}
+	if cfg.AuthMode != "password" {
+		t.Errorf("AuthMode = %q", cfg.AuthMode)
+	}
+	if cfg.ThemeDefault != "dark" {
+		t.Errorf("ThemeDefault = %q", cfg.ThemeDefault)
+	}
+	if cfg.NodeBin != "/opt/node/bin/node" {
+		t.Errorf("NodeBin = %q", cfg.NodeBin)
+	}
+}
+
+func TestLoadDashboard_UnknownAuthFallsBackToNone(t *testing.T) {
+	clearEnv()
+	os.Setenv("MAQUINISTA_DASHBOARD_AUTH", "biometric")
+	cfg := loadDashboardConfig()
+	if cfg.AuthMode != "none" {
+		t.Errorf("AuthMode for unknown value = %q, want none", cfg.AuthMode)
+	}
+}
+
+func TestLoadDashboard_UnknownThemeFallsBackToSystem(t *testing.T) {
+	clearEnv()
+	os.Setenv("MAQUINISTA_DASHBOARD_THEME", "neon")
+	cfg := loadDashboardConfig()
+	if cfg.ThemeDefault != "system" {
+		t.Errorf("ThemeDefault for unknown value = %q, want system", cfg.ThemeDefault)
+	}
+}
+
+func TestLoadDashboard_CaseInsensitive(t *testing.T) {
+	clearEnv()
+	os.Setenv("MAQUINISTA_DASHBOARD_AUTH", "TELEGRAM")
+	os.Setenv("MAQUINISTA_DASHBOARD_THEME", "LIGHT")
+	cfg := loadDashboardConfig()
+	if cfg.AuthMode != "telegram" {
+		t.Errorf("AuthMode lowercased = %q", cfg.AuthMode)
+	}
+	if cfg.ThemeDefault != "light" {
+		t.Errorf("ThemeDefault lowercased = %q", cfg.ThemeDefault)
+	}
+}
+
+func TestLoad_PopulatesDashboard(t *testing.T) {
+	clearEnv()
+	tmpDir := t.TempDir()
+	os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
+	os.Setenv("ALLOWED_USERS", "1")
+	os.Setenv("MAQUINISTA_DIR", tmpDir)
+	os.Setenv("MAQUINISTA_DASHBOARD_LISTEN", "127.0.0.1:0")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Dashboard.Listen != "127.0.0.1:0" {
+		t.Errorf("cfg.Dashboard.Listen = %q", cfg.Dashboard.Listen)
+	}
+	if cfg.Dashboard.NodeBin != "node" {
+		t.Errorf("cfg.Dashboard.NodeBin = %q", cfg.Dashboard.NodeBin)
 	}
 }

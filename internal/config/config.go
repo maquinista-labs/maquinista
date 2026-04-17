@@ -75,6 +75,32 @@ type Config struct {
 	// accumulate without double-sending alongside the legacy Telegram path.
 	// Configured via MAILBOX_DISPATCHER=1.
 	MailboxDispatcher bool
+
+	// Dashboard is the configuration for `maquinista dashboard`. See
+	// plans/active/dashboard.md.
+	Dashboard DashboardConfig
+}
+
+// DashboardConfig configures the supervised Next.js dashboard. All
+// fields are optional; sane defaults are applied at Load time.
+type DashboardConfig struct {
+	// Listen is the host:port the dashboard binds to. Default
+	// "127.0.0.1:8900"; set MAQUINISTA_DASHBOARD_LISTEN to override.
+	Listen string
+	// AuthMode selects one of "none", "password", or "telegram".
+	// Phase 6 introduces the full matrix; until then "none" is the
+	// only supported value and binding to a non-loopback address
+	// implies operator opt-in. Default "none";
+	// MAQUINISTA_DASHBOARD_AUTH to override.
+	AuthMode string
+	// ThemeDefault is one of "system", "dark", "light". Default
+	// "system"; MAQUINISTA_DASHBOARD_THEME to override.
+	ThemeDefault string
+	// NodeBin is the Node executable used to run the Next.js
+	// standalone server. Default "node"; override with
+	// MAQUINISTA_DASHBOARD_NODE_BIN for operators who keep Node
+	// outside $PATH (e.g. asdf / nvm shims).
+	NodeBin string
 }
 
 // MailboxInboundEnabled reports whether the mailbox.inbound flag is active
@@ -202,7 +228,44 @@ func Load(envFile ...string) (*Config, error) {
 		MailboxOutbound:      parseBoolEnv(os.Getenv("MAILBOX_OUTBOUND")),
 		MailboxInboundTopics: parseTopicList(os.Getenv("MAILBOX_INBOUND_TOPICS")),
 		MailboxDispatcher:    parseBoolEnv(os.Getenv("MAILBOX_DISPATCHER")),
+		Dashboard:            loadDashboardConfig(),
 	}, nil
+}
+
+// loadDashboardConfig reads dashboard-related env vars with defaults.
+// Separated from Load so tests can exercise it without Telegram /
+// ALLOWED_USERS plumbing.
+func loadDashboardConfig() DashboardConfig {
+	cfg := DashboardConfig{
+		Listen:       strings.TrimSpace(os.Getenv("MAQUINISTA_DASHBOARD_LISTEN")),
+		AuthMode:     strings.ToLower(strings.TrimSpace(os.Getenv("MAQUINISTA_DASHBOARD_AUTH"))),
+		ThemeDefault: strings.ToLower(strings.TrimSpace(os.Getenv("MAQUINISTA_DASHBOARD_THEME"))),
+		NodeBin:      strings.TrimSpace(os.Getenv("MAQUINISTA_DASHBOARD_NODE_BIN")),
+	}
+	if cfg.Listen == "" {
+		cfg.Listen = "127.0.0.1:8900"
+	}
+	switch cfg.AuthMode {
+	case "", "none":
+		cfg.AuthMode = "none"
+	case "password", "telegram":
+		// pass through
+	default:
+		// Unknown values fall back to "none"; Phase 6 validates.
+		cfg.AuthMode = "none"
+	}
+	switch cfg.ThemeDefault {
+	case "", "system":
+		cfg.ThemeDefault = "system"
+	case "dark", "light":
+		// pass through
+	default:
+		cfg.ThemeDefault = "system"
+	}
+	if cfg.NodeBin == "" {
+		cfg.NodeBin = "node"
+	}
+	return cfg
 }
 
 func parseTopicList(v string) []string {

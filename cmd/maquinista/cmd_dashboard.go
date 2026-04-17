@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/dashboard"
 	"github.com/spf13/cobra"
 )
 
@@ -103,6 +105,10 @@ The dashboard is a Next.js application supervised by this CLI. See
 plans/active/dashboard.md for the full architecture.`,
 }
 
+var (
+	dashboardStartListen string
+)
+
 var dashboardStartCmd = &cobra.Command{
 	Use:   "start",
 	Short: "Start the dashboard",
@@ -149,17 +155,70 @@ var dashboardLogsCmd = &cobra.Command{
 }
 
 func init() {
+	dashboardStartCmd.Flags().StringVar(&dashboardStartListen, "listen", "", "host:port to bind (overrides MAQUINISTA_DASHBOARD_LISTEN and the default 127.0.0.1:8900)")
 	dashboardLogsCmd.Flags().BoolVarP(&dashboardLogsFollow, "follow", "f", false, "follow the log file")
 	dashboardCmd.AddCommand(dashboardStartCmd, dashboardStopCmd, dashboardStatusCmd, dashboardLogsCmd)
 	rootCmd.AddCommand(dashboardCmd)
 }
 
-// runDashboardStart is the Phase 0 Commit 0.1 skeleton. It:
-//  1. Refuses to start if a live PID is already on disk.
-//  2. Cleans up a stale PID file if the recorded process is dead.
-//  3. Writes the current process's PID to the file and blocks on
-//     SIGTERM / SIGINT. Commit 0.3 replaces the block with a Node
-//     child spawn + supervisor.Wait().
+// resolveDashboardListen returns the configured listen address. Flag
+// > env > default.
+func resolveDashboardListen() string {
+	if dashboardStartListen != "" {
+		return dashboardStartListen
+	}
+	if v := os.Getenv("MAQUINISTA_DASHBOARD_LISTEN"); v != "" {
+		return v
+	}
+	return "127.0.0.1:8900"
+}
+
+// resolveNodeBin returns the Node executable path. Env > default.
+func resolveNodeBin() string {
+	if v := os.Getenv("MAQUINISTA_DASHBOARD_NODE_BIN"); v != "" {
+		return v
+	}
+	return "node"
+}
+
+// dashboardHealthcheckScript is the Phase 0 stub: a Node one-liner
+// that responds with {"ok":true} on any path. Commit 1.6 replaces
+// the spawn with the extracted Next.js standalone server, at which
+// point this constant becomes dead code and is deleted.
+const dashboardHealthcheckScript = `
+const http = require('http');
+const server = http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({ ok: true, path: req.url, stub: true }));
+});
+const port = parseInt(process.env.PORT || '8900', 10);
+const host = process.env.HOSTNAME || '127.0.0.1';
+server.listen(port, host, () => {
+  process.stdout.write("dashboard stub listening on " + host + ":" + port + "\n");
+});
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
+`
+
+// parseListen splits "host:port" into its components. Returns the
+// port only if the string is "port" form.
+func parseListen(listen string) (host string, port string) {
+	// Find the LAST colon so IPv6 ([::1]:8900) parses correctly.
+	for i := len(listen) - 1; i >= 0; i-- {
+		if listen[i] == ':' {
+			return listen[:i], listen[i+1:]
+		}
+	}
+	return "127.0.0.1", listen
+}
+
+// runDashboardStart spawns the Node child via dashboard.Supervisor
+// and blocks until SIGTERM/SIGINT arrives or the restart budget is
+// exhausted.
+//
+// Phase 0 Commit 0.3: the child is a Node one-liner that serves
+// {"ok":true} on any path (see dashboardHealthcheckScript). Commit
+// 1.6 replaces the one-liner with the extracted Next.js standalone
+// server; the surrounding lifecycle code is identical.
 func runDashboardStart(parentCtx context.Context) error {
 	existing, err := readDashboardPIDFile()
 	if err != nil {
@@ -172,6 +231,32 @@ func runDashboardStart(parentCtx context.Context) error {
 		removeDashboardPIDFile()
 	}
 
+	listen := resolveDashboardListen()
+	host, port := parseListen(listen)
+	if port == "" {
+		return fmt.Errorf("invalid --listen %q (expected host:port)", listen)
+	}
+
+	nodeBin := resolveNodeBin()
+	if _, err := config.Load(); err != nil {
+		// Config load is best-effort for Phase 0 — we can run
+		// without Telegram config. Later phases (e.g. Phase 6
+		// auth via Telegram magic link) will tighten this.
+		_ = err
+	}
+
+	logPath := dashboardLogFilePath()
+
+	sup := dashboard.New(dashboard.Config{
+		Bin:            nodeBin,
+		Args:           []string{"-e", dashboardHealthcheckScript},
+		Env:            []string{"PORT=" + port, "HOSTNAME=" + host},
+		LogPath:        logPath,
+		MaxRestarts:    5,
+		RestartWindow:  60 * time.Second,
+		RestartBackoff: 500 * time.Millisecond,
+	})
+
 	if err := writeDashboardPIDFile(os.Getpid()); err != nil {
 		return fmt.Errorf("writing PID file: %w", err)
 	}
@@ -179,12 +264,21 @@ func runDashboardStart(parentCtx context.Context) error {
 	ctx, cancel := signal.NotifyContext(parentCtx, syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	fmt.Fprintln(os.Stdout, "dashboard: started (stub — no server yet)")
-	fmt.Fprintf(os.Stdout, "dashboard: PID %d, waiting for SIGTERM/SIGINT\n", os.Getpid())
+	// A "ready" line on the log or a single successful spawn is
+	// the signal the child is up. For Phase 0 we just log that we
+	// started the supervisor; the healthcheck test confirms the
+	// port is live.
+	fmt.Fprintf(os.Stdout, "dashboard: starting (listen=%s node=%s log=%s)\n", listen, nodeBin, logPath)
 
-	<-ctx.Done()
+	runErr := sup.Run(ctx)
 
 	removeDashboardPIDFile()
+
+	if runErr != nil {
+		fmt.Fprintf(os.Stderr, "dashboard: supervisor error: %v\n", runErr)
+		return runErr
+	}
+
 	fmt.Fprintln(os.Stdout, "dashboard: stopped")
 	return nil
 }
