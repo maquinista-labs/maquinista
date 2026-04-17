@@ -23,6 +23,7 @@
 | [`active/multi-agent-registry.md`](active/multi-agent-registry.md) | partial (50%) | Phase 1 reconcile loop shipped. Phase 2–3 (inject settings at spawn + `maquinista agent add/edit` CLI) pending. |
 | [`active/opencode-integration.md`](active/opencode-integration.md) | partial (20%) | OC-01..04 (MonitorProfile, PlannerCommand, session tracking, LaunchCommand) all pending. |
 | [`active/pi-integration.md`](active/pi-integration.md) | not started | Add pi (`@mariozechner/pi-coding-agent`) as a fourth runner — `PiRunner`, `PiProfile`, `PiSource`. |
+| [`active/productization-saas.md`](active/productization-saas.md) | not started | Multi-tenant SaaS turn — workspaces, RLS, billing, onboarding, pricing. Depends on dashboard auth. |
 
 ### Reference (design docs)
 
