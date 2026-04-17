@@ -68,14 +68,20 @@ test.describe("dashboard shell", () => {
     }
   });
 
-  test("theme toggle opens a menu with three options", async ({ page }) => {
+  test("theme toggle cycles system → light → dark", async ({ page }) => {
     await page.goto("/agents");
-    const toggle = page.getByRole("button", { name: "Toggle theme" });
+    const toggle = page.getByTestId("theme-toggle");
     await expect(toggle).toBeVisible();
+    await expect(toggle).toHaveAttribute("data-theme-mode", "system");
+    await expect(toggle).toHaveAttribute("data-theme-next", "light");
+
     await toggle.click();
-    await expect(page.getByRole("menuitem", { name: "Light" })).toBeVisible();
-    await expect(page.getByRole("menuitem", { name: "Dark" })).toBeVisible();
-    await expect(page.getByRole("menuitem", { name: "System" })).toBeVisible();
+    await expect(toggle).toHaveAttribute("data-theme-mode", "light");
+    await expect(toggle).toHaveAttribute("data-theme-next", "dark");
+
+    await toggle.click();
+    await expect(toggle).toHaveAttribute("data-theme-mode", "dark");
+    await expect(toggle).toHaveAttribute("data-theme-next", "system");
   });
 
   test("/api/healthz returns ok:true from the real Next handler", async ({

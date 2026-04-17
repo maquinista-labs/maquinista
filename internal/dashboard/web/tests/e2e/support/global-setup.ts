@@ -40,6 +40,31 @@ async function exists(p: string): Promise<boolean> {
   }
 }
 
+// anySourceNewerThan walks src/ + next.config.ts + package.json and
+// returns true if any file's mtime exceeds the reference file's.
+// Used by the Playwright global-setup to decide when to rebuild
+// the standalone bundle.
+async function anySourceNewerThan(refPath: string): Promise<boolean> {
+  const { readdir } = await import("node:fs/promises");
+  const refMtime = (await stat(refPath)).mtimeMs;
+  const queue: string[] = [
+    path.join(WEB_DIR, "src"),
+    path.join(WEB_DIR, "next.config.ts"),
+    path.join(WEB_DIR, "package.json"),
+  ];
+  for (const p of queue) {
+    if (!(await exists(p))) continue;
+    const s = await stat(p);
+    if (s.isDirectory()) {
+      const entries = await readdir(p);
+      for (const e of entries) queue.push(path.join(p, e));
+      continue;
+    }
+    if (s.mtimeMs > refMtime) return true;
+  }
+  return false;
+}
+
 async function ensureMaquinistaBinary(): Promise<string> {
   if (await exists(BIN)) return BIN;
   await mkdir(BIN_DIR, { recursive: true });
@@ -53,11 +78,9 @@ async function ensureMaquinistaBinary(): Promise<string> {
 
 async function ensureNextStandalone(): Promise<string> {
   const serverJS = path.join(STANDALONE, "server.js");
-  const configMTime = (await stat(path.join(WEB_DIR, "next.config.ts")))
-    .mtimeMs;
   const stale = !(await exists(serverJS))
     ? true
-    : (await stat(serverJS)).mtimeMs < configMTime;
+    : await anySourceNewerThan(serverJS);
   if (!stale) return STANDALONE;
 
   console.log("[playwright setup] building Next.js standalone bundle…");
