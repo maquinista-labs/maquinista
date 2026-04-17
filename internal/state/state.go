@@ -127,9 +127,16 @@ func Load(path string) (*State, error) {
 }
 
 // Save writes state to a JSON file atomically.
+// Save persists the in-memory maps to state.json. After Phase B of
+// plans/active/json-state-migration.md the DB is the source of truth,
+// so a state with a pool attached skips the file write entirely. Tests
+// and nil-pool callers keep the old file-based behavior.
 func (s *State) Save(path string) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	if s.pool != nil {
+		return nil // DB is authoritative; JSON file is retired.
+	}
 	return atomicWriteJSON(path, s)
 }
 

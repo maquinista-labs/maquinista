@@ -195,6 +195,10 @@ func runStart() error {
 	// DB-backed implementations fall through to the in-memory JSON maps.
 	if pool != nil {
 		b.State().SetPool(pool)
+		// state.json is retired once the DB is the system of record. Clean
+		// up stragglers from pre-Phase-B installs so operators stop
+		// inspecting a stale file that no longer reflects reality.
+		_ = os.Remove(filepath.Join(cfg.MaquinistaDir, "state.json"))
 	}
 
 	claudeSrc := monitor.NewClaudeSource(cfg, pool, b.State(), ms)
