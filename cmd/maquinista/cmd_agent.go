@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/soul"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
 )
 
@@ -69,6 +71,15 @@ var agentEditCmd = &cobra.Command{
 	},
 }
 
+var agentSpawnCmd = &cobra.Command{
+	Use:   "spawn <agent-id>",
+	Short: "Force-respawn an agent: kill its tmux window (if any), clear tmux_window, run reconcile on this row",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runAgentSpawn(args[0])
+	},
+}
+
 func init() {
 	agentAddCmd.Flags().StringVar(&agentAddRunner, "runner", "claude", "runner_type (claude, openclaude, opencode, custom)")
 	agentAddCmd.Flags().StringVar(&agentAddRole, "role", "user", "agent role (user | executor)")
@@ -83,8 +94,54 @@ func init() {
 	agentEditCmd.Flags().StringVar(&agentAddSystemPrompt, "system-prompt", "", "new system prompt file")
 	agentEditCmd.Flags().StringVar(&agentAddPersona, "persona", "", "new persona text")
 
-	agentCmd.AddCommand(agentAddCmd, agentArchiveCmd, agentKillCmd, agentEditCmd)
+	agentCmd.AddCommand(agentAddCmd, agentArchiveCmd, agentKillCmd, agentEditCmd, agentSpawnCmd)
 	rootCmd.AddCommand(agentCmd)
+}
+
+// runAgentSpawn: force-kill the existing tmux window (if any), clear
+// agents.tmux_window + mark status='stopped', then the next routing
+// ladder tick (or explicit message) spawns it fresh. For users who
+// want to bounce an agent without restarting the whole daemon.
+func runAgentSpawn(id string) error {
+	if err := connectDB(); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	cfg, err := config.Load()
+	if err != nil {
+		return fmt.Errorf("load config: %w", err)
+	}
+
+	var existingWindow string
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(tmux_window,'') FROM agents WHERE id=$1
+	`, id).Scan(&existingWindow); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("no such agent: %s", id)
+		}
+		return err
+	}
+
+	if existingWindow != "" {
+		if err := tmux.KillWindow(cfg.TmuxSessionName, existingWindow); err != nil {
+			// "can't find window" is fine — already gone.
+			if !tmux.IsWindowDead(err) {
+				return fmt.Errorf("kill tmux window: %w", err)
+			}
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE agents
+		SET tmux_window = '', status = 'stopped', last_seen = NOW()
+		WHERE id = $1
+	`, id); err != nil {
+		return fmt.Errorf("clear tmux_window: %w", err)
+	}
+	fmt.Printf("Respawn pending for %s — next message in its topic will re-create the pane via tier-3 spawn.\n", id)
+	return nil
 }
 
 func runAgentAdd(id string) error {
