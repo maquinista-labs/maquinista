@@ -9,7 +9,7 @@ DASHBOARD_WEB_DIR := internal/dashboard/web
 .PHONY: build test vet clean \
         dashboard-test \
         dashboard-web-install dashboard-web-dev dashboard-web-build \
-        dashboard-web-test dashboard-e2e
+        dashboard-web-package dashboard-web-test dashboard-e2e
 
 build:
 	go build $(LDFLAGS) -o $(BINARY) $(BUILD_DIR)
@@ -54,6 +54,24 @@ dashboard-web-build:
 	else \
 		echo "skip: $(DASHBOARD_WEB_DIR) not scaffolded yet (Phase 1 Commit 1.1)"; \
 	fi
+
+# Build the Next.js standalone bundle and tar it into
+# internal/dashboard/standalone.tgz, which embed.go pulls in via
+# //go:embed. Run this before `make build` for a release binary.
+dashboard-web-package: dashboard-web-build
+	@if [ ! -d $(DASHBOARD_WEB_DIR)/.next/standalone ]; then \
+		echo "error: $(DASHBOARD_WEB_DIR)/.next/standalone missing after build"; \
+		exit 1; \
+	fi
+	@# Copy public/ + .next/static/ into the standalone tree per the
+	@# Next.js docs (standalone mode does not copy them automatically).
+	@if [ -d $(DASHBOARD_WEB_DIR)/public ]; then \
+		cp -r $(DASHBOARD_WEB_DIR)/public $(DASHBOARD_WEB_DIR)/.next/standalone/public; \
+	fi
+	@mkdir -p $(DASHBOARD_WEB_DIR)/.next/standalone/.next
+	@cp -r $(DASHBOARD_WEB_DIR)/.next/static $(DASHBOARD_WEB_DIR)/.next/standalone/.next/static
+	tar -czf internal/dashboard/standalone.tgz -C $(DASHBOARD_WEB_DIR)/.next/standalone .
+	@echo "packaged: internal/dashboard/standalone.tgz ($$(du -h internal/dashboard/standalone.tgz | cut -f1))"
 
 dashboard-web-test:
 	@if [ -f $(DASHBOARD_WEB_DIR)/package.json ]; then \
