@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/maquinista-labs/maquinista/internal/soul"
@@ -57,18 +59,55 @@ func runSoulRender(agentID string) error {
 	if err := connectDB(); err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	s, err := soul.Load(ctx, pool, agentID)
+	// Resolve runner_type → model-family guidance block.
+	var runnerType string
+	_ = pool.QueryRow(ctx,
+		`SELECT COALESCE(runner_type,'') FROM agents WHERE id=$1`, agentID,
+	).Scan(&runnerType)
+
+	env := soul.EnvHints{
+		Platform: os.Getenv("MAQUINISTA_PLATFORM"),
+		CWD:      lookupAgentCWD(ctx, agentID),
+	}
+
+	composed, err := soul.ComposeForAgent(
+		ctx, pool, pool, agentID,
+		env, modelFamilyGuidance(runnerType), nil, soulRenderMaxChars,
+	)
 	if err != nil {
 		if errors.Is(err, soul.ErrNotFound) {
-			// No soul → empty output, exit 0. Caller's `$(cmd)` lands as
-			// an empty string and the runner starts with no system prompt.
 			return nil
 		}
 		return err
 	}
-	fmt.Print(soul.Render(*s, soulRenderMaxChars))
+	fmt.Print(composed)
 	return nil
+}
+
+// modelFamilyGuidance returns a terse per-model-family directive block.
+// Hermes calls these TOOL_USE_ENFORCEMENT / GOOGLE_MODEL_OPERATIONAL_GUIDANCE;
+// for maquinista we only ship two variants: the claude default and a
+// stricter "verify-before-edit" block for other runners. Extend by
+// adding more cases as runners come online.
+func modelFamilyGuidance(runnerType string) string {
+	switch runnerType {
+	case "claude", "openclaude":
+		return "" // Claude's built-in system prompt already covers tool-use discipline.
+	case "opencode":
+		return strings.TrimSpace(`
+When using tools: always prefer absolute paths, verify the target file exists
+before editing (read_file / stat first), and cite the final file:line when
+reporting changes. Never trust unverified diff context from earlier turns.
+`)
+	}
+	return ""
+}
+
+func lookupAgentCWD(ctx context.Context, agentID string) string {
+	var cwd string
+	_ = pool.QueryRow(ctx, `SELECT COALESCE(cwd,'') FROM agents WHERE id=$1`, agentID).Scan(&cwd)
+	return cwd
 }
