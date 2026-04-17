@@ -233,3 +233,42 @@ export async function listConversation(
     at: r.at.toISOString ? r.at.toISOString() : String(r.at),
   }));
 }
+
+// listAgentTimeline: cross-conversation flat merge of inbox + outbox
+// for a single agent, newest-last. Used by the agent-detail page's
+// Conversation tab when no specific conversation is selected.
+export async function listAgentTimeline(
+  pool: Pool,
+  agentId: string,
+  limit = 100,
+): Promise<ConversationItem[]> {
+  const { rows } = await pool.query(
+    `
+    (
+      SELECT 'inbox' AS kind, id, agent_id, from_kind, content,
+             enqueued_at AS at
+      FROM agent_inbox
+      WHERE agent_id = $1
+      ORDER BY enqueued_at DESC LIMIT ${Math.min(limit, 500)}
+    )
+    UNION ALL
+    (
+      SELECT 'outbox' AS kind, id, agent_id, NULL AS from_kind, content,
+             created_at AS at
+      FROM agent_outbox
+      WHERE agent_id = $1
+      ORDER BY created_at DESC LIMIT ${Math.min(limit, 500)}
+    )
+    ORDER BY at ASC
+    `,
+    [agentId],
+  );
+  return rows.map((r) => ({
+    kind: r.kind,
+    id: r.id,
+    agent_id: r.agent_id,
+    from_kind: r.from_kind,
+    excerpt: excerptFromContent(r.content),
+    at: r.at.toISOString ? r.at.toISOString() : String(r.at),
+  }));
+}
