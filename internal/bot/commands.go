@@ -1,11 +1,12 @@
 package bot
 
 import (
+	"context"
 	"log"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/maquinista-labs/maquinista/internal/git"
@@ -137,19 +138,22 @@ func (b *Bot) forwardCommand(msg *tgbotapi.Message, claudeCmd string) {
 
 // resetSessionTracking clears session monitor state for a window after /clear.
 func (b *Bot) resetSessionTracking(windowID string) {
-	// Remove window state's session info so the monitor starts fresh
-	// The monitor_state.json offset will be reset when the new JSONL file appears
-	if b.monitorState != nil {
-		// Find the session key that matches this window
-		sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
-		sm, err := loadSessionMapForReset(sessionMapPath)
-		if err != nil {
-			return
-		}
-		for key := range sm {
-			if windowIDFromKey(key) == windowID {
-				b.monitorState.RemoveSession(key)
-			}
+	if b.monitorState == nil {
+		return
+	}
+	pool := b.getPool()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sm, err := state.LoadSessionMap(ctx, pool)
+	if err != nil {
+		return
+	}
+	for key := range sm {
+		if windowIDFromKey(key) == windowID {
+			b.monitorState.RemoveSession(key)
 		}
 	}
 }
@@ -260,19 +264,30 @@ func (b *Bot) handleTopicClose(msg *tgbotapi.Message) {
 		b.state.RemoveWindowState(windowID)
 		b.state.RemoveGroupChatID(userID, threadIDStr)
 
-		// Remove monitor state if available
+		// Drop monitor-state cursors keyed on this window. The agents
+		// row itself is marked stopped below so it falls out of future
+		// session-map loads; no JSON file to delete.
 		if b.monitorState != nil {
-			sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
-			sm, err := loadSessionMapForReset(sessionMapPath)
-			if err == nil {
-				for key := range sm {
-					if windowIDFromKey(key) == windowID {
-						b.monitorState.RemoveSession(key)
-						// Also remove from session_map.json
-						state.RemoveSessionMapEntry(sessionMapPath, key)
+			if pool := b.getPool(); pool != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				sm, err := state.LoadSessionMap(ctx, pool)
+				cancel()
+				if err == nil {
+					for key := range sm {
+						if windowIDFromKey(key) == windowID {
+							b.monitorState.RemoveSession(key)
+						}
 					}
 				}
 			}
+		}
+		if pool := b.getPool(); pool != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, _ = pool.Exec(ctx, `
+				UPDATE agents SET status='stopped', last_seen=NOW()
+				WHERE tmux_session=$1 AND tmux_window=$2
+			`, b.config.TmuxSessionName, windowID)
+			cancel()
 		}
 	}
 
@@ -304,10 +319,6 @@ func (b *Bot) SetMonitorState(ms *state.MonitorState) {
 	b.monitorState = ms
 }
 
-// loadSessionMapForReset loads session_map.json for the /clear reset logic.
-func loadSessionMapForReset(path string) (map[string]state.SessionMapEntry, error) {
-	return state.LoadSessionMap(path)
-}
 
 // windowIDFromKey extracts the window ID from a session map key ("session:@N" → "@N").
 func windowIDFromKey(key string) string {

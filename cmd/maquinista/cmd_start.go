@@ -156,6 +156,15 @@ func runStart() error {
 		log.Printf("Warning: unknown default runner %q, falling back to claude", cfg.DefaultRunner)
 	}
 
+	// One-time cleanup: the legacy session_map.json and the soul prompts/
+	// directory are both retired (Phase A of json-state-migration.md, and
+	// §0 compliance for agent souls). The file/dir no longer exists on
+	// fresh installs; this removes stragglers for existing installs. Safe
+	// to ignore "does not exist" errors.
+	_ = os.Remove(filepath.Join(cfg.MaquinistaDir, "session_map.json"))
+	_ = os.Remove(filepath.Join(cfg.MaquinistaDir, "session_map.json.lock"))
+	_ = os.RemoveAll(filepath.Join(cfg.MaquinistaDir, "prompts"))
+
 	msPath := filepath.Join(cfg.MaquinistaDir, "monitor_state.json")
 	ms, err := state.LoadMonitorState(msPath)
 	if err != nil {

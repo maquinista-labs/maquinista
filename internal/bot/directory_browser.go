@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os"
@@ -263,24 +264,54 @@ func (b *Bot) createWindowForDir(dir string, userID int64, chatID int64, threadI
 	// Kill the placeholder _init window now that we have a real window
 	tmux.CleanupInitWindow(b.config.TmuxSessionName)
 
-	sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
-	sessionKey := b.config.TmuxSessionName + ":" + windowID
+	windowName := filepath.Base(dir)
 
 	r := b.DefaultRunner()
 	hasHook := r != nil && r.HasSessionHook()
 
+	// Upsert the agents row first — that's the session-map equivalent now.
+	// session_id stays NULL until the hook / monitor discovers it.
+	pool := b.getPool()
+	if pool != nil {
+		upsertCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		_, err := pool.Exec(upsertCtx, `
+			INSERT INTO agents
+				(id, tmux_session, tmux_window, role, status, runner_type,
+				 cwd, window_name, started_at, last_seen, stop_requested)
+			VALUES ($1, $2, $3, 'user', 'running', $4, $5, $6, NOW(), NOW(), FALSE)
+			ON CONFLICT (id) DO UPDATE SET
+				tmux_session   = EXCLUDED.tmux_session,
+				tmux_window    = EXCLUDED.tmux_window,
+				status         = 'running',
+				cwd            = EXCLUDED.cwd,
+				window_name    = EXCLUDED.window_name,
+				last_seen      = NOW(),
+				stop_requested = FALSE
+		`, windowID, b.config.TmuxSessionName, windowID, b.config.DefaultRunner, dir, windowName)
+		cancel()
+		if err != nil {
+			log.Printf("directory_browser: agents upsert: %v", err)
+		}
+	}
+
 	if hasHook {
-		// Runner writes session_map via an external hook — wait for it.
-		sessionKey = ""
+		// Runner writes session_id via an external hook — poll the DB until
+		// the agents row picks up the session_id.
+		resolved := ""
 		for i := 0; i < 10; i++ {
 			time.Sleep(500 * time.Millisecond)
-			sm, err := state.LoadSessionMap(sessionMapPath)
+			if pool == nil {
+				break
+			}
+			lookupCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			sm, err := state.LoadSessionMap(lookupCtx, pool)
+			cancel()
 			if err != nil {
 				continue
 			}
 			for key, entry := range sm {
-				if strings.HasSuffix(key, ":"+windowID) {
-					sessionKey = key
+				if strings.HasSuffix(key, ":"+windowID) && entry.SessionID != "" {
+					resolved = key
 					b.state.SetWindowState(windowID, state.WindowState{
 						SessionID:  entry.SessionID,
 						CWD:        entry.CWD,
@@ -290,22 +321,20 @@ func (b *Bot) createWindowForDir(dir string, userID int64, chatID int64, threadI
 					break
 				}
 			}
-			if sessionKey != "" {
+			if resolved != "" {
 				break
 			}
 		}
-
-		if sessionKey == "" {
-			log.Printf("Hook did not create session_map entry for %s, trying fallback discovery...", windowID)
-			sessionKey = b.config.TmuxSessionName + ":" + windowID
-			if sid := discoverSessionID(dir); sid != "" {
+		if resolved == "" {
+			log.Printf("Hook did not populate agents.session_id for %s, trying fallback discovery...", windowID)
+			if sid := discoverSessionID(dir); sid != "" && pool != nil {
+				upCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				_, _ = pool.Exec(upCtx, `
+					UPDATE agents SET session_id=$1, last_seen=NOW()
+					WHERE id=$2
+				`, sid, windowID)
+				cancel()
 				log.Printf("Fallback: discovered session %s for window %s", sid, windowID)
-				state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
-					data[sessionKey] = state.SessionMapEntry{
-						SessionID: sid,
-						CWD:       dir,
-					}
-				})
 			} else {
 				log.Printf("Warning: could not discover session for window %s", windowID)
 			}
@@ -313,23 +342,14 @@ func (b *Bot) createWindowForDir(dir string, userID int64, chatID int64, threadI
 
 		tmux.WaitForReady(b.config.TmuxSessionName, windowID, 15*time.Second)
 	} else {
-		// Runner has no hook — write a preliminary session_map entry with CWD.
-		// The TranscriptSource discovers the session ID from its own database.
-		entry := state.SessionMapEntry{
-			CWD:             dir,
-			WindowName:      filepath.Base(dir),
-			WindowCreatedAt: time.Now().UnixMilli(),
-		}
-		if err := state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
-			data[sessionKey] = entry
-		}); err != nil {
-			log.Printf("Warning: failed to write session_map entry: %v", err)
-		}
+		// Hookless runner (OpenCode) — the agents row is already populated
+		// with cwd + window_name; the TranscriptSource discovers
+		// session_id from its own DB and UPDATEs agents.session_id.
 		b.state.SetWindowState(windowID, state.WindowState{
 			CWD:        dir,
-			WindowName: filepath.Base(dir),
+			WindowName: windowName,
 		})
-		b.state.SetWindowDisplayName(windowID, filepath.Base(dir))
+		b.state.SetWindowDisplayName(windowID, windowName)
 
 		time.Sleep(3 * time.Second)
 	}

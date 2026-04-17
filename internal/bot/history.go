@@ -2,12 +2,14 @@ package bot
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
@@ -93,8 +95,13 @@ func (b *Bot) handleHistoryCB(cq *tgbotapi.CallbackQuery) {
 
 // findJSONLForWindow finds the JSONL transcript file for a window.
 func (b *Bot) findJSONLForWindow(windowID string) string {
-	sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
-	sm, err := state.LoadSessionMap(sessionMapPath)
+	pool := b.getPool()
+	if pool == nil {
+		return ""
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sm, err := state.LoadSessionMap(ctx, pool)
 	if err != nil {
 		return ""
 	}

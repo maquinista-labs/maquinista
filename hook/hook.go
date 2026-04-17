@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
@@ -76,17 +75,12 @@ func Run() error {
 		return fmt.Errorf("creating maquinista dir: %w", err)
 	}
 
-	sessionMapPath := filepath.Join(dir, "session_map.json")
-
-	if err := state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
-		data[key] = state.SessionMapEntry{
-			SessionID:  input.SessionID,
-			CWD:        input.CWD,
-			WindowName: windowName,
-		}
-	}); err != nil {
-		return err
-	}
+	// Per-tmux-window session metadata now lives on the agents row
+	// (session_id/cwd/window_name columns, migration 015). The
+	// registerAgentFromEnv upsert below is the only writer; the legacy
+	// session_map.json has been retired per §0 of maquinista-v2.md.
+	_ = key // kept in scope for registerAgentFromEnv's debug log
+	_ = dir
 
 	// If the user launched the runner with AGENT_ID set, upsert an agents
 	// row so the bot's routing ladder can resolve Telegram messages to this

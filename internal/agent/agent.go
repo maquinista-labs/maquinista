@@ -1,17 +1,16 @@
 package agent
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/git"
 	"github.com/maquinista-labs/maquinista/internal/runner"
-	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
@@ -55,7 +54,7 @@ func Spawn(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env ma
 
 	if r != nil && !r.HasSessionHook() {
 		workDir, _ := filepath.Abs(".")
-		writeSessionMapFallback(tmuxSession, agentID, workDir)
+		upsertHooklessAgentCWD(pool, agentID, workDir)
 	}
 
 	now := time.Now()
@@ -110,7 +109,7 @@ func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath st
 	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, &worktreeDir, &branch, r)
 
 	if r != nil && !r.HasSessionHook() {
-		writeSessionMapFallback(tmuxSession, agentID, worktreeDir)
+		upsertHooklessAgentCWD(pool, agentID, worktreeDir)
 	}
 
 	now := time.Now()
@@ -126,39 +125,33 @@ func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath st
 	}, nil
 }
 
-// writeSessionMapFallback writes a preliminary session_map.json entry for runners
-// that have no SessionStart hook (e.g. OpenCode). It uses the agent ID as a stable
-// proxy for the session ID so bot handlers can route Telegram messages correctly.
-func writeSessionMapFallback(tmuxSession, agentID, workDir string) {
-	windowID, err := tmux.GetWindowID(tmuxSession, agentID)
-	if err != nil || windowID == "" {
-		return // tmux not available or window not found; skip silently
-	}
-
-	dir := os.Getenv("MAQUINISTA_DIR")
-	if dir == "" {
-		dir = "~/.maquinista"
-	}
-	if strings.HasPrefix(dir, "~/") {
-		home, err := os.UserHomeDir()
-		if err == nil {
-			dir = filepath.Join(home, dir[2:])
-		}
-	}
-	if err := os.MkdirAll(dir, 0755); err != nil {
+// upsertHooklessAgentCWD persists the working directory on the agents
+// row for runners with no SessionStart hook (OpenCode). session_id is
+// left NULL; the monitor source discovers it later from the runner's
+// own DB. Replaces the retired session_map.json fallback — all state
+// now lives in Postgres per §0 of maquinista-v2.md.
+func upsertHooklessAgentCWD(pool *pgxpool.Pool, agentID, workDir string) {
+	if pool == nil {
 		return
 	}
-
-	key := tmuxSession + ":" + windowID
-	sessionMapPath := filepath.Join(dir, "session_map.json")
-	_ = state.ReadModifyWriteSessionMap(sessionMapPath, func(data map[string]state.SessionMapEntry) {
-		data[key] = state.SessionMapEntry{
-			SessionID:       "",
-			CWD:             workDir,
-			WindowName:      agentID,
-			WindowCreatedAt: time.Now().UnixMilli(),
-		}
-	})
+	windowID, err := tmux.GetWindowID(os.Getenv("MAQUINISTA_TMUX_SESSION"), agentID)
+	_ = windowID // not strictly required; the row already carries tmux_window from RegisterAgent
+	if err != nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := pool.Exec(ctx, `
+		UPDATE agents
+		SET cwd = COALESCE(NULLIF($2,''), cwd),
+		    window_name = COALESCE(NULLIF($1,''), window_name),
+		    last_seen = NOW()
+		WHERE id = $1
+	`, agentID, workDir); err != nil {
+		// Fail open — the monitor will still discover the cwd from
+		// whichever runner-side source it already reads.
+		_ = err
+	}
 }
 
 // mergeEnv merges runner env overrides into the base env map.

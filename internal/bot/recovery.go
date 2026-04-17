@@ -1,9 +1,11 @@
 package bot
 
 import (
+	"context"
 	"log"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/maquinista-labs/maquinista/internal/state"
@@ -236,16 +238,27 @@ func cleanupDeadWindow(b *Bot, windowID string) {
 	// Remove window state and display name
 	b.state.RemoveWindowState(windowID)
 
-	// Remove monitor state and session_map entries
-	sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
-	sm, err := state.LoadSessionMap(sessionMapPath)
-	if err == nil {
-		for key := range sm {
-			if windowIDFromKey(key) == windowID {
-				if b.monitorState != nil {
-					b.monitorState.RemoveSession(key)
+	// Mark the dead window's agents row stopped + drop any monitor-state
+	// cursors keyed on it. The DB-backed session map filters by live
+	// status, so nothing else needs "deletion" — stopped rows drop out
+	// naturally.
+	if pool := b.getPool(); pool != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if _, uerr := pool.Exec(ctx, `
+			UPDATE agents SET status='stopped', last_seen=NOW()
+			WHERE tmux_session=$1 AND tmux_window=$2
+		`, b.config.TmuxSessionName, windowID); uerr != nil {
+			log.Printf("cleanupThreadsForWindow: mark stopped: %v", uerr)
+		}
+		if b.monitorState != nil {
+			sm, err := state.LoadSessionMap(ctx, pool)
+			if err == nil {
+				for key := range sm {
+					if windowIDFromKey(key) == windowID {
+						b.monitorState.RemoveSession(key)
+					}
 				}
-				state.RemoveSessionMapEntry(sessionMapPath, key)
 			}
 		}
 	}
@@ -270,24 +283,31 @@ func cleanStaleProjects(s *state.State) {
 	// not critical enough for startup cleanup.
 }
 
-// cleanStaleSessionMap removes session_map entries for dead windows.
+// cleanStaleSessionMap flips agents rows pointing at dead tmux windows
+// to status='stopped'. The DB-backed session_map loader already filters
+// by live status, so this is the replacement for the old JSON cleanup.
 func (b *Bot) cleanStaleSessionMap(liveIDs map[string]bool) {
-	sessionMapPath := filepath.Join(b.config.MaquinistaDir, "session_map.json")
-	sm, err := state.LoadSessionMap(sessionMapPath)
+	pool := b.getPool()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	sm, err := state.LoadSessionMap(ctx, pool)
 	if err != nil {
 		return
 	}
-
-	var toRemove []string
 	for key := range sm {
 		wid := windowIDFromKey(key)
-		if !liveIDs[wid] {
-			toRemove = append(toRemove, key)
+		if liveIDs[wid] {
+			continue
 		}
-	}
-
-	for _, key := range toRemove {
-		state.RemoveSessionMapEntry(sessionMapPath, key)
+		if _, err := pool.Exec(ctx, `
+			UPDATE agents SET status='stopped', last_seen=NOW()
+			WHERE tmux_session=$1 AND tmux_window=$2
+		`, b.config.TmuxSessionName, wid); err != nil {
+			log.Printf("cleanStaleSessionMap: %s: %v", key, err)
+		}
 	}
 }
 

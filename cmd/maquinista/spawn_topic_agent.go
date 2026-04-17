@@ -117,32 +117,32 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			return "", fmt.Errorf("pre-registering topic agent row: %w", err)
 		}
 
-		// Create soul (default template), seed memory blocks, render soul
-		// file — all done BEFORE tmux spawn so the runner command can use
-		// --system-prompt when the runner supports it (Claude / OpenClaude).
+		// Create soul (default template), seed memory blocks. Both live in
+		// Postgres only — no prompt file on disk. The runner launch
+		// command pulls the rendered soul via `maquinista soul render <id>`
+		// at spawn time via shell substitution ($()), so the DB stays the
+		// single source of truth per §0 of maquinista-v2.md.
 		if err := soul.CreateFromTemplate(ctx, pool, agentID, "", soul.Overrides{}); err != nil {
 			log.Printf("spawn_topic_agent: soul create for %s: %v (continuing)", agentID, err)
 		}
 		var seedPersona string
+		hasSoul := false
 		if s, lerr := soul.Load(ctx, pool, agentID); lerr == nil && s != nil {
 			seedPersona = s.CoreTruths
+			hasSoul = true
 		}
 		if err := memory.SeedDefaultBlocks(ctx, pool, agentID, seedPersona); err != nil {
 			log.Printf("spawn_topic_agent: seed memory blocks for %s: %v (continuing)", agentID, err)
 		}
-		soulPromptPath, serr := writeSoulPromptFile(ctx, pool, cfg, agentID)
-		if serr != nil {
-			log.Printf("spawn_topic_agent: write soul prompt file: %v (continuing)", serr)
-		}
 
-		runnerCmd, env := resolveRunnerCommand(cfg, agentID, cwd, soulPromptPath)
+		runnerCmd, env := resolveRunnerCommand(cfg, agentID, cwd, hasSoul)
 
 		windowID, err := tmux.NewWindow(cfg.TmuxSessionName, agentID, cwd, runnerCmd, env)
 		if err != nil {
 			return "", fmt.Errorf("spawning topic agent window: %w", err)
 		}
 		log.Printf("spawn_topic_agent: spawned %s at %s:%s (cwd=%s, runner=%s, soul=%v)",
-			agentID, cfg.TmuxSessionName, windowID, cwd, runnerCmd, soulPromptPath != "")
+			agentID, cfg.TmuxSessionName, windowID, cwd, runnerCmd, hasSoul)
 
 		// Block until the runner's TUI is ready to accept keystrokes.
 		if err := waitForRunnerReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
@@ -246,21 +246,23 @@ func tmuxWindowExists(session, windowID string) bool {
 }
 
 // resolveRunnerCommand picks the shell command line for the configured
-// runner. When soulPromptPath is non-empty and the runner understands a
-// system-prompt file (Claude-family), the command is rewritten to inject
-// it via `--system-prompt "$(cat FILE)"` so the agent boots with its soul.
-// Runners without that flag (OpenCode) fall back to LaunchCommand — the
-// soul still lives on disk for future integration.
-func resolveRunnerCommand(cfg *config.Config, agentID, cwd, soulPromptPath string) (string, map[string]string) {
+// runner. When hasSoul is true and the runner understands a --system-prompt
+// flag (Claude family), the command is rewritten to pull the rendered
+// soul from Postgres at spawn time via shell substitution:
+//
+//	claude … --system-prompt "$(maquinista soul render <agent_id>)"
+//
+// The DB remains the single source of truth per §0 — no prompt files on
+// disk. Runners without that flag (OpenCode) fall back to LaunchCommand;
+// MAQUINISTA_AGENT_ID is still exported so a future runner integration
+// can look up the soul itself.
+func resolveRunnerCommand(cfg *config.Config, agentID, cwd string, hasSoul bool) (string, map[string]string) {
 	env := map[string]string{
 		"AGENT_ID":    agentID,
 		"RUNNER_TYPE": cfg.DefaultRunner,
 	}
 	if cfg.DatabaseURL != "" {
 		env["DATABASE_URL"] = cfg.DatabaseURL
-	}
-	if soulPromptPath != "" {
-		env["MAQUINISTA_AGENT_PROMPT"] = soulPromptPath
 	}
 	r, rerr := runner.Get(cfg.DefaultRunner)
 	if rerr != nil {
@@ -275,39 +277,16 @@ func resolveRunnerCommand(cfg *config.Config, agentID, cwd, soulPromptPath strin
 	}
 
 	cmd := r.LaunchCommand(runner.Config{WorkDir: cwd, Env: env})
-	if soulPromptPath == "" {
+	if !hasSoul {
 		return cmd, env
 	}
 	switch r.Name() {
 	case "claude", "openclaude":
-		// Both accept `--system-prompt "$(cat FILE)"`; append it so the
-		// soul lands as the system prompt without replacing the launch
-		// flags (IS_SANDBOX=1, --dangerously-skip-permissions, …).
-		cmd = fmt.Sprintf(`%s --system-prompt "$(cat %s)"`, cmd, soulPromptPath)
+		maquinistaBin := cfg.MaquinistaBin
+		if maquinistaBin == "" {
+			maquinistaBin = "maquinista"
+		}
+		cmd = fmt.Sprintf(`%s --system-prompt "$(%s soul render %s)"`, cmd, maquinistaBin, agentID)
 	}
 	return cmd, env
-}
-
-// writeSoulPromptFile renders agent's soul to
-// $MAQUINISTA_DIR/prompts/<agent_id>.md. The path is returned so the
-// caller can export MAQUINISTA_AGENT_PROMPT / pass --system-prompt. Empty
-// string + nil error means "no soul row yet" — spawner skips injection.
-func writeSoulPromptFile(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, agentID string) (string, error) {
-	s, err := soul.Load(ctx, pool, agentID)
-	if err != nil {
-		if err == soul.ErrNotFound {
-			return "", nil
-		}
-		return "", err
-	}
-	dir := filepath.Join(cfg.MaquinistaDir, "prompts")
-	if mkerr := os.MkdirAll(dir, 0o755); mkerr != nil {
-		return "", fmt.Errorf("mkdir prompts: %w", mkerr)
-	}
-	path := filepath.Join(dir, agentID+".md")
-	rendered := soul.Render(*s, 32000)
-	if werr := os.WriteFile(path, []byte(rendered), 0o644); werr != nil {
-		return "", fmt.Errorf("write %s: %w", path, werr)
-	}
-	return path, nil
 }
