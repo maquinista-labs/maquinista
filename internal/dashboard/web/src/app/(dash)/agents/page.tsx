@@ -4,18 +4,22 @@
 // Query + SSE for live updates.
 
 import { AgentsListClient } from "@/components/dash/agents-list-client";
+import { KpiStrip } from "@/components/dash/kpi-strip";
+import { SystemHealthCard } from "@/components/dash/system-health-card";
 import { getPool } from "@/lib/db";
-import { listAgents } from "@/lib/queries";
-import type { AgentListItem } from "@/lib/types";
+import { computeKPIs, listAgents } from "@/lib/queries";
+import type { AgentListItem, KPIs } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
 export default async function AgentsPage() {
   let agents: AgentListItem[] = [];
+  let kpis: KPIs | undefined;
   let error: string | null = null;
   try {
-    agents = await listAgents(getPool());
+    const pool = getPool();
+    [agents, kpis] = await Promise.all([listAgents(pool), computeKPIs(pool)]);
   } catch (err) {
     error = err instanceof Error ? err.message : String(err);
   }
@@ -33,7 +37,13 @@ export default async function AgentsPage() {
         </p>
       )}
 
-      {!error && <AgentsListClient initial={agents} />}
+      {!error && (
+        <>
+          <KpiStrip initial={kpis} />
+          <AgentsListClient initial={agents} />
+          <SystemHealthCard />
+        </>
+      )}
     </section>
   );
 }

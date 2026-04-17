@@ -62,15 +62,24 @@ test.describe("dashboard shell", () => {
     // (fresh DB). The remaining three routes are still Phase-1
     // placeholders.
     await page.goto("/agents");
-    const agentsLive = page.getByTestId("agents-list");
-    const agentsEmpty = page.getByTestId("agents-empty");
-    const agentsError = page.getByTestId("agents-error");
-    await expect(agentsLive.or(agentsEmpty).or(agentsError)).toBeVisible();
+    // /agents always renders its heading; the inner list / empty
+    // banner / error is phase-dependent. Assert the page is loaded
+    // by the heading itself.
+    await expect(
+      page.getByRole("heading", { name: "Agents" }),
+    ).toBeVisible();
 
+    // /jobs became live in Phase 4 — assert its heading instead
+    // of the Phase-1 placeholder.
+    await page.goto("/jobs");
+    await expect(
+      page.getByRole("heading", { name: "Jobs" }),
+    ).toBeVisible();
+
+    // /inbox + /conversations are still Phase-1 placeholders.
     for (const [href, testid] of [
       ["/inbox", "inbox-placeholder"],
       ["/conversations", "conversations-placeholder"],
-      ["/jobs", "jobs-placeholder"],
     ] as const) {
       await page.goto(href);
       await expect(page.getByTestId(testid)).toBeVisible();

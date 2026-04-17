@@ -1,16 +1,36 @@
-// Jobs page — Phase 1 placeholder. Phase 4 wires it to
-// scheduled_jobs + webhook_handlers.
+// Jobs page — scheduled_jobs + webhook_handlers, fed by /api/jobs.
 
-export default function JobsPage() {
+import { JobsPageClient } from "@/components/dash/jobs-page-client";
+import { getPool } from "@/lib/db";
+import { listJobs } from "@/lib/queries";
+import type { JobsList } from "@/lib/types";
+
+export const dynamic = "force-dynamic";
+export const revalidate = 0;
+
+export default async function JobsPage() {
+  let jobs: JobsList = { scheduled: [], webhooks: [] };
+  let error: string | null = null;
+  try {
+    jobs = await listJobs(getPool());
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+  }
+
   return (
     <section className="mx-auto max-w-screen-sm px-4 py-6">
-      <h2 className="mb-2 text-xl font-semibold">Jobs</h2>
-      <p
-        data-testid="jobs-placeholder"
-        className="text-sm text-muted-foreground"
-      >
-        Scheduled jobs and webhook handlers. Wired up in Phase 4.
-      </p>
+      <h2 className="mb-3 text-xl font-semibold">Jobs</h2>
+
+      {error && (
+        <p
+          data-testid="jobs-error"
+          className="rounded border border-destructive/60 bg-destructive/10 p-3 text-sm text-destructive"
+        >
+          {error}
+        </p>
+      )}
+
+      {!error && <JobsPageClient initial={jobs} />}
     </section>
   );
 }

@@ -62,3 +62,53 @@ export type ConversationItem = {
   excerpt: string | null;
   at: string;
 };
+
+export type KPIs = {
+  active_agents: number;
+  total_agents: number;
+  inbox_in_flight: number;
+  outbox_pending: number;
+  tokens_today: { input: number; output: number };
+  cost_today_cents: number;
+  cost_month_projected_cents: number;
+  cost_by_model: Array<{ model: string; cents: number }>;
+};
+
+export type ScheduledJob = {
+  id: string;
+  name: string;
+  kind: "scheduled";
+  cron_expr: string;
+  timezone: string;
+  agent_id: string;
+  enabled: boolean;
+  next_run_at: string;
+  last_run_at: string | null;
+};
+
+export type WebhookHandler = {
+  id: string;
+  name: string;
+  kind: "webhook";
+  path: string;
+  agent_id: string;
+  enabled: boolean;
+  rate_limit_per_min: number;
+};
+
+export type JobsList = {
+  scheduled: ScheduledJob[];
+  webhooks: WebhookHandler[];
+};
+
+export type SystemHealth = {
+  pg: {
+    total: number;
+    idle: number;
+    waiting: number;
+  };
+  uptime_ms: number;
+  pid: number;
+  node_version: string;
+  platform: string;
+};

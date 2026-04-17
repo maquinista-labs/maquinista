@@ -8,6 +8,8 @@ import type {
   AgentListItem,
   ConversationItem,
   InboxRow,
+  JobsList,
+  KPIs,
   OutboxRow,
 } from "@/lib/types";
 
@@ -232,6 +234,133 @@ export async function listConversation(
     excerpt: excerptFromContent(r.content),
     at: r.at.toISOString ? r.at.toISOString() : String(r.at),
   }));
+}
+
+// computeKPIs aggregates fleet-wide counters for the KPI strip.
+// Single round-trip via CTEs; safe to call from a Server Component.
+export async function computeKPIs(pool: Pool): Promise<KPIs> {
+  const { rows } = await pool.query(`
+    WITH
+      a AS (
+        SELECT COUNT(*) FILTER (WHERE status = 'working') AS active,
+               COUNT(*)                                   AS total
+        FROM agents
+        WHERE status <> 'archived' OR status IS NULL
+      ),
+      inbox AS (
+        SELECT COUNT(*) AS in_flight
+        FROM agent_inbox
+        WHERE status IN ('pending','processing')
+      ),
+      outbox AS (
+        SELECT COUNT(*) AS pending
+        FROM agent_outbox
+        WHERE status = 'pending'
+      ),
+      tc AS (
+        SELECT
+          COALESCE(SUM(input_tokens), 0)::bigint  AS input_today,
+          COALESCE(SUM(output_tokens), 0)::bigint AS output_today,
+          COALESCE(SUM(input_usd_cents + output_usd_cents), 0)::int AS cents_today
+        FROM agent_turn_costs
+        WHERE finished_at >= date_trunc('day', NOW())
+      ),
+      tc_month AS (
+        SELECT COALESCE(SUM(input_usd_cents + output_usd_cents), 0)::int AS cents_month
+        FROM agent_turn_costs
+        WHERE finished_at >= date_trunc('month', NOW())
+      ),
+      donut AS (
+        SELECT model,
+               COALESCE(SUM(input_usd_cents + output_usd_cents), 0)::int AS cents
+        FROM agent_turn_costs
+        WHERE finished_at >= date_trunc('day', NOW())
+        GROUP BY model
+      )
+    SELECT
+      a.active, a.total, inbox.in_flight, outbox.pending,
+      tc.input_today, tc.output_today, tc.cents_today,
+      tc_month.cents_month,
+      COALESCE((SELECT json_agg(row_to_json(donut)) FROM donut), '[]') AS by_model
+    FROM a, inbox, outbox, tc, tc_month
+  `);
+  const r = rows[0];
+  const now = new Date();
+  // Linear projection for the rest of the month based on cents_today.
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+  const daysElapsed = Math.max(
+    1,
+    Math.ceil((now.getTime() - startOfMonth.getTime()) / 86_400_000),
+  );
+  const daysInMonth = new Date(
+    now.getFullYear(),
+    now.getMonth() + 1,
+    0,
+  ).getDate();
+  const projection = Math.round((r.cents_month / daysElapsed) * daysInMonth);
+
+  return {
+    active_agents: Number(r.active) || 0,
+    total_agents: Number(r.total) || 0,
+    inbox_in_flight: Number(r.in_flight) || 0,
+    outbox_pending: Number(r.pending) || 0,
+    tokens_today: {
+      input: Number(r.input_today) || 0,
+      output: Number(r.output_today) || 0,
+    },
+    cost_today_cents: Number(r.cents_today) || 0,
+    cost_month_projected_cents: projection,
+    cost_by_model: Array.isArray(r.by_model)
+      ? r.by_model.map((m: { model: string; cents: number }) => ({
+          model: m.model,
+          cents: Number(m.cents) || 0,
+        }))
+      : [],
+  };
+}
+
+export async function listJobs(pool: Pool): Promise<JobsList> {
+  const [{ rows: scheduled }, { rows: webhooks }] = await Promise.all([
+    pool.query(`
+      SELECT id, name, cron_expr, timezone, agent_id, enabled,
+             next_run_at, last_run_at
+      FROM scheduled_jobs
+      ORDER BY enabled DESC, next_run_at ASC
+    `),
+    pool.query(`
+      SELECT id, name, path, agent_id, enabled, rate_limit_per_min
+      FROM webhook_handlers
+      ORDER BY enabled DESC, name ASC
+    `),
+  ]);
+  return {
+    scheduled: scheduled.map((r) => ({
+      id: r.id,
+      name: r.name,
+      kind: "scheduled" as const,
+      cron_expr: r.cron_expr,
+      timezone: r.timezone,
+      agent_id: r.agent_id,
+      enabled: r.enabled,
+      next_run_at: r.next_run_at.toISOString
+        ? r.next_run_at.toISOString()
+        : String(r.next_run_at),
+      last_run_at: r.last_run_at
+        ? r.last_run_at.toISOString
+          ? r.last_run_at.toISOString()
+          : String(r.last_run_at)
+        : null,
+    })),
+    webhooks: webhooks.map((r) => ({
+      id: r.id,
+      name: r.name,
+      kind: "webhook" as const,
+      path: r.path,
+      agent_id: r.agent_id,
+      enabled: r.enabled,
+      rate_limit_per_min: r.rate_limit_per_min,
+    })),
+  };
 }
 
 // listAgentTimeline: cross-conversation flat merge of inbox + outbox

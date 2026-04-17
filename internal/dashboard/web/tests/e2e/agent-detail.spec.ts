@@ -5,13 +5,11 @@ import {
   insertAgent,
   insertInbox,
   insertOutbox,
+  pgUrlFromState,
 } from "./support/db";
 
 const dbRequired = () =>
-  test.skip(
-    !process.env.MAQUINISTA_DASHBOARD_PG_URL,
-    "Postgres fixture unavailable; skipping",
-  );
+  test.skip(!pgUrlFromState(), "Postgres fixture unavailable; skipping");
 
 test.describe("agent detail — tabs", () => {
   test.beforeEach(async () => {
