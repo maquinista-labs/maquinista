@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import { DashQueryClientProvider } from "@/lib/query-client";
 import { ThemeProvider } from "@/components/theme-provider";
 import { Toaster } from "@/components/ui/sonner";
 import "./globals.css";
@@ -50,8 +51,10 @@ export default function RootLayout({
           enableSystem
           disableTransitionOnChange
         >
-          {children}
-          <Toaster position="top-center" richColors />
+          <DashQueryClientProvider>
+            {children}
+            <Toaster position="top-center" richColors />
+          </DashQueryClientProvider>
         </ThemeProvider>
       </body>
     </html>
