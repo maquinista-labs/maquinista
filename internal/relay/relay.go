@@ -203,7 +203,12 @@ func mergeMentions(mentionsJSON, content []byte) []Mention {
 // index: origin_channel='a2a' + external_msg_id='<outbox_id>:<target>' so
 // a crash-restart of the relay doesn't double-deliver.
 //
-// Phase 1 of plans/active/agent-to-agent-communication.md.
+// Each mention is placed on an a2a conversation: when an open
+// conversation already exists with the same {from, to} participants it's
+// reused (so a multi-turn exchange stays threaded); otherwise a fresh
+// conversations row with kind='a2a' is inserted and used.
+//
+// Phase 1 + Phase 2 of plans/active/agent-to-agent-communication.md.
 func enqueueMentions(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -228,6 +233,14 @@ func enqueueMentions(
 			// producer.
 			continue
 		}
+		// Pick the a2a conversation id. Prefer the outbox's own
+		// conversation (threads replies back); otherwise find-or-create
+		// one keyed on the participant set.
+		convoID, err := ensureA2AConversation(ctx, tx, fromAgent, canonical, conversationID)
+		if err != nil {
+			return inserted, fmt.Errorf("ensure a2a conversation for %s→%s: %w", fromAgent, canonical, err)
+		}
+
 		content, _ := json.Marshal(map[string]string{"type": "text", "text": m.Text})
 		externalMsgID := outboxID.String() + ":" + canonical
 		tag, err := tx.Exec(ctx, `
@@ -236,7 +249,7 @@ func enqueueMentions(
 				 origin_channel, external_msg_id, content)
 			VALUES ($1, $2, 'agent', $3, 'a2a', $4, $5::jsonb)
 			ON CONFLICT (origin_channel, external_msg_id) DO NOTHING
-		`, canonical, conversationID, fromAgent, externalMsgID, content)
+		`, canonical, convoID, fromAgent, externalMsgID, content)
 		if err != nil {
 			return inserted, fmt.Errorf("insert mention for %s: %w", canonical, err)
 		}
@@ -245,6 +258,46 @@ func enqueueMentions(
 		}
 	}
 	return inserted, nil
+}
+
+// ensureA2AConversation returns a conversation id to thread this
+// mention under. If caller's conversation_id is already set, we reuse it
+// (replies thread back into the originating human-driven conversation).
+// Otherwise look for an open conversations row with kind='a2a' whose
+// participants contain {from, to}; reuse it if found. Else insert a
+// fresh one and return its id.
+func ensureA2AConversation(ctx context.Context, tx pgx.Tx, from, to string, inherit *uuid.UUID) (uuid.UUID, error) {
+	if inherit != nil {
+		return *inherit, nil
+	}
+	var existing uuid.UUID
+	err := tx.QueryRow(ctx, `
+		SELECT id FROM conversations
+		WHERE kind = 'a2a'
+		  AND closed_at IS NULL
+		  AND participants @> ARRAY[$1, $2]::text[]
+		  AND participants <@ ARRAY[$1, $2]::text[]
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, from, to).Scan(&existing)
+	if err == nil {
+		return existing, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, fmt.Errorf("lookup a2a convo: %w", err)
+	}
+
+	var newID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		INSERT INTO conversations
+			(kind, participants, pending_count)
+		VALUES ('a2a', ARRAY[$1, $2]::text[], 0)
+		RETURNING id
+	`, from, to).Scan(&newID)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("insert a2a convo: %w", err)
+	}
+	return newID, nil
 }
 
 // resolveAgentToken returns the canonical agents.id for a token that may

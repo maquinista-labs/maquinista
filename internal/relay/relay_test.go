@@ -278,6 +278,77 @@ func TestA2A_SelfMention_Skipped(t *testing.T) {
 	}
 }
 
+// TestA2A_ConversationThreading: the first mention alpha→beta creates a
+// kind='a2a' conversation with participants={alpha,beta}. A second
+// mention on the same chain should reuse that conversation id.
+func TestA2A_ConversationThreading(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	// Round 1.
+	outbox1 := uuid.New()
+	mustExec(t, pool, `
+		INSERT INTO agent_outbox (id, agent_id, content)
+		VALUES ($1, 'alpha', $2::jsonb)
+	`, outbox1, `{"text":"[@beta: round 1]"}`)
+	if ok, err := ProcessOne(ctx, pool, "w1"); err != nil || !ok {
+		t.Fatalf("round 1 ProcessOne: ok=%v err=%v", ok, err)
+	}
+
+	// Round 2 — a fresh outbox from alpha mentioning beta again.
+	outbox2 := uuid.New()
+	mustExec(t, pool, `
+		INSERT INTO agent_outbox (id, agent_id, content)
+		VALUES ($1, 'alpha', $2::jsonb)
+	`, outbox2, `{"text":"[@beta: round 2]"}`)
+	if ok, err := ProcessOne(ctx, pool, "w1"); err != nil || !ok {
+		t.Fatalf("round 2 ProcessOne: ok=%v err=%v", ok, err)
+	}
+
+	var convos int
+	pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM conversations
+		WHERE kind = 'a2a'
+		  AND participants @> ARRAY['alpha','beta']::text[]
+		  AND participants <@ ARRAY['alpha','beta']::text[]
+	`).Scan(&convos)
+	if convos != 1 {
+		t.Errorf("got %d a2a conversations for {alpha,beta}, want exactly 1 (thread should reuse)", convos)
+	}
+
+	// Both inbox rows should carry the same conversation_id.
+	var distinct int
+	pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT conversation_id) FROM agent_inbox
+		WHERE agent_id='beta' AND from_kind='agent' AND from_id='alpha'
+	`).Scan(&distinct)
+	if distinct != 1 {
+		t.Errorf("inbox rows thread via %d distinct convo ids, want 1", distinct)
+	}
+}
+
+// TestA2A_ConversationDistinctPerParticipantSet: alpha→beta vs alpha→gamma
+// must get separate conversations.
+func TestA2A_ConversationDistinctPerParticipantSet(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	outbox1 := uuid.New()
+	mustExec(t, pool, `
+		INSERT INTO agent_outbox (id, agent_id, content)
+		VALUES ($1, 'alpha', $2::jsonb)
+	`, outbox1, `{"text":"[@beta: to beta] [@gamma: to gamma]"}`)
+	if ok, err := ProcessOne(ctx, pool, "w1"); err != nil || !ok {
+		t.Fatalf("ProcessOne: ok=%v err=%v", ok, err)
+	}
+
+	var convos int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM conversations WHERE kind='a2a'`).Scan(&convos)
+	if convos != 2 {
+		t.Errorf("want 2 distinct a2a convos (alpha,beta) + (alpha,gamma); got %d", convos)
+	}
+}
+
 // TestA2A_Idempotent_ReplaySameOutbox: if the relay replays the same
 // outbox row (e.g. after a crash), the mention fanout must not
 // double-deliver. Uses the (origin_channel, external_msg_id) UNIQUE.
