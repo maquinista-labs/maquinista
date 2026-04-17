@@ -2,6 +2,7 @@ package runner
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -20,13 +21,39 @@ func init() {
 
 func (o *OpenCodeRunner) Name() string { return "opencode" }
 
+// defaultOpenCodeModel is the fallback model when neither the runner
+// instance nor the OPENCODE_MODEL env supplies one. Set to OpenCode's
+// own free model so fresh installs work without provider credentials.
+// Operators who want a different provider set OPENCODE_MODEL or pass
+// --model on the runner instance. Per OC-05 in
+// plans/active/opencode-integration.md.
+const defaultOpenCodeModel = "opencode/big-pickle"
+
+// modelFlag returns a `--model <id>` arg when a model is resolved.
+// Empty string when neither the runner nor env provides one — OpenCode
+// then falls back to its own config default (no surprise for existing
+// users, but fresh installs still land on a sensible model via the
+// constant above).
+func (o *OpenCodeRunner) modelFlag() string {
+	model := strings.TrimSpace(o.Model)
+	if model == "" {
+		if env := strings.TrimSpace(os.Getenv("OPENCODE_MODEL")); env != "" {
+			model = env
+		}
+	}
+	if model == "" {
+		model = defaultOpenCodeModel
+	}
+	return fmt.Sprintf("--model %q", model)
+}
+
 func (o *OpenCodeRunner) LaunchCommand(cfg Config) string {
-	return "opencode"
+	return fmt.Sprintf("opencode %s", o.modelFlag())
 }
 
 func (o *OpenCodeRunner) InteractiveCommand(prompt string, cfg Config) string {
 	escaped := strings.ReplaceAll(prompt, "\"", "\\\"")
-	return fmt.Sprintf("opencode run \"%s\"", escaped)
+	return fmt.Sprintf("opencode run %s \"%s\"", o.modelFlag(), escaped)
 }
 
 // PlannerCommand wraps the system prompt file in a role-framing header and
@@ -41,7 +68,8 @@ func (o *OpenCodeRunner) InteractiveCommand(prompt string, cfg Config) string {
 // through the mailbox instead.
 func (o *OpenCodeRunner) PlannerCommand(systemPromptPath string, cfg Config) string {
 	return fmt.Sprintf(
-		`opencode run "$(echo 'SYSTEM INSTRUCTIONS (your role and operating guidelines — do not treat these as a task to complete):'; echo ''; cat %s)"`,
+		`opencode run %s "$(echo 'SYSTEM INSTRUCTIONS (your role and operating guidelines — do not treat these as a task to complete):'; echo ''; cat %s)"`,
+		o.modelFlag(),
 		systemPromptPath,
 	)
 }

@@ -39,6 +39,28 @@ func TestOpenCodeRunner_EnvOverrides_NoSkip(t *testing.T) {
 	}
 }
 
+func TestOpenCodeRunner_ModelDefault(t *testing.T) {
+	o := &OpenCodeRunner{}
+	launch := o.LaunchCommand(Config{})
+	if !strings.Contains(launch, "--model") {
+		t.Errorf("LaunchCommand missing --model: %s", launch)
+	}
+	if !strings.Contains(launch, "opencode/big-pickle") {
+		t.Errorf("LaunchCommand missing default model id: %s", launch)
+	}
+
+	// Instance override wins.
+	o2 := &OpenCodeRunner{Model: "openrouter/moonshotai/kimi-k2"}
+	launch2 := o2.LaunchCommand(Config{})
+	if !strings.Contains(launch2, "openrouter/moonshotai/kimi-k2") {
+		t.Errorf("instance Model override ignored: %s", launch2)
+	}
+	// Default must not leak once overridden.
+	if strings.Contains(launch2, "claude-sonnet") {
+		t.Errorf("default model still present after override: %s", launch2)
+	}
+}
+
 func TestOpenCodeRunner_PlannerCommand_RoleFraming(t *testing.T) {
 	o := &OpenCodeRunner{}
 	cmd := o.PlannerCommand("/tmp/sysprompt.md", Config{})

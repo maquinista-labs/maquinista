@@ -38,16 +38,29 @@ func ClaudeProfile() MonitorProfile {
 	}
 }
 
-// OpenCodeProfile returns the OpenCode TUI parsing parameters. OpenCode's
-// status appears in a bottom bar ("Build 12s"); there are no permission /
-// plan-mode prompts to catch yet. Status detection stays in OpenCodeSource
-// since the pattern is line-content not chrome-layout.
+// OpenCodeProfile returns the OpenCode TUI parsing parameters, derived
+// from live observation in OpenCode v1.3.14 (OC-06 in
+// plans/active/opencode-integration.md).
+//
+// Observed layout (captured with `opencode --model opencode/big-pickle`):
+//
+//	┃  Ask anything... "Fix a TODO in the codebase"
+//	┃
+//	┃  Build  Big Pickle OpenCode Zen
+//	╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+//	                              tab agents  ctrl+p commands
+//
+// There's no spinner character in the input area; busy state is signaled
+// in the bottom "Build" status bar ("Build 12s"). The chrome line above
+// the hints is made of '▀' (Unicode upper half block) with a leading
+// '╹'. No permission-prompt / plan-mode UIs observed in non-interactive
+// probing; patterns stay empty until an operator captures one.
 func OpenCodeProfile() MonitorProfile {
 	return MonitorProfile{
-		SpinnerChars:    "",
-		SeparatorRunes:  nil, // never match a separator — OpenCode has no chrome line
-		MinSeparatorLen: 0,
-		UIPatterns:      nil,
+		SpinnerChars:    "", // no input-area spinner; status lives in the "Build" bar
+		SeparatorRunes:  []rune{'▀', '╹'},
+		MinSeparatorLen: 30,
+		UIPatterns:      nil, // no interactive prompts known yet
 	}
 }
 
