@@ -1,0 +1,65 @@
+"use client";
+
+import { Bot, Inbox, MessageSquare, CalendarClock } from "lucide-react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+import type { ComponentType, SVGProps } from "react";
+
+import { cn } from "@/lib/utils";
+
+// Bottom nav: four touch targets, min-height 44 px to meet Apple's
+// HIG. Each tab's label is shown under the icon for discoverability
+// (iOS-style) and stays within a 12-char budget so the layout
+// doesn't break on narrow phones.
+type Tab = {
+  href: string;
+  label: string;
+  Icon: ComponentType<SVGProps<SVGSVGElement>>;
+  testId: string;
+};
+
+const tabs: Tab[] = [
+  { href: "/agents", label: "Agents", Icon: Bot, testId: "nav-agents" },
+  { href: "/inbox", label: "Inbox", Icon: Inbox, testId: "nav-inbox" },
+  {
+    href: "/conversations",
+    label: "Chats",
+    Icon: MessageSquare,
+    testId: "nav-conversations",
+  },
+  { href: "/jobs", label: "Jobs", Icon: CalendarClock, testId: "nav-jobs" },
+];
+
+export function BottomNav() {
+  const pathname = usePathname();
+
+  return (
+    <nav
+      data-testid="bottom-nav"
+      aria-label="Primary"
+      className="sticky bottom-0 z-20 grid grid-cols-4 border-t border-border/60 bg-background/90 backdrop-blur supports-[backdrop-filter]:bg-background/70"
+      style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+    >
+      {tabs.map(({ href, label, Icon, testId }) => {
+        const active = pathname === href || pathname.startsWith(`${href}/`);
+        return (
+          <Link
+            key={href}
+            href={href}
+            data-testid={testId}
+            aria-current={active ? "page" : undefined}
+            className={cn(
+              "flex min-h-[52px] flex-col items-center justify-center gap-0.5 text-xs",
+              active
+                ? "text-foreground"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <Icon className="h-5 w-5" aria-hidden />
+            <span className="leading-none">{label}</span>
+          </Link>
+        );
+      })}
+    </nav>
+  );
+}
