@@ -190,6 +190,13 @@ func runStart() error {
 		}
 	}
 
+	// Phase B of json-state-migration: let state.State route its read/write
+	// paths through Postgres when a pool is available. Without this, the
+	// DB-backed implementations fall through to the in-memory JSON maps.
+	if pool != nil {
+		b.State().SetPool(pool)
+	}
+
 	claudeSrc := monitor.NewClaudeSource(cfg, pool, b.State(), ms)
 	monitor.RegisterSource("claude", claudeSrc)
 

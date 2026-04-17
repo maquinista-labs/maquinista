@@ -1,8 +1,14 @@
 package state
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // WindowState holds session info for a bound window.
@@ -28,9 +34,17 @@ type WorktreeInfo struct {
 	IsMergeTopic bool   `json:"is_merge_topic,omitempty"`
 }
 
-// State is the main application state, persisted as state.json.
+// State is the main application state. Originally persisted entirely as
+// state.json; Phase B of plans/active/json-state-migration.md moves
+// fields one at a time onto Postgres tables. Fields that still ship in
+// the JSON file are the ones not yet migrated.
+//
+// Call SetPool(pool) once at startup to enable DB-backed methods; nil
+// pool falls back to the in-memory maps (still used by unit tests and
+// during the transition).
 type State struct {
 	mu                 sync.RWMutex
+	pool               *pgxpool.Pool                // B1+ DB-backed operations
 	ThreadBindings     map[string]map[string]string `json:"thread_bindings"`      // user_id → thread_id → window_id
 	WindowStates       map[string]WindowState       `json:"window_states"`        // window_id → state
 	WindowDisplayNames map[string]string            `json:"window_display_names"` // window_id → display_name
@@ -40,6 +54,24 @@ type State struct {
 	WorktreeBindings   map[string]WorktreeInfo      `json:"worktree_bindings"`    // thread_id → worktree info
 	WindowRunners      map[string]string            `json:"window_runners"`       // window_id → runner_name
 	ActiveThreads      map[string]UserThread        `json:"active_threads"`       // window_id → last (user, thread) that routed to this window
+}
+
+// SetPool attaches a DB pool for Phase B DB-backed paths. Safe to call
+// from any goroutine but intended to run once at startup.
+func (s *State) SetPool(pool *pgxpool.Pool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.pool = pool
+}
+
+func (s *State) getPool() *pgxpool.Pool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.pool
+}
+
+func dbCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 2*time.Second)
 }
 
 // NewState creates a new empty state.
@@ -102,13 +134,40 @@ func (s *State) Save(path string) error {
 }
 
 // BindThread binds a thread to a window for a user.
+// Phase B1: when a DB pool is attached, writes also upsert an owner
+// binding into topic_agent_bindings for the agent whose tmux_window
+// matches. The in-memory map is still populated so callers that
+// haven't been migrated (and tests) keep working.
 func (s *State) BindThread(userID, threadID, windowID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.ThreadBindings[userID] == nil {
 		s.ThreadBindings[userID] = make(map[string]string)
 	}
 	s.ThreadBindings[userID][threadID] = windowID
+	pool := s.pool
+	s.mu.Unlock()
+
+	if pool == nil {
+		return
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	var agentID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM agents WHERE tmux_window=$1 LIMIT 1`,
+		windowID,
+	).Scan(&agentID); err != nil {
+		return // agents row not yet present; tier-3 spawn writes the binding via routing.Resolve
+	}
+	var threadNum int64
+	fmt.Sscanf(threadID, "%d", &threadNum)
+	_, _ = pool.Exec(ctx, `
+		INSERT INTO topic_agent_bindings
+			(topic_id, agent_id, binding_type, user_id, thread_id)
+		VALUES ($1, $2, 'owner', $3, $4)
+		ON CONFLICT (user_id, thread_id) WHERE binding_type='owner' DO UPDATE
+			SET agent_id = EXCLUDED.agent_id
+	`, threadNum, agentID, userID, threadID)
 }
 
 // UnbindThread removes a thread binding for a user.
@@ -133,7 +192,31 @@ func (s *State) UnbindThread(userID, threadID string) {
 }
 
 // GetWindowForThread returns the window ID bound to a thread, if any.
+// Phase B1: when a DB pool is attached, queries topic_agent_bindings
+// JOIN agents so the DB is the authoritative read path; falls back to
+// the in-memory map otherwise (tests and unmigrated callers).
 func (s *State) GetWindowForThread(userID, threadID string) (string, bool) {
+	if pool := s.getPool(); pool != nil {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var wid string
+		err := pool.QueryRow(ctx, `
+			SELECT COALESCE(a.tmux_window,'')
+			FROM topic_agent_bindings b
+			JOIN agents a ON a.id = b.agent_id
+			WHERE b.binding_type='owner'
+			  AND b.user_id=$1 AND b.thread_id=$2
+			LIMIT 1
+		`, userID, threadID).Scan(&wid)
+		if err == nil && wid != "" {
+			return wid, true
+		}
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			// Transient DB hiccup: fall back to map to stay available.
+		} else if err == nil && wid == "" {
+			return "", false
+		}
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if m := s.ThreadBindings[userID]; m != nil {
@@ -144,7 +227,32 @@ func (s *State) GetWindowForThread(userID, threadID string) (string, bool) {
 }
 
 // FindUsersForWindow returns all (userID, threadID) pairs bound to a window.
+// Phase B1: DB-backed query over topic_agent_bindings JOIN agents when
+// pool is set; in-memory map fallback otherwise.
 func (s *State) FindUsersForWindow(windowID string) []UserThread {
+	if pool := s.getPool(); pool != nil {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		rows, err := pool.Query(ctx, `
+			SELECT b.user_id, b.thread_id
+			FROM topic_agent_bindings b
+			JOIN agents a ON a.id = b.agent_id
+			WHERE a.tmux_window = $1
+		`, windowID)
+		if err == nil {
+			defer rows.Close()
+			var out []UserThread
+			for rows.Next() {
+				var ut UserThread
+				if err := rows.Scan(&ut.UserID, &ut.ThreadID); err != nil {
+					return out
+				}
+				out = append(out, ut)
+			}
+			return out
+		}
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var result []UserThread
@@ -228,7 +336,22 @@ func (s *State) SetWindowRunner(windowID, runnerName string) {
 }
 
 // GetWindowRunner returns the runner name for a window, defaulting to "claude".
+// Phase B2: queries agents.runner_type directly when a pool is set;
+// falls back to the in-memory map otherwise.
 func (s *State) GetWindowRunner(windowID string) string {
+	if pool := s.getPool(); pool != nil {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var rt string
+		err := pool.QueryRow(ctx,
+			`SELECT COALESCE(runner_type,'claude') FROM agents WHERE tmux_window=$1 LIMIT 1`,
+			windowID,
+		).Scan(&rt)
+		if err == nil && rt != "" {
+			return rt
+		}
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if name, ok := s.WindowRunners[windowID]; ok {
@@ -245,15 +368,42 @@ func (s *State) ClearWindowRunner(windowID string) {
 }
 
 // SetGroupChatID stores the group chat ID for a user+thread.
+// Phase B5: upserts user_thread_chats when pool is set.
 func (s *State) SetGroupChatID(userID, threadID string, chatID int64) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", userID, threadID)
 	s.GroupChatIDs[key] = chatID
+	pool := s.pool
+	s.mu.Unlock()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	_, _ = pool.Exec(ctx, `
+		INSERT INTO user_thread_chats (user_id, thread_id, chat_id)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (user_id, thread_id) DO UPDATE
+			SET chat_id = EXCLUDED.chat_id, updated_at = NOW()
+	`, userID, threadID, chatID)
 }
 
 // GetGroupChatID returns the group chat ID for a user+thread.
+// Phase B5: reads user_thread_chats when pool is set.
 func (s *State) GetGroupChatID(userID, threadID string) (int64, bool) {
+	if pool := s.getPool(); pool != nil {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var id int64
+		err := pool.QueryRow(ctx,
+			`SELECT chat_id FROM user_thread_chats WHERE user_id=$1 AND thread_id=$2`,
+			userID, threadID,
+		).Scan(&id)
+		if err == nil {
+			return id, true
+		}
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	key := fmt.Sprintf("%s:%s", userID, threadID)
@@ -264,20 +414,56 @@ func (s *State) GetGroupChatID(userID, threadID string) (int64, bool) {
 // RemoveGroupChatID removes the group chat ID for a user+thread.
 func (s *State) RemoveGroupChatID(userID, threadID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	key := fmt.Sprintf("%s:%s", userID, threadID)
 	delete(s.GroupChatIDs, key)
+	pool := s.pool
+	s.mu.Unlock()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	_, _ = pool.Exec(ctx,
+		`DELETE FROM user_thread_chats WHERE user_id=$1 AND thread_id=$2`,
+		userID, threadID)
 }
 
 // BindProject binds a thread to a Minuano project.
+// Phase B4: upserts topic_projects when pool is set.
 func (s *State) BindProject(threadID, projectID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.ProjectBindings[threadID] = projectID
+	pool := s.pool
+	s.mu.Unlock()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	_, _ = pool.Exec(ctx, `
+		INSERT INTO topic_projects (thread_id, project_id)
+		VALUES ($1, $2)
+		ON CONFLICT (thread_id) DO UPDATE
+			SET project_id = EXCLUDED.project_id, updated_at = NOW()
+	`, threadID, projectID)
 }
 
 // GetProject returns the Minuano project for a thread.
+// Phase B4: reads topic_projects when pool is set.
 func (s *State) GetProject(threadID string) (string, bool) {
+	if pool := s.getPool(); pool != nil {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var p string
+		err := pool.QueryRow(ctx,
+			`SELECT project_id FROM topic_projects WHERE thread_id=$1`,
+			threadID,
+		).Scan(&p)
+		if err == nil {
+			return p, true
+		}
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	p, ok := s.ProjectBindings[threadID]
@@ -287,8 +473,15 @@ func (s *State) GetProject(threadID string) (string, bool) {
 // RemoveProject removes the project binding for a thread.
 func (s *State) RemoveProject(threadID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.ProjectBindings, threadID)
+	pool := s.pool
+	s.mu.Unlock()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	_, _ = pool.Exec(ctx, `DELETE FROM topic_projects WHERE thread_id=$1`, threadID)
 }
 
 // SetWindowDisplayName sets the display name for a window.
@@ -351,14 +544,54 @@ func (s *State) AllBoundWindowIDs() map[string]bool {
 }
 
 // SetWorktreeInfo stores worktree metadata for a thread.
+// Phase B3: upserts window_worktrees when pool is set.
 func (s *State) SetWorktreeInfo(threadID string, wi WorktreeInfo) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.WorktreeBindings[threadID] = wi
+	pool := s.pool
+	s.mu.Unlock()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	_, _ = pool.Exec(ctx, `
+		INSERT INTO window_worktrees
+			(thread_id, worktree_dir, branch, repo_root, base_branch, task_id, is_merge_topic)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''), $7)
+		ON CONFLICT (thread_id) DO UPDATE SET
+			worktree_dir    = EXCLUDED.worktree_dir,
+			branch          = EXCLUDED.branch,
+			repo_root       = EXCLUDED.repo_root,
+			base_branch     = EXCLUDED.base_branch,
+			task_id         = EXCLUDED.task_id,
+			is_merge_topic  = EXCLUDED.is_merge_topic,
+			updated_at      = NOW()
+	`, threadID, wi.WorktreeDir, wi.Branch, wi.RepoRoot, wi.BaseBranch, wi.TaskID, wi.IsMergeTopic)
 }
 
 // GetWorktreeInfo returns the worktree info for a thread.
+// Phase B3: reads window_worktrees when pool is set.
 func (s *State) GetWorktreeInfo(threadID string) (WorktreeInfo, bool) {
+	if pool := s.getPool(); pool != nil {
+		ctx, cancel := dbCtx()
+		defer cancel()
+		var wi WorktreeInfo
+		var taskID *string
+		err := pool.QueryRow(ctx, `
+			SELECT worktree_dir, branch, repo_root, base_branch,
+			       COALESCE(task_id,''), is_merge_topic
+			FROM window_worktrees WHERE thread_id=$1
+		`, threadID).Scan(&wi.WorktreeDir, &wi.Branch, &wi.RepoRoot,
+			&wi.BaseBranch, &taskID, &wi.IsMergeTopic)
+		if err == nil {
+			if taskID != nil {
+				wi.TaskID = *taskID
+			}
+			return wi, true
+		}
+	}
+
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	wi, ok := s.WorktreeBindings[threadID]
@@ -368,8 +601,15 @@ func (s *State) GetWorktreeInfo(threadID string) (WorktreeInfo, bool) {
 // RemoveWorktreeInfo removes worktree metadata for a thread.
 func (s *State) RemoveWorktreeInfo(threadID string) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	delete(s.WorktreeBindings, threadID)
+	pool := s.pool
+	s.mu.Unlock()
+	if pool == nil {
+		return
+	}
+	ctx, cancel := dbCtx()
+	defer cancel()
+	_, _ = pool.Exec(ctx, `DELETE FROM window_worktrees WHERE thread_id=$1`, threadID)
 }
 
 // AllWorktreeThreadIDs returns all thread IDs that have worktree bindings.
