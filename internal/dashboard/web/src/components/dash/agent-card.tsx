@@ -23,7 +23,11 @@ export function agentStatusDot(a: AgentListItem, now = Date.now()): DotColor {
   ) {
     return "gray";
   }
-  if (a.stop_requested || !a.tmux_window) return "red";
+  // stop_requested or missing tmux_window (null/"") → red — agent is
+  // tombstoned or awaiting respawn.
+  if (a.stop_requested || !a.tmux_window || a.tmux_window === "") {
+    return "red";
+  }
   const seenMs = new Date(a.last_seen).getTime();
   const ageSec = (now - seenMs) / 1000;
   return ageSec < 30 ? "green" : "amber";

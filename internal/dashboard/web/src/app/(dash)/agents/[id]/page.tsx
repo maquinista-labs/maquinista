@@ -3,7 +3,9 @@
 
 import { notFound } from "next/navigation";
 
+import { AgentActions } from "@/components/dash/agent-actions";
 import { AgentDetailTabs } from "@/components/dash/agent-detail-tabs";
+import { Composer } from "@/components/dash/composer";
 import { getPool } from "@/lib/db";
 import { getAgent } from "@/lib/queries";
 
@@ -44,6 +46,9 @@ export default async function AgentDetailPage(props: {
             {agent.model ? ` · ${agent.model}` : ""}
           </span>
         )}
+        <div className="ml-auto">
+          <AgentActions agentId={id} />
+        </div>
       </header>
 
       {error && (
@@ -55,7 +60,12 @@ export default async function AgentDetailPage(props: {
         </p>
       )}
 
-      {!error && <AgentDetailTabs agentId={id} />}
+      {!error && (
+        <>
+          <AgentDetailTabs agentId={id} />
+          <Composer agentId={id} />
+        </>
+      )}
     </section>
   );
 }

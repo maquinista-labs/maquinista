@@ -182,23 +182,32 @@ async function startPostgres(): Promise<{ url: string; container: string }> {
 
   const url = `postgres://maquinista:maquinista@127.0.0.1:${pgPort}/maquinistadb?sslmode=disable`;
 
-  // Wait for Postgres to accept connections.
-  const deadline = Date.now() + 30_000;
+  // Wait for Postgres to accept TCP connections. pg_isready over
+  // the unix socket returns success before the TCP listener is up,
+  // so we probe -h localhost explicitly.
+  const deadline = Date.now() + 60_000;
+  let ready = false;
   while (Date.now() < deadline) {
     try {
       await execFileP("docker", [
         "exec",
         container,
         "pg_isready",
+        "-h",
+        "localhost",
         "-U",
         "maquinista",
         "-d",
         "maquinistadb",
       ]);
+      ready = true;
       break;
     } catch {
       await sleep(250);
     }
+  }
+  if (!ready) {
+    throw new Error("Postgres did not become ready within 60 s");
   }
 
   // Apply every .sql migration in order using the container's psql.
@@ -224,6 +233,8 @@ async function startPostgres(): Promise<{ url: string; container: string }> {
           "-i",
           container,
           "psql",
+          "-h",
+          "localhost",
           "-U",
           "maquinista",
           "-d",
