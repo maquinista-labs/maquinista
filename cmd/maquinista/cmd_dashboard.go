@@ -106,7 +106,9 @@ plans/active/dashboard.md for the full architecture.`,
 }
 
 var (
-	dashboardStartListen string
+	dashboardStartListen   string
+	dashboardStartNoEmbed  string
+	dashboardStartEmbedDir string
 )
 
 var dashboardStartCmd = &cobra.Command{
@@ -156,6 +158,8 @@ var dashboardLogsCmd = &cobra.Command{
 
 func init() {
 	dashboardStartCmd.Flags().StringVar(&dashboardStartListen, "listen", "", "host:port to bind (overrides MAQUINISTA_DASHBOARD_LISTEN and the default 127.0.0.1:8900)")
+	dashboardStartCmd.Flags().StringVar(&dashboardStartNoEmbed, "no-embed", "", "path to a pre-built Next.js .next/standalone directory (skips the embedded extract step; CI uses this to avoid paying the tarball extract per test)")
+	dashboardStartCmd.Flags().StringVar(&dashboardStartEmbedDir, "embed-dir", "", "override the extraction directory (default ~/.maquinista/dashboard/<version>)")
 	dashboardLogsCmd.Flags().BoolVarP(&dashboardLogsFollow, "follow", "f", false, "follow the log file")
 	dashboardCmd.AddCommand(dashboardStartCmd, dashboardStopCmd, dashboardStatusCmd, dashboardLogsCmd)
 	rootCmd.AddCommand(dashboardCmd)
@@ -215,10 +219,16 @@ func parseListen(listen string) (host string, port string) {
 // and blocks until SIGTERM/SIGINT arrives or the restart budget is
 // exhausted.
 //
-// Phase 0 Commit 0.3: the child is a Node one-liner that serves
-// {"ok":true} on any path (see dashboardHealthcheckScript). Commit
-// 1.6 replaces the one-liner with the extracted Next.js standalone
-// server; the surrounding lifecycle code is identical.
+// Child-process resolution, in priority order:
+//  1. --no-embed <dir>: run `node server.js` from <dir>. Used by
+//     CI + local dev to avoid the extract step once a standalone
+//     bundle is sitting in the tree.
+//  2. Real embedded tarball: extract to the cache dir and run
+//     `node <cache>/server.js`.
+//  3. Placeholder tarball: fall back to the Phase 0 Node
+//     healthcheck stub. This keeps `maquinista dashboard start`
+//     working on a fresh clone before `make dashboard-web-package`
+//     has run.
 func runDashboardStart(parentCtx context.Context) error {
 	existing, err := readDashboardPIDFile()
 	if err != nil {
@@ -239,18 +249,24 @@ func runDashboardStart(parentCtx context.Context) error {
 
 	nodeBin := resolveNodeBin()
 	if _, err := config.Load(); err != nil {
-		// Config load is best-effort for Phase 0 — we can run
+		// Config load is best-effort for Phase 0/1 — we can run
 		// without Telegram config. Later phases (e.g. Phase 6
 		// auth via Telegram magic link) will tighten this.
 		_ = err
 	}
 
+	source, err := resolveDashboardChild(nodeBin)
+	if err != nil {
+		return err
+	}
+
 	logPath := dashboardLogFilePath()
 
 	sup := dashboard.New(dashboard.Config{
-		Bin:            nodeBin,
-		Args:           []string{"-e", dashboardHealthcheckScript},
-		Env:            []string{"PORT=" + port, "HOSTNAME=" + host},
+		Bin:            source.Bin,
+		Args:           source.Args,
+		Env:            append([]string{"PORT=" + port, "HOSTNAME=" + host}, source.Env...),
+		WorkDir:        source.WorkDir,
 		LogPath:        logPath,
 		MaxRestarts:    5,
 		RestartWindow:  60 * time.Second,
@@ -264,11 +280,7 @@ func runDashboardStart(parentCtx context.Context) error {
 	ctx, cancel := signal.NotifyContext(parentCtx, syscall.SIGTERM, syscall.SIGINT)
 	defer cancel()
 
-	// A "ready" line on the log or a single successful spawn is
-	// the signal the child is up. For Phase 0 we just log that we
-	// started the supervisor; the healthcheck test confirms the
-	// port is live.
-	fmt.Fprintf(os.Stdout, "dashboard: starting (listen=%s node=%s log=%s)\n", listen, nodeBin, logPath)
+	fmt.Fprintf(os.Stdout, "dashboard: starting (listen=%s source=%s log=%s)\n", listen, source.Kind, logPath)
 
 	runErr := sup.Run(ctx)
 
@@ -281,6 +293,70 @@ func runDashboardStart(parentCtx context.Context) error {
 
 	fmt.Fprintln(os.Stdout, "dashboard: stopped")
 	return nil
+}
+
+// dashboardChildSource describes how to spawn the dashboard's Node
+// child. Kind is a short human-readable tag for logs and tests.
+type dashboardChildSource struct {
+	Kind    string
+	Bin     string
+	Args    []string
+	Env     []string
+	WorkDir string
+}
+
+// resolveDashboardChild picks between --no-embed, the real
+// //go:embed tarball, and the Phase 0 healthcheck stub fallback.
+func resolveDashboardChild(nodeBin string) (dashboardChildSource, error) {
+	// Option 1: --no-embed
+	if dashboardStartNoEmbed != "" {
+		server := filepath.Join(dashboardStartNoEmbed, "server.js")
+		if _, err := os.Stat(server); err != nil {
+			return dashboardChildSource{}, fmt.Errorf("--no-embed %q: %w", dashboardStartNoEmbed, err)
+		}
+		return dashboardChildSource{
+			Kind:    "no-embed:" + dashboardStartNoEmbed,
+			Bin:     nodeBin,
+			Args:    []string{server},
+			WorkDir: dashboardStartNoEmbed,
+		}, nil
+	}
+
+	// Option 3 (checked early): placeholder fallback. Gives the
+	// operator a working healthz on a fresh clone.
+	if dashboard.StandaloneIsPlaceholder() {
+		fmt.Fprintln(os.Stderr, "dashboard: embedded bundle is the NOT_BUILT placeholder; running Phase 0 healthcheck stub (run `make dashboard-web-package` for the real Next server)")
+		return dashboardChildSource{
+			Kind: "stub",
+			Bin:  nodeBin,
+			Args: []string{"-e", dashboardHealthcheckScript},
+		}, nil
+	}
+
+	// Option 2: extract the embedded tarball.
+	dest := dashboardStartEmbedDir
+	if dest == "" {
+		version := dashboard.StandaloneSHA256()
+		// Short prefix is enough to disambiguate across versions.
+		dest = filepath.Join(resolveDashboardDir(), "dashboard", version[:16])
+	}
+	extracted, err := dashboard.ExtractStandalone(dest)
+	if err != nil {
+		return dashboardChildSource{}, fmt.Errorf("extract standalone: %w", err)
+	}
+	if extracted {
+		fmt.Fprintf(os.Stdout, "dashboard: extracted embedded bundle to %s\n", dest)
+	}
+	server := filepath.Join(dest, "server.js")
+	if _, err := os.Stat(server); err != nil {
+		return dashboardChildSource{}, fmt.Errorf("extracted bundle missing server.js at %s: %w", server, err)
+	}
+	return dashboardChildSource{
+		Kind:    "embedded:" + dest,
+		Bin:     nodeBin,
+		Args:    []string{server},
+		WorkDir: dest,
+	}, nil
 }
 
 // runDashboardStop reads the PID file and terminates the recorded
