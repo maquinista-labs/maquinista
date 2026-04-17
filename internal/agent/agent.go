@@ -242,7 +242,10 @@ func Kill(pool *pgxpool.Pool, tmuxSession, agentID string) error {
 	return nil
 }
 
-// KillAll terminates all registered agents.
+// KillAll terminates task-scoped agents (task_id IS NOT NULL) and
+// parks persistent user agents. Persistent rows keep their session_id
+// + soul so the next `./maquinista start` can respawn the panes with
+// --resume <sid> and preserve context. Called by `maquinista stop`.
 func KillAll(pool *pgxpool.Pool, tmuxSession string) error {
 	agents, err := db.ListAgents(pool)
 	if err != nil {
@@ -250,8 +253,27 @@ func KillAll(pool *pgxpool.Pool, tmuxSession string) error {
 	}
 
 	for _, a := range agents {
-		if err := Kill(pool, tmuxSession, a.ID); err != nil {
-			fmt.Printf("warning: failed to kill agent %s: %v\n", a.ID, err)
+		// Task-scoped ephemeral agents are deleted outright — they have
+		// no cross-restart meaning. Same for agents explicitly marked
+		// as executors (non-user roles).
+		if a.TaskID != nil && *a.TaskID != "" {
+			if err := Kill(pool, tmuxSession, a.ID); err != nil {
+				fmt.Printf("warning: failed to kill agent %s: %v\n", a.ID, err)
+			}
+			continue
+		}
+		// Persistent user agents: preserve the row. The tmux window is
+		// about to die with the session; mark status='stopped' and
+		// clear tmux_window so the startup reconcile respawns cleanly.
+		if _, err := pool.Exec(context.Background(), `
+			UPDATE agents
+			SET status = 'stopped',
+			    tmux_window = '',
+			    last_seen = NOW(),
+			    stop_requested = FALSE
+			WHERE id = $1
+		`, a.ID); err != nil {
+			fmt.Printf("warning: park persistent agent %s: %v\n", a.ID, err)
 		}
 	}
 	return nil

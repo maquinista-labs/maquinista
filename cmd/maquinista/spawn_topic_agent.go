@@ -135,7 +135,17 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			log.Printf("spawn_topic_agent: seed memory blocks for %s: %v (continuing)", agentID, err)
 		}
 
-		runnerCmd, env := resolveRunnerCommand(cfg, agentID, cwd, hasSoul)
+		// If an existing agents row carries a runner session_id, we're
+		// respawning the same topic's pane after a stop/start cycle —
+		// hand it to the runner as the resume token so context carries
+		// across restarts.
+		var resumeSessionID string
+		_ = pool.QueryRow(ctx,
+			`SELECT COALESCE(session_id,'') FROM agents WHERE id=$1`,
+			agentID,
+		).Scan(&resumeSessionID)
+
+		runnerCmd, env := resolveRunnerCommand(cfg, agentID, cwd, hasSoul, resumeSessionID)
 
 		windowID, err := tmux.NewWindow(cfg.TmuxSessionName, agentID, cwd, runnerCmd, env)
 		if err != nil {
@@ -246,17 +256,16 @@ func tmuxWindowExists(session, windowID string) bool {
 }
 
 // resolveRunnerCommand picks the shell command line for the configured
-// runner. When hasSoul is true and the runner understands a --system-prompt
-// flag (Claude family), the command is rewritten to pull the rendered
-// soul from Postgres at spawn time via shell substitution:
+// runner.
 //
-//	claude … --system-prompt "$(maquinista soul render <agent_id>)"
-//
-// The DB remains the single source of truth per §0 — no prompt files on
-// disk. Runners without that flag (OpenCode) fall back to LaunchCommand;
-// MAQUINISTA_AGENT_ID is still exported so a future runner integration
-// can look up the soul itself.
-func resolveRunnerCommand(cfg *config.Config, agentID, cwd string, hasSoul bool) (string, map[string]string) {
+//  - hasSoul=true and fresh start (resumeSessionID=="") → append
+//    `--system-prompt "$(maquinista soul render <id>)"` for Claude-family
+//    runners. DB is source of truth for identity.
+//  - resumeSessionID != "" → append the runner's "resume this session"
+//    flag (claude/openclaude: --resume <sid>; opencode: --session <sid>)
+//    and SKIP --system-prompt because the resumed session already has
+//    the original system prompt in its history.
+func resolveRunnerCommand(cfg *config.Config, agentID, cwd string, hasSoul bool, resumeSessionID string) (string, map[string]string) {
 	env := map[string]string{
 		"AGENT_ID":    agentID,
 		"RUNNER_TYPE": cfg.DefaultRunner,
@@ -277,6 +286,19 @@ func resolveRunnerCommand(cfg *config.Config, agentID, cwd string, hasSoul bool)
 	}
 
 	cmd := r.LaunchCommand(runner.Config{WorkDir: cwd, Env: env})
+
+	// Resume path: runner-native flag, no soul injection (the stored
+	// session already has it).
+	if resumeSessionID != "" {
+		switch r.Name() {
+		case "claude", "openclaude":
+			return fmt.Sprintf("%s --resume %s", cmd, resumeSessionID), env
+		case "opencode":
+			return fmt.Sprintf("%s --session %s", cmd, resumeSessionID), env
+		}
+		// Unknown runner — fall through to fresh-launch path.
+	}
+
 	if !hasSoul {
 		return cmd, env
 	}

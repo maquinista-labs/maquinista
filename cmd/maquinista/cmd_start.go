@@ -199,6 +199,19 @@ func runStart() error {
 		// up stragglers from pre-Phase-B installs so operators stop
 		// inspecting a stale file that no longer reflects reality.
 		_ = os.Remove(filepath.Join(cfg.MaquinistaDir, "state.json"))
+
+		// Respawn live agents that survived a previous `maquinista stop`.
+		// Uses --resume <session_id> when the hook has recorded one so
+		// Claude's context carries across restarts.
+		if cwd, cwdErr := resolveStartCWD(cfg); cwdErr == nil {
+			respawnCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+			if n, err := reconcileAgentPanes(respawnCtx, cfg, pool, b.State(), cwd); err != nil {
+				log.Printf("reconcile: %v", err)
+			} else if n > 0 {
+				log.Printf("reconcile: respawned %d agent pane(s) after restart", n)
+			}
+			cancel()
+		}
 	}
 
 	claudeSrc := monitor.NewClaudeSource(cfg, pool, b.State(), ms)
