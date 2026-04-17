@@ -1,465 +1,598 @@
-# Dashboard (mobile-first)
+# Dashboard (React SPA, embedded)
 
-> This plan adheres to §0 of `maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
+> This plan adheres to §0 of `reference/maquinista-v2.md`: **Postgres is
+> the system of record**. No markdown files, no JSON on disk, no
+> dotfiles for persistent state.
 
 ## Context
 
 Today the only way to see what maquinista is doing is:
 
-- `tmux attach` to the session (good for one agent, useless on mobile)
-- `psql` the mailbox tables (bad ergonomics, not observable over cell)
-- Telegram bot admin commands (`/show`, `/inbox`, …) — discoverable but
-  tied to chat scroll, no visuals, no cost view, no checkpoint surface
+- `tmux attach` to the session — fine for one agent, useless on mobile.
+- `psql` the mailbox tables — bad ergonomics, not observable over cell.
+- Telegram bot admin commands — discoverable but tied to chat scroll,
+  no visuals, no cost view, no checkpoint surface.
 
 The operator — usually me, on a phone, during a deploy or a school run
 — needs a glance-view of the fleet: who's running, who's stuck, what
 each agent last said, how much it's cost, and one-tap actions
-(approve / interrupt / rewind). This plan ports the *feature set* of
-the hermes and openclaw dashboards to maquinista's domain model,
-shaped for mobile first.
+(approve / interrupt / rewind). Maquinista's dashboard's primary axis
+is **agent** (one tmux window, per-agent soul / memory / checkpoint /
+worktree), with inbox/outbox/conversations as cross-cutting feeds.
 
-### Reference implementations worth studying
+## Goals
 
-- **hermes-webui (sanchomuzax)** — closest shape for a clean SPA:
-  KPI cards, live session feed, FTS over history, skills browser,
-  WebSocket live updates, dark/light theme.
-- **Hermes HUD** — 13 tabs incl. cost-per-model, keyboard palette.
-- **openclaw-dashboard (mudrii)** — zero-deps Go-style layout with
-  live top metrics bar, cost donut, cron table, AI chat, 6 themes.
-- **openclaw-dashboard (tugcantopaloglu)** — production-grade auth
-  (TOTP + PBKDF2), Docker admin, config editor.
-- **ClawMetry** — observability / flow-graph Grafana-style.
+1. Operator gets a **mobile-first**, live, readable view of the fleet
+   without opening tmux or psql.
+2. Ships as part of the single Go binary. One command: `./maquinista
+   dashboard start`.
+3. Frontend built on a stack the operator is productive in (React +
+   TypeScript + shadcn/ui).
+4. **Every user journey is covered by an automated integration test**
+   that boots the Go binary against an ephemeral Postgres and drives
+   the real UI. This is non-negotiable; regressions are caught by CI.
+5. Phases are small and independently shippable; each phase lands via
+   a handful of ~100-line commits, each green on `make test`.
 
-Maquinista's dashboard should land closer to the **mudrii** shape
-(simple, server-rendered, tiny footprint, embedded) than the SPA
-shape, because (a) it must ship as part of the single Go binary and
-(b) it must be mobile-first by design, not retrofit.
+## Non-goals (for v1)
 
-### What's different about maquinista's domain
+- Multi-tenant auth / roles. Phase 4 adds single-operator auth; SaaS
+  multi-tenancy is punted to `active/productization-saas.md`.
+- Flow-graph / decision-transcript canvas (see ClawMetry). Conversation
+  view + checkpoint timeline together give 80% of the observability.
+- Docker / container admin. Out of scope — maquinista is one binary.
+- AI chat *with the dashboard itself*. Every agent already accepts
+  messages from the composer; dashboard-qua-chatbot is redundant.
 
-Hermes and openclaw are single-agent-centric. Maquinista is multi-
-agent by default (one tmux window per agent, per-agent soul / memory
-/ checkpoint / worktree). The dashboard's primary axis is therefore
-**agent**, not session — with inbox/outbox/conversations as cross-
-cutting feeds.
+---
 
-## Scope
+## Decision needed — sign off before we build
 
-Four phases. Phase 1 delivers a useful read-only dashboard; 2 adds
-metrics and scheduled-job visibility; 3 opens the action surface
-(reply, rewind, spawn); 4 hardens auth for external exposure.
+Two stack choices gate implementation. Both are written up here so we
+can agree before a single file is created. Change either by editing
+this section and re-running the plan.
 
-### Phase 1 — Read-only mobile-first dashboard
+### Decision 1 — Frontend framework
 
-**Stack** (intentionally boring, matches maquinista's "one binary,
-no npm" vibe):
+Fixed constraints:
 
-- Server-rendered **Go html/template** partials.
-- **HTMX** (~14 KB min.gz) for partial reloads and SSE, no SPA build.
-- **Server-Sent Events** for live updates (single GET `/dash/stream`
-  multiplexes all topics; HTTP/2 scales fine; mobile Safari / Chrome
-  both support SSE reliably — WebSocket's duplex isn't needed).
-- **Plain CSS** with CSS custom properties for theming; no tailwind.
-  ~2 KB after gzip for the whole stylesheet.
-- **PWA**: `manifest.webmanifest` + tiny service worker for install-
-  to-home-screen + offline shell (header + "reconnecting…" state).
+- **React + TypeScript.** Operator is fluent in React; TS is table
+  stakes in 2026.
+- **shadcn/ui** for components. It's the de-facto dashboard kit in
+  2026 (copy-paste Radix + Tailwind, owned code, no runtime dep lock-
+  in). Compatible with every option below; not the differentiator.
+- **Builds to static files** that `go:embed` can pull into the binary.
+  No Node runtime at serve time — we won't ship a JS server.
+- **Small output** (< 300 KB gzip for the shell; code-split feature
+  chunks) so the phone loads over cell.
 
-All static assets live under `internal/dashboard/static/` and are
-embedded via `//go:embed`. Zero filesystem reads at runtime.
+Candidate frameworks (React + TS + shadcn):
 
-**Routes** — all under `/dash`:
+| Option | Pros | Cons | Fit for embed |
+|---|---|---|---|
+| **A. Vite 7 + React 19 + TanStack Router + TanStack Query** | Minimal, boring, famously fast dev server. Static SPA build; plain `dist/` embeds cleanly. TanStack Router gives type-safe routes; TanStack Query handles server state + SSE cache invalidation. Every shadcn template "just works". | No SSR (not needed — auth gates the whole thing). Client-side routing means a first-paint flash on slow devices; mitigated by a static shell. | **Excellent.** `dist/` is ~15 files, all hashed, go:embed one-liner. Zero Node at runtime. |
+| **B. Next.js 16 (static export, `output: 'export'`)** | Huge ecosystem, first-class shadcn, RSC story if we ever need it. App Router is familiar. | Static-export mode disables the half of Next.js that makes it interesting (middleware, RSC, route handlers, image optimisation). We'd be using 30% of Next for 100% of its config surface. Bigger bundle than Vite for the same features. | Good. Static export embeds. But we're paying Next's complexity tax to use a subset. |
+| **C. TanStack Start (SPA mode) + shadcn** | Type-safe end-to-end; same router as A but with SSR-capable primitives we could grow into. Vite-based, fast. Official dashboard template with shadcn exists. | Still pre-1.0 in early 2026; API churn risk. SPA mode exists but the framework is SSR-first — we'd be "off-label". | Good in SPA mode. Adds framework surface we don't need today. |
+| **D. Remix / React Router 7 (SPA mode)** | Same router codebase as TanStack Router-adjacent world, proven at scale. SPA mode (`ssr: false`) builds static. | Same "framework surface we don't use" problem as B and C. Smaller dashboard-template ecosystem vs. shadcn than Vite. | OK. No compelling advantage over A for our shape. |
+| **E. Refine + Vite + shadcn** | Batteries-included admin framework: auth, data providers, CRUD scaffolding. Could shave weeks if our domain matched Refine's opinions. | Our domain *doesn't* match: we're not CRUDing resources, we're watching live mailboxes and streaming SSE. Refine's data-provider abstraction fights real-time. | OK. Heavy for what we'd use. |
+| **F. Astro + React islands + shadcn** | Smallest bundle; ships HTML + selective hydration. Great for marketing-shaped apps. | Dashboard is highly interactive and live-updated — the "island" model adds friction for global SSE + route-spanning state. | OK. Wrong shape for a live dashboard. |
+
+**Recommendation: Option A — Vite + React + TanStack Router + TanStack
+Query.** Lowest framework surface, fastest dev loop, cleanest embed,
+boring in the best way. shadcn/ui is pure components — portable
+across all six options, so we keep optionality on the UI layer.
+
+**Pick one before we start:** ☐ A (recommended) ☐ B ☐ C ☐ D ☐ E ☐ F
+
+### Decision 2 — E2E / integration testing framework
+
+User's original ask: Puppeteer. Current state of the art:
+
+| Option | Pros | Cons |
+|---|---|---|
+| **Playwright (chosen)** | Industry default by 2026 (Puppeteer's weekly downloads were overtaken in 2024; Puppeteer is now in maintenance mode). First-class TypeScript. Auto-waiting defaults kill flaky tests. Trace viewer (`playwright show-trace`) + `codegen` cut debugging time by an order of magnitude. Cross-browser (Chromium/Firefox/WebKit) — WebKit catches the mobile-Safari bugs that hit our users. Parallel execution built-in. | Slightly larger install footprint (~200 MB incl. browser binaries); mitigated by `--with-deps chromium` only. |
+| Puppeteer | Simpler API surface if you already know it. Chrome-only by default. | Maintenance-mode release cadence, no built-in test runner (needs Jest/Mocha), no auto-wait — flakes. No WebKit coverage. |
+| Cypress | Great interactive runner; solid for smaller apps. | One-browser-at-a-time; iframes; real-browser clock model fights our SSE streams; slower in CI. |
+
+**Decision: Playwright.** Per operator direction (revision of original
+ask). Trade-off accepted: ~200 MB CI image growth in exchange for
+auto-waiting, trace viewer, WebKit coverage, and a tool that's
+actively maintained.
+
+**Confirm before we start:** ☐ Playwright ☐ Puppeteer ☐ Cypress
+
+### Decision 3 — Process model for `./maquinista dashboard`
+
+The command shape is fixed: `./maquinista dashboard start|stop|status`.
+Implementation has two sensible shapes:
+
+| Option | Pros | Cons |
+|---|---|---|
+| **Standalone process, separate PID file** (`~/.maquinista/dashboard.pid`, default `:8900`) | Clean lifecycle — `start`/`stop` mirror main daemon. Can run dashboard without the bot (useful for observing a Pi-hosted daemon from a laptop). Trivial to reason about: one PID, one listener. | Two processes share a DB pool via `DATABASE_URL` (fine). If the main daemon is offline, action endpoints (composer, kill, rewind) have nothing to act on; dashboard degrades gracefully to read-only. |
+| Embedded goroutine inside `maquinista start` | One PID; no extra command needed. Matches the Phase 3 action path (shares in-process state with the bot). | Can't observe a remote daemon. `dashboard start/stop` becomes weird — you're really controlling a flag on the main process. Harder to hot-reload during development. |
+| Both (flag on `start` + standalone subcommand) | Maximum flex. | Two wire paths to maintain, two integration-test matrices. |
+
+**Recommendation: standalone process.** It's the cleanest fit for the
+operator's `start`/`stop` mental model and it enables the "observe a
+remote Pi daemon from my laptop" case that
+`active/pi-integration.md` implies. We can always add `--dashboard`
+to `maquinista start` later; we cannot remove it once it's there.
+
+**Pick one before we start:** ☐ Standalone (recommended) ☐ Embedded ☐ Both
+
+---
+
+## Chosen stack (assuming the recommendations above)
+
+- **Frontend:** Vite 7 + React 19 + TypeScript 5.7 + shadcn/ui
+  (Radix + Tailwind 4) + TanStack Router + TanStack Query + Zustand
+  for the small amount of genuinely-client UI state (theme,
+  disclosure, drawer).
+- **Charts:** Recharts (shadcn's default, already battle-tested with
+  the component set).
+- **Live updates:** Server-Sent Events (`/dash/api/stream`). Simpler
+  than WebSocket, mobile-friendly, one-way fits our "server pushes
+  events, client re-queries" model. TanStack Query's
+  `invalidateQueries` on each SSE event gives us the refresh story
+  for free.
+- **Backend:** Go `net/http` with `chi` router (already a transitive
+  dep via other packages — confirm during Phase 0). JSON API under
+  `/dash/api/*`. Static assets served from `internal/dashboard/web/
+  dist/` via `//go:embed`.
+- **Tests:** Playwright (integration/E2E) + Vitest + React Testing
+  Library (component/unit) + Go `httptest` (API handlers) +
+  `internal/dbtest.PgContainer` (migrations against real Postgres).
+- **CLI:** `./maquinista dashboard start|stop|status` as a standalone
+  process with its own PID file.
+
+## CLI surface
+
+```text
+maquinista dashboard start   [--listen :8900] [--dev]
+maquinista dashboard stop
+maquinista dashboard status
+```
+
+Behaviour:
+
+- `start` writes `~/.maquinista/dashboard.pid`. Refuses to start if a
+  live PID is already there (same pattern as `cmd_start.go`).
+- `stop` reads the PID file, sends SIGTERM, waits up to 10s, SIGKILLs
+  if needed, removes the PID file. Tolerates a missing/stale file.
+- `status` prints `running (PID N, listen X, uptime Y)` or `not
+  running`. Non-zero exit on "not running" for scripting.
+- `--dev` switches asset resolution from `//go:embed` to a reverse
+  proxy at `http://127.0.0.1:5173` (the Vite dev server). One flag
+  covers local iteration; CI and production always use the embed.
+
+Config (in `internal/config/config.go`, section `Dashboard`):
+
+```go
+type Dashboard struct {
+    Listen   string // default "127.0.0.1:8900"
+    AuthMode string // "none" | "password" | "telegram" — Phase 4
+    ThemeDefault string // "system" | "dark" | "light"
+}
+```
+
+Env vars: `MAQUINISTA_DASHBOARD_LISTEN`,
+`MAQUINISTA_DASHBOARD_AUTH`, `MAQUINISTA_DASHBOARD_THEME`.
+
+## Architecture
 
 ```
-GET  /dash/                        → root, redirect to /dash/agents
-GET  /dash/agents                  → agent list (default landing)
-GET  /dash/agents/{id}             → agent detail (tabs below)
-GET  /dash/agents/{id}/inbox       → inbox rows
-GET  /dash/agents/{id}/outbox      → outbox rows
-GET  /dash/agents/{id}/soul        → soul (from agent_souls, Phase 3 of soul plan)
-GET  /dash/agents/{id}/memory      → blocks + archival memory (memory plan)
-GET  /dash/agents/{id}/checkpoints → git checkpoint timeline (checkpoint plan)
-GET  /dash/conversations           → threaded view across all agents
-GET  /dash/conversations/{id}
-GET  /dash/jobs                    → scheduled_jobs + webhook_handlers tables
-GET  /dash/stream                  → SSE multiplexed live feed
+┌─────────────────────────────────────────────────────────────┐
+│ browser (mobile/desktop)                                     │
+│  ┌─ SPA shell (React) ──────────────────────────────────┐    │
+│  │  TanStack Router · Query · shadcn · Tailwind · SSE   │    │
+│  └──────────────────────────────────────────────────────┘    │
+└──────────────▲─────────────────────────────▲────────────────┘
+               │ JSON  GET /dash/api/*       │ SSE /dash/api/stream
+┌──────────────┴─────────────────────────────┴────────────────┐
+│ maquinista dashboard (Go process)                            │
+│  internal/dashboard/                                         │
+│   server.go    — chi router, static embed, auth middleware   │
+│   api.go       — JSON handlers (agents, inbox, outbox, ...)  │
+│   stream.go    — SSE multiplexer over LISTEN agent_inbox_new,│
+│                  agent_outbox_new, channel_delivery_new,     │
+│                  agent_stop (migration 009 already emits)    │
+│   auth.go      — Phase 4                                     │
+│   web/         — Vite project (src, tests, playwright, dist) │
+│                  dist/ embedded via //go:embed               │
+└──────────────┬───────────────────────────────────────────────┘
+               │ pgx pool (shared with main daemon)
+┌──────────────▼───────────────────────────────────────────────┐
+│ Postgres (system of record)                                  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-Each route returns full HTML on first load and returns *just the
-partial* (header stripped) when HTMX's `HX-Request: true` header is
-present. This is server-side navigation with zero client state.
+The dashboard process **never** writes to tmux directly. Action
+endpoints (Phase 3) write to `agent_inbox` with
+`origin_channel='dashboard'`; the per-agent sidecar consumes them,
+same path as Telegram. This is why the dashboard can run on a
+different host from the daemon.
 
-**Mobile-first layout** — bottom nav (four icons: agents, inbox,
-conversations, jobs), sticky top header with agent/page title, swipe-
-able tabs on detail pages. Breakpoints: 320 px baseline, 768 px
-switches to split pane (list on left, detail on right), 1200 px adds
-a third column (live feed rail). No table HTML on mobile — tables
-collapse to stacked cards via `@media (max-width: 640px)`.
+## Phases
 
-**Agent list** — the primary view. Each agent is one card:
+Each phase is ordered to keep commits small (target ≤150 lines of
+production code per commit; tests can be larger). Every commit is
+green on `make test`. Feature-specific commits are called out with
+`→` bullets so the commit plan is part of the spec.
+
+### Phase 0 — Scaffolding and CLI harness (no UI yet)
+
+**Goal:** `./maquinista dashboard start` binds a port and serves a
+single `/dash/api/healthz` JSON endpoint. No React, no embed yet.
+
+→ **Commit 0.1** `cmd/maquinista/cmd_dashboard.go` — skeleton with
+`start/stop/status` subcommands; PID file helpers mirror
+`cmd_start.go`; no DB yet. Unit tests for PID-file lifecycle.
+
+→ **Commit 0.2** `internal/dashboard/server.go` — chi router, one
+`/dash/api/healthz` handler returning `{"ok":true,"version":...}`.
+`httptest` covers it. Add `Dashboard` struct to `internal/config/
+config.go` with env-var plumbing and a test.
+
+→ **Commit 0.3** Graceful shutdown: `http.Server.Shutdown(ctx)` on
+SIGTERM; test with `signal.Notify` + `t.Cleanup`.
+
+→ **Commit 0.4** `make dashboard-dev` target; docs stub in
+`docs/dashboard.md` (just the CLI surface, one page).
+
+Gate: `./maquinista dashboard start`, `curl 127.0.0.1:8900/dash/api/
+healthz`, `./maquinista dashboard stop` — all green, end-to-end, in
+an integration test.
+
+### Phase 1 — Frontend scaffolding + shadcn + first real route
+
+**Goal:** loading `/dash/` renders an empty, branded shell with a
+bottom nav and an empty "Agents" page, shadcn theme applied, Vite
+dev mode working, go:embed of the prod build working.
+
+→ **Commit 1.1** `internal/dashboard/web/` — `npm create vite@latest
+web -- --template react-ts`, `package.json` pinned. `.gitignore`
+for `node_modules` and `dist`. `make dashboard-web-install`, `make
+dashboard-web-build`, `make dashboard-web-dev` Makefile targets.
+
+→ **Commit 1.2** Tailwind 4 + shadcn init (`npx shadcn@latest
+init`). Add base components: `button`, `card`, `badge`, `dropdown-
+menu`, `sheet`, `tabs`, `toast`. Commit the generated files (per
+shadcn's "you own the code" model).
+
+→ **Commit 1.3** `src/routes/` via TanStack Router (file-based);
+`src/lib/query.ts` for TanStack Query; `src/app.tsx` with bottom
+nav (Agents / Inbox / Conversations / Jobs) + sticky header.
+Three placeholder routes.
+
+→ **Commit 1.4** `internal/dashboard/web/web.go` — `//go:embed
+dist` + `http.FS` wiring with a strip-prefix for `/dash/`. Add
+`--dev` flag that proxies to `127.0.0.1:5173` via
+`httputil.ReverseProxy` when set. Integration test (Go side only)
+asserts `GET /dash/` returns 200 with a non-empty HTML shell.
+
+→ **Commit 1.5** Playwright install + first E2E test:
+`tests/e2e/shell.spec.ts` — launches the Go binary against a
+`dbtest.PgContainer`, navigates to `/dash/`, asserts the page has
+the header and the four bottom-nav items. `make
+dashboard-e2e` target. CI job added.
+
+Gate: opening `/dash/` on a phone shows the empty shell; Playwright
+trace is clean; Lighthouse PWA-ready score ≥ 80 (perf can be
+improved later once there's real content).
+
+### Phase 2 — Read-only Agents view with live SSE
+
+**Goal:** the Agents list renders real rows from Postgres, with
+status dots, and updates within 1s when an agent's state changes.
+
+**Agent card shape** (preserved from prior plan):
 
 ```
 ┌─────────────────────────────┐
-│ ● maquinista     claude 4.6 │   ← status dot (green/amber/red/gray),
-│   last seen 2s ago          │     name, runner+model, last-seen
-│   "Fixing webhook dedup…"   │   ← latest outbox excerpt, 80 chars
-│   #main  #planner  43¢ today│   ← tags: role, soul template, cost
+│ ● maquinista     claude 4.6 │   status dot · name · runner+model
+│   last seen 2s ago          │   relative time from agents.last_seen
+│   "Fixing webhook dedup…"   │   latest outbox excerpt, 80 chars
+│   #main  #planner  43¢ today│   badges: role, soul template, cost
 └─────────────────────────────┘
 ```
 
-Status dot logic:
-- green — `status='running'` AND `last_seen < 30 s ago`
-- amber — `status='running'` AND `last_seen ≥ 30 s`
-- red   — `status='running'` AND `stop_requested` OR `tmux_window` missing
+**Status dot logic** (preserved):
+- green — `status='running'` AND `last_seen < 30s`
+- amber — `status='running'` AND `last_seen ≥ 30s`
+- red   — `status='running'` AND (`stop_requested` OR missing tmux_window)
 - gray  — `status IN ('stopped','archived')`
 
-Unread inbox count badge in the top-right of the card if
-`COUNT(*) WHERE status IN ('pending','processing')` > 0.
+→ **Commit 2.1** `internal/dashboard/api.go` — `GET /dash/api/
+agents` returns `[{id, runner, model, status, last_seen,
+last_outbox_excerpt, role, soul_template, unread_inbox_count}]`.
+Query joins `agents`, `agent_settings`, and the most recent
+`agent_outbox` row. Tested via `httptest` + `dbtest.PgContainer`.
 
-**Conversation view** — chat bubbles, right-aligned for the agent,
-left-aligned for the counterpart (user / peer agent / webhook
-source). Shows `from_kind` as a small icon above each bubble
-(human / agent / scheduled / webhook). Mobile Safari's `::-webkit-
-scrollbar-hide` + sticky composer footer, same shape as iMessage.
+→ **Commit 2.2** `src/features/agents/` — `useAgents()` hook
+(TanStack Query, 30s stale, 5m gc), `AgentCard` component,
+`AgentsPage`. Vitest + RTL snapshot.
 
-**Live updates via SSE** — `/dash/stream` subscribes to the existing
-Postgres triggers (migration 009 already ships `agent_inbox_new`,
-`agent_outbox_new`, `channel_delivery_new`, `agent_stop`) and emits:
+→ **Commit 2.3** `internal/dashboard/stream.go` — SSE endpoint;
+subscribes to PG NOTIFY on `agent_inbox_new`, `agent_outbox_new`,
+`agent_stop`; emits JSON events. Backpressure via per-client
+buffered channel; drop-oldest policy with a `retry:` hint on
+reconnect. `httptest` covers the happy path; a unit test covers
+drop-oldest.
 
-```
-event: agent.status
-data: {"agent_id":"maquinista","status":"running","last_seen":"…"}
+→ **Commit 2.4** `src/lib/sse.ts` — EventSource wrapper with auto-
+reconnect and exponential backoff; on each event, call
+`queryClient.invalidateQueries(['agents'])` scoped to the relevant
+agent. Vitest covers reconnect semantics with a fake EventSource.
 
-event: inbox.new
-data: {"agent_id":"maquinista","id":123,"from_kind":"user","excerpt":"…"}
+→ **Commit 2.5** Playwright test `tests/e2e/agents-live.spec.ts`:
+seeds an agent row → opens the page → asserts the card renders →
+inserts an `agent_outbox` row via `pgx` → asserts the excerpt on
+the card updates within 2s. This is the first full user-journey
+test and the template for every subsequent phase.
 
-event: outbox.new
-data: {"agent_id":"maquinista","id":456,"excerpt":"…"}
-```
+Gate: phone shows the agent list; sending a Telegram message to an
+agent updates the card text within 2s without a page refresh; the
+e2e test above is green locally and in CI.
 
-HTMX swap rules: `hx-swap-oob="beforeend:#agent-<id>-feed"` for
-each event type. No page reload, no client-side state management.
+### Phase 3 — Agent detail with tabs (inbox, outbox, conversation)
 
-**Theming** — three themes (system, dark, light). System follows
-`prefers-color-scheme`. Dark palette: Catppuccin Mocha (validated
-as popular per reference list). Light palette: GitHub default. One
-CSS custom-property block per theme, swap by setting `:root` class.
+**Goal:** tapping an agent opens a detail page with tabs; inbox +
+outbox rows render; conversation view shows threaded bubbles.
 
-### Phase 2 — Metrics, cost, jobs, system health
+→ **Commit 3.1** `GET /dash/api/agents/{id}` — details; `GET /dash/
+api/agents/{id}/inbox` and `.../outbox` with `?before=<cursor>` +
+`?limit=50`. Shared pagination helper in `internal/dashboard/api/
+paginate.go`. httptest coverage.
 
-**KPI strip** at the top of the agent list (horizontal scroll on
-mobile, static row ≥768 px):
+→ **Commit 3.2** `src/features/agents/AgentDetail.tsx` — shadcn
+`Tabs`; three sub-routes under `/agents/$id`. Inbox/outbox use
+`useInfiniteQuery`; intersection-observer triggers the next page.
 
-- Active agents (running / total)
-- Inbox in-flight (pending + processing)
-- Outbox pending
-- Tokens today (input + output, sum across agents)
-- Cost today (USD, running)
-- Cost projected month (linear extrapolation)
+→ **Commit 3.3** `GET /dash/api/conversations/{id}` — threaded
+timeline merging inbox + outbox rows by `created_at` within a
+`conversation_id`. Bubbles right-aligned for the agent, left for
+counterpart.
 
-Cost sourcing: claude runner already streams `usage.input_tokens` /
-`usage.output_tokens` per turn into its stdout. Capture in
-`internal/monitor/cost.go` (already partially exists for outbox
-scraping), write to a new `agent_turn_costs` table:
+→ **Commit 3.4** `src/features/conversations/ConversationView.tsx`
+— chat-style layout; sticky composer-footer stub (disabled until
+Phase 5). Mobile Safari `pb-[env(safe-area-inset-bottom)]`.
 
-```sql
--- migration 020_agent_turn_costs.sql
-CREATE TABLE agent_turn_costs (
-  id               BIGSERIAL PRIMARY KEY,
-  agent_id         TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
-  inbox_id         UUID REFERENCES agent_inbox(id),
-  model            TEXT NOT NULL,
-  input_tokens     INTEGER NOT NULL DEFAULT 0,
-  output_tokens    INTEGER NOT NULL DEFAULT 0,
-  cache_read       INTEGER NOT NULL DEFAULT 0,
-  cache_write      INTEGER NOT NULL DEFAULT 0,
-  input_usd_cents  INTEGER NOT NULL DEFAULT 0,   -- computed at insert from a per-model rate table
-  output_usd_cents INTEGER NOT NULL DEFAULT 0,
-  started_at       TIMESTAMPTZ NOT NULL,
-  finished_at      TIMESTAMPTZ NOT NULL
-);
-CREATE INDEX agent_turn_costs_agent_finished_idx
-  ON agent_turn_costs (agent_id, finished_at DESC);
-```
+→ **Commit 3.5** SSE deltas wire into inbox/outbox queries —
+inserting a row scrolls the feed or shows a "N new messages ↓"
+pill if the operator has scrolled up.
 
-Rates in a seeded lookup (`model_rates(model, input_per_mtok,
-output_per_mtok, cache_read_per_mtok, cache_write_per_mtok,
-effective_from)`) so historical costs stay accurate when pricing
-changes.
+→ **Commit 3.6** Playwright: `tests/e2e/agent-detail.spec.ts`
+asserts tap-through, tab switches, infinite scroll, and live SSE
+insertion of a new outbox row.
 
-Donut chart for cost-by-model: inline SVG, 16 ms to render, no
-charting library.
+### Phase 4 — KPIs, costs, jobs, system health
 
-**Jobs view** — rows from `scheduled_jobs` and `webhook_handlers`
-(migration 010 already has both). Columns on desktop, stacked on
-mobile: `name`, `schedule or path`, `agent`, `last_run_at`,
-`next_run_at`, `enabled`. A row tap opens a detail drawer with the
-prompt template + last N inbox rows the job produced.
+**Goal:** the agents page gains a KPI strip; a Jobs page lists
+scheduled jobs + webhook handlers; a System Health panel exposes
+pool + tmux + disk stats.
 
-**System health panel** — a single card on the agent list page:
+New tables (migrations — small, separately committable):
 
-- Postgres: pool in-use / idle / waiting
-- tmux session: attached / detached windows
-- Maquinista PID + uptime
-- Bot connection: Telegram / Discord (per configured channel)
-- Disk used by worktrees (`du -sh .maquinista/worktrees`)
+- Commit 4.1: `internal/db/migrations/024_agent_turn_costs.sql` —
+  per-turn cost capture (schema as prior plan).
+- Commit 4.2: `internal/db/migrations/025_model_rates.sql` — seed
+  rates so historical costs survive a price change.
+- Commit 4.3: `internal/monitor/cost.go` captures `usage.*_tokens`
+  from the claude runner's stdout on each turn and inserts a row.
+  Unit tests over a stdout fixture.
 
-Refreshed every 5 s via SSE `event: system.health`.
+Then the UI:
 
-**Alerts banner** — inline above the KPI strip when any of:
+- Commit 4.4: `GET /dash/api/kpis` — aggregated today/yesterday.
+- Commit 4.5: `<KpiStrip />` with 6 tiles and a Recharts donut for
+  cost-by-model.
+- Commit 4.6: `GET /dash/api/jobs` + `<JobsPage />` listing
+  `scheduled_jobs` and `webhook_handlers`.
+- Commit 4.7: `GET /dash/api/health` + `<SystemHealthCard />`:
+  pool stats (via `pgxpool.Stat()`), tmux window count, PID uptime,
+  bot connection, disk used by worktrees.
+- Commit 4.8: Playwright — runs 20 fake turns via seeded rows,
+  asserts the KPI strip matches the SQL sum; toggles a job off
+  from the UI and verifies `enabled=FALSE`.
 
-- Any agent stuck in `status='running'` with `last_seen > 5 min`
-- Any inbox row with `attempts >= max_attempts` (dead)
-- Today's cost > configured daily cap
-- Any webhook handler with > N failures in last hour
+### Phase 5 — Action surface (write)
 
-Dismissable per-session; persists across dismissal via
-`dashboard_alerts(id, kind, subject, created_at, dismissed_at,
-operator)` if Phase 4 auth is on.
+**Goal:** the operator can reply, interrupt, kill, respawn, rewind,
+void, reroute, and pin memory from the dashboard.
 
-### Phase 3 — Action surface (write)
-
-Read-only is useful but the operator ends up switching to Telegram
-for actions. Close the loop:
-
-**Composer** — sticky bottom bar on the agent detail and conversation
-views. Enqueues an `agent_inbox` row with
-`from_kind='user', origin_channel='dashboard',
-origin_user_id=<operator>, content.text=<body>`. Uses the existing
-inbox consumer — zero new plumbing.
-
-**Per-agent actions** — long-press (mobile) or right-click (desktop)
-an agent card:
-
-- **Interrupt** — send an inbox row with content marker
-  `content.control='interrupt'`; the runner wrapper sees it and
-  issues Ctrl+C into the tmux window.
-- **Kill** — `UPDATE agents SET stop_requested=TRUE`, relies on
-  `multi-agent-registry.md` Phase 1 reconcile skipping the row.
-- **Respawn** — clear `tmux_window`, next reconcile spawns fresh.
-- **Rewind to checkpoint** — opens a checkpoint picker
-  (`checkpoint-rollback.md` Phase 3), confirms, invokes
-  `POST /dash/api/agents/{id}/rewind`.
-- **Pin memory** — from a memory row, one-tap sets `pinned=TRUE`
-  (agent-memory-db.md Phase 3).
-
-**Per-message actions** — tap a single outbox row:
-
-- **Copy link** — URL with `#outbox-<id>` anchor.
-- **Reroute** — send the same content to a different agent via
-  `@mention` fanout (agent-to-agent-communication.md Phase 1).
-- **Void** — mark `status='voided'`, stops any pending
-  `channel_deliveries` for it.
-
-**Quick-reply presets** — configured in `agent_settings.roster ->>
-'quickReplies'` as an array of `{label, body}`. Rendered as chips
-above the composer (`👍 ship it`, `🔁 try again`, `⛔ stop`). One-tap
-enqueues the inbox row with the preset body. Immediate mobile win —
-no typing on the phone keyboard.
-
-All action endpoints:
+Endpoints (form-encoded, CSRF via double-submit cookie):
 
 ```
-POST /dash/api/agents/{id}/inbox          → new inbox row (composer)
+POST /dash/api/agents/{id}/inbox        composer
 POST /dash/api/agents/{id}/interrupt
 POST /dash/api/agents/{id}/kill
 POST /dash/api/agents/{id}/respawn
-POST /dash/api/agents/{id}/rewind         {checkpoint_id, mode}
+POST /dash/api/agents/{id}/rewind       {checkpoint_id, mode}
 POST /dash/api/outbox/{id}/void
-POST /dash/api/outbox/{id}/reroute        {target_agent}
-POST /dash/api/memory/{id}/pin            {pinned: bool}
+POST /dash/api/outbox/{id}/reroute      {target_agent}
+POST /dash/api/memory/{id}/pin          {pinned: bool}
 ```
 
-CSRF via double-submit cookie (both PWA and desktop-safe); no JSON
-body on inert HTMX forms, just form-encoded.
+Commits 5.1–5.8 map 1:1 to those endpoints. Each commit adds:
+- The Go handler + httptest unit tests.
+- The React affordance (sticky composer, long-press menu, or toast-
+  confirm modal).
+- A Playwright spec that drives the affordance end-to-end and
+  asserts the row appears in `agent_inbox` or the target table.
 
-### Phase 4 — Auth, audit, external exposure
+Quick-reply presets (`agent_settings.roster ->> 'quickReplies'`)
+land in Commit 5.9 as chips above the composer.
 
-Phase 1–3 assume **local-only** binding (`dashboard.listen =
-127.0.0.1:8900` default). Phase 4 makes it safe to expose via
-Tailscale / WireGuard / Cloudflare-Tunnel.
+### Phase 6 — Auth, audit, external exposure
 
-**Auth tiers** (pick per deployment):
+Pick one per deployment: `none` / `password` / `telegram`. Default
+`none` + loopback; `telegram` is the maquinista-native option
+(operator messages the bot `/dash`, receives a magic link with a
+10-minute token — no new credentials to remember).
 
-1. **None** — bind to loopback, trust the network layer (default).
-2. **Password** — PBKDF2-SHA256 (openclaw tugcantopaloglu pattern),
-   stored in `operator_credentials(id, username, pbkdf2_hash,
-   salt, iter, created_at)`. Cookie session in
-   `dashboard_sessions(id, operator_id, token_hash, ua, ip, created_at,
-   expires_at)`.
-3. **Password + TOTP** — same + RFC 6238 TOTP, 30 s window,
-   `operator_credentials.totp_secret`. QR code served at
-   `/dash/setup/totp` once, then locked.
-4. **Telegram-gated** — reuse the existing bot: operator messages the
-   bot `/dash`, receives a one-tap magic link with a 10-minute token.
-   Zero new credentials, perfect for "I'm on my phone and don't
-   remember the password". This is the maquinista-native option —
-   steal it over the other three.
+- Commit 6.1: `migration 026_dashboard_auth.sql` — operator_credentials, dashboard_sessions, dashboard_audit, dashboard_rate_buckets.
+- Commit 6.2: `internal/dashboard/auth.go` — middleware, session
+  cookies, PBKDF2-SHA256 password path.
+- Commit 6.3: Telegram magic-link flow — bot handler in
+  `internal/bot/handlers.go` for `/dash`, dashboard endpoint
+  `GET /dash/auth/magic?token=...` exchanges token for session.
+- Commit 6.4: `<LoginPage />` + `<AuthGate />` in the SPA.
+- Commit 6.5: Audit logging wrapper around every Phase 5 endpoint
+  + `<AuditPage />` under `/dash/audit`.
+- Commit 6.6: Per-operator + per-IP rate limits (60 writes/min).
+- Commit 6.7: Playwright specs for each auth mode — none, password
+  (good/bad password, lockout), telegram (mock the bot webhook).
 
-Default recommendation: **Telegram-gated**, falling back to password
-if the bot is down.
+## Testing strategy
 
-**Audit log**:
+| Layer | Tool | Lives in | Runs in CI |
+|---|---|---|---|
+| Go unit | `go test` | `internal/dashboard/*_test.go` | yes, `make test` |
+| Go integration (real Postgres) | `dbtest.PgContainer` | `internal/dashboard/*_integration_test.go` | yes, under `make test-integration` (Docker-gated) |
+| JS unit / component | Vitest + RTL | `web/src/**/*.test.tsx` | yes, `make dashboard-web-test` |
+| E2E / user journey | **Playwright** | `web/tests/e2e/*.spec.ts` | yes, `make dashboard-e2e` |
 
-```sql
-CREATE TABLE dashboard_audit (
-  id           BIGSERIAL PRIMARY KEY,
-  operator_id  TEXT,                     -- NULL for unauthed local
-  action       TEXT NOT NULL,             -- 'inbox.post', 'agent.kill', …
-  subject      JSONB NOT NULL,            -- {agent_id, outbox_id, …}
-  ua           TEXT,
-  ip           INET,
-  ok           BOOLEAN NOT NULL,
-  error        TEXT,
-  at           TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-CREATE INDEX dashboard_audit_operator_at_idx
-  ON dashboard_audit (operator_id, at DESC);
-CREATE INDEX dashboard_audit_action_at_idx
-  ON dashboard_audit (action, at DESC);
+**Playwright harness** (the spine of the plan):
+
+```
+// web/tests/e2e/support/maquinistad.ts
+export async function startDashboard(t: TestInfo) {
+  const pg = await startPostgresContainer();         // testcontainers
+  await runMigrations(pg.url);
+  const proc = spawn('./maquinista', ['dashboard', 'start',
+                     '--listen', '127.0.0.1:0'],
+                    { env: { DATABASE_URL: pg.url } });
+  const listen = await readLineMatching(proc.stdout, /listen=(\S+)/);
+  t.teardown(async () => { proc.kill(); await pg.stop(); });
+  return { url: `http://${listen}`, pg };
+}
 ```
 
-Every write endpoint in Phase 3 records one row. Surfaced on the
-dashboard itself under `/dash/audit` (operator-scoped view).
+Every E2E spec follows the same shape: `startDashboard(t)` →
+`page.goto(url)` → seed DB via `pg.client` → assert → mutate →
+assert delta.
 
-**Rate limits** — per-operator + per-IP, sliding-window counters in
-a small in-memory ring (or Postgres `dashboard_rate_buckets` if we
-need durability). 60 writes / minute default.
+Test-data fixtures live in `web/tests/e2e/fixtures/*.sql` and are
+applied via raw SQL (no Go-side seeder — keeps the harness thin).
 
-## Mobile-specific decisions
-
-- **No virtualization libraries.** Pagination via `?before=<cursor>`
-  cursor + HTMX `hx-trigger="revealed"` on the last row.
-- **Tap targets ≥ 44 px.** Verified via `min-height: 44px` on every
-  interactive element.
-- **Haptics.** `navigator.vibrate(10)` on destructive action
-  confirmations (kill / void). iOS Safari ignores it gracefully.
-- **Input types.** `inputmode="decimal"` for cost-cap fields,
-  `enterkeyhint="send"` on composer, `autocomplete="off"` on search.
-- **Viewport.** `viewport-fit=cover` for notched phones; respect
-  `env(safe-area-inset-*)` on bottom nav and composer.
-- **Offline shell.** Service worker precaches `/dash/shell.html` (a
-  skeleton with header + reconnecting indicator). Data is always
-  fresh from the server when online; offline shows the last cached
-  agent list + a "stale" banner.
-- **Install prompt.** Custom "Add to home screen" nudge after the
-  operator visits three distinct sessions, dismissable for 30 d.
-- **Pull-to-refresh.** Native browser behaviour retained; SSE makes
-  it rarely needed, but operators expect the gesture.
+**Coverage floor:** every Phase-N "gate" item has a Playwright spec.
+CI fails if a Phase-N commit lands without its spec. This is the
+guardrail that makes "well tested" real.
 
 ## Files
 
 New:
 
-- `internal/dashboard/server.go` — handlers, router, SSE pump.
-- `internal/dashboard/templates/*.html` — layout + per-page partials.
-- `internal/dashboard/static/app.css`
-- `internal/dashboard/static/app.js` — tiny (~3 KB): HTMX, SSE reconnect, theme toggle, haptics.
-- `internal/dashboard/static/manifest.webmanifest`
-- `internal/dashboard/static/sw.js` — service worker (shell cache + offline banner).
-- `internal/dashboard/static/icon-{192,512,maskable}.png`
-- `internal/dashboard/stream.go` — SSE multiplexer subscribing to
-  existing `LISTEN agent_inbox_new` / `agent_outbox_new` /
-  `channel_delivery_new` / `agent_stop` channels.
-- `internal/dashboard/auth.go` — Phase 4 (none / password / TOTP /
-  Telegram-magic-link).
-- `internal/dashboard/audit.go` — Phase 4.
-- `internal/db/migrations/020_agent_turn_costs.sql` (Phase 2)
-- `internal/db/migrations/021_model_rates.sql` (Phase 2)
-- `internal/db/migrations/022_dashboard_auth.sql` (Phase 4)
-- `cmd/maquinista/cmd_dashboard.go` — optional standalone binary
-  subcommand (`maquinista dashboard --listen :8900`) that shares the
-  same DB pool as the main process.
+```
+cmd/maquinista/cmd_dashboard.go           start/stop/status subcmds
+cmd/maquinista/cmd_dashboard_test.go      PID-file + lifecycle tests
+internal/dashboard/server.go              router + middleware
+internal/dashboard/api.go                 JSON handlers
+internal/dashboard/stream.go              SSE multiplexer
+internal/dashboard/auth.go                Phase 6
+internal/dashboard/audit.go               Phase 6
+internal/dashboard/web/web.go             go:embed + dev proxy
+internal/dashboard/web/package.json       (Vite 7)
+internal/dashboard/web/tsconfig.json
+internal/dashboard/web/vite.config.ts
+internal/dashboard/web/tailwind.config.ts
+internal/dashboard/web/playwright.config.ts
+internal/dashboard/web/src/main.tsx
+internal/dashboard/web/src/app.tsx
+internal/dashboard/web/src/routes/...     TanStack Router file tree
+internal/dashboard/web/src/features/...   agents, conversations, jobs
+internal/dashboard/web/src/components/ui  shadcn components (owned)
+internal/dashboard/web/src/lib/{query,sse,api,types}.ts
+internal/dashboard/web/tests/e2e/*.spec.ts
+internal/dashboard/web/tests/e2e/support/maquinistad.ts
+internal/db/migrations/024_agent_turn_costs.sql   Phase 4
+internal/db/migrations/025_model_rates.sql        Phase 4
+internal/db/migrations/026_dashboard_auth.sql     Phase 6
+internal/monitor/cost.go                           Phase 4
+docs/dashboard.md                          operator docs
+```
 
 Modified:
 
-- `cmd/maquinista/cmd_start.go` — optionally start dashboard goroutine
-  alongside the bot (gated on `cfg.Dashboard.Enabled`).
-- `internal/config/config.go` — `Dashboard` section (listen addr,
-  auth mode, theme default, telegram-magic-link TTL).
-- `internal/bot/handlers.go` — Phase 4 Telegram `/dash` command
-  returning a magic-link URL.
+```
+cmd/maquinista/main.go         register dashboardCmd
+internal/config/config.go      Dashboard{} section + env vars
+Makefile                       dashboard-web-install/build/dev/test/e2e
+.gitignore                     internal/dashboard/web/{node_modules,dist,playwright-report}
+.github/workflows/*.yml        install Node + playwright browsers
+README.md                      one-liner pointer to docs/dashboard.md
+```
 
 ## Verification per phase
 
-- **Phase 1** — open `http://127.0.0.1:8900/dash/agents` on phone,
-  see agent cards. Send a Telegram message to the agent; within 1 s
-  the outbox excerpt on the card updates without a refresh. Switch
-  to the conversation view; new message appears as a bubble.
-  Lighthouse mobile score ≥ 90 (perf + accessibility + PWA).
-- **Phase 2** — run the agent for 20 turns; `agent_turn_costs` has
-  20 rows; the KPI strip shows a non-zero "cost today" that matches
-  `SELECT SUM(input_usd_cents + output_usd_cents)/100.0 FROM
-  agent_turn_costs WHERE finished_at::date = CURRENT_DATE`.
-  Toggle a scheduled job off from `/dash/jobs` → `enabled=FALSE`.
-- **Phase 3** — from the phone's lock screen, open the PWA; long-
-  press the agent card; choose "Interrupt". `tmux capture-pane -t
-  maquinista:<agent>` shows Ctrl+C. Type "ship it" in the composer
-  → new inbox row, agent picks it up within 1 s, replies.
-- **Phase 4** — enable `auth=telegram-magic-link`, expose via
-  Tailscale, message the bot `/dash` → receive a URL; tap, authed
-  for 10 min. Any write action logs a `dashboard_audit` row. Second
-  device without auth gets redirected to `/dash/auth`.
+Matches the "Gate" lines at the end of each phase above. All gates
+are Playwright specs; phase is not merged until its spec is green.
 
-## Interaction with other plans
+## Rejected alternatives
 
-- **`multi-agent-registry.md`** — the agent list reads
-  `agents + agent_settings` with the same reconcile predicate.
-  `maquinista agent archive` from the CLI is mirrored by a dashboard
-  action once Phase 3 lands.
-- **`agent-soul-db-state.md`** — soul tab renders `agent_souls` row;
-  `soul edit` flows through the web in Phase 3 (textarea per
-  section, submit re-renders). Injection scanner runs server-side.
-- **`agent-memory-db.md`** — memory tab has two sub-tabs: blocks
-  (editable textarea per block, enforces `char_limit`) and
-  archival (search + pin). Phase 0 of the memory plan is a
-  prerequisite for the blocks UI.
-- **`agent-to-agent-communication.md`** — conversation view naturally
-  handles `from_kind='agent'` rows with an "agent" icon; `kind='a2a'`
-  threads show both participants. Broadcast (`@everyone`) threads
-  render with a participant list collapsible.
-- **`checkpoint-rollback.md`** — checkpoint tab is a vertical
-  timeline; rewind is a confirm-then-POST flow. Conflict prompt from
-  the plan renders as a modal.
-- **`json-state-migration.md`** — irrelevant once that lands; the
-  dashboard just reads Postgres.
-
-## What we deliberately skip (vs reference dashboards)
-
-- **Flow graph / decision transcripts** (ClawMetry). Nice-to-have,
-  big build. Conversation view + checkpoint timeline together
-  already give 80 % of the observability without a canvas renderer.
-- **Docker / container admin** (tugcantopaloglu). Out of scope —
-  maquinista is a single binary.
-- **AI chat over the dashboard** (mudrii). Talking to the dashboard
-  itself is redundant when every agent already accepts messages from
-  the composer.
-- **UFW / fail2ban panels**. Host-level security is the host's job.
-- **6 themes**. Ship 3 (system, dark, light). Theming is CSS custom
-  props; more can be added by operators in userspace.
-- **Keyboard palette with 13 tabs**. Mobile-first means touch-first.
-  Desktop gets `?` to open a shortcut cheatsheet in Phase 2.
+- **Next.js 16 (static export).** Pays Next's complexity tax for a
+  subset of features we actually use. Chosen against in Decision 1.
+- **TanStack Start SPA mode.** Promising but framework is SSR-first
+  and still pre-1.0 in April 2026; re-evaluate in v2.
+- **Refine.** Opinionated around CRUD; fights live-mailbox shape.
+- **Astro + islands.** Wrong fit for a highly-interactive, globally
+  live-updated dashboard.
+- **Puppeteer.** Maintenance-mode by 2026; Playwright overtook it on
+  downloads in 2024, and its auto-wait + WebKit coverage close flake
+  classes Puppeteer cannot. See Decision 2.
+- **Cypress.** Great interactive runner, but one-browser-at-a-time
+  and its synthetic clock model fights our SSE streams.
 
 ## Open questions
 
-1. **Go templates vs Templ vs htmx-only.** Raw `html/template` works
-   but escapes painfully. [`a-h/templ`](https://templ.guide) would
-   be nicer but adds a code-generation step. Start raw, migrate if
-   template size passes ~20 partials.
-2. **SSE vs WebSocket.** SSE is simpler and mobile-friendly but
-   one-way. If Phase 3 write-path needs server-push responses (e.g.
-   "rewind in progress… done"), WebSocket becomes tempting. Defer —
-   use polling on the specific long-running call until pain shows.
-3. **Embedding vs separate binary.** Ship inside the main binary (a
-   goroutine) by default so operators get it for free; `maquinista
-   dashboard --listen …` subcommand is available for split
-   deployments (dashboard on a public host, main on a private one).
-   Same binary, shared `go:embed` assets.
-4. **Charting.** Inline SVG covers donut + sparkline. If we need
-   anything richer (cumulative cost line, response-time histogram),
-   `uplot` is ~40 KB and works on mobile. Decide when the need hits.
-5. **Operator identity.** Phase 4 treats operators as a flat list.
-   Multi-operator / role separation (`viewer` vs `admin`) is
-   deferred; not needed for the single-operator case.
-6. **Export.** Should the dashboard offer JSON/CSV export of
-   conversations, costs, audit? Probably yes for audit + cost, no
-   for conversations (privacy). Ship CSV in Phase 2.
+1. **Tailwind 4 vs 3.** Tailwind 4 is the default for new shadcn
+   projects in 2026 and ships a Lightning-CSS-based engine; decide
+   at Phase 1 whether to pin to v4 or pin conservatively to v3.4 if
+   CI tooling lags.
+2. **TanStack Router vs plain react-router.** Router is TS-sharper
+   but one more library to learn. Plan assumes Router; flipping to
+   react-router v7 is a half-day refactor if the DX is worse.
+3. **Charting.** Recharts covers donut + line + sparkline. If we
+   need anything richer, `uplot` is ~40 KB and works on mobile.
+4. **SSE vs WebSocket.** SSE for the read path (Phase 2–4) is clean.
+   Phase 5 write endpoints are request/response; if they grow long-
+   running responses ("rewind in progress… done"), reconsider WS.
+5. **Hot-reload in dev mode.** Vite HMR handles the React side.
+   Backend hot-reload via `air` or similar is a nice-to-have; punt
+   unless iteration speed bites.
+6. **Operator identity & SaaS.** `active/productization-saas.md`
+   will need Phase 6's auth primitives. Keep `operator_id` in
+   `dashboard_audit` opaque so the migration to tenants is rename-
+   only.
+7. **Export.** CSV export of costs + audit log is probably yes;
+   conversations are no (privacy). Defer to Phase 4/6.
+
+## Interaction with other active plans
+
+- `active/multi-agent-registry.md` — agent list reads the same
+  `agents + agent_settings` view; archive action mirrors the CLI
+  once Phase 5 ships.
+- `active/agent-soul-db-state.md` — soul tab renders `agent_souls`;
+  Phase 5 soul-edit is a textarea-per-section form; injection
+  scanner runs server-side.
+- `active/agent-memory-db.md` — memory tab gets two sub-tabs
+  (blocks, archival); pin toggle is Phase 5. Blocks UI blocks on
+  that plan's Phase 0.
+- `active/agent-to-agent-communication.md` — conversation view
+  already handles `from_kind='agent'`; `kind='a2a'` threads render
+  both participants.
+- `active/checkpoint-rollback.md` — checkpoint tab is a vertical
+  timeline; rewind is a confirm-then-POST flow. Blocked on
+  per-agent sidecar for the rewind write path.
+- `active/per-agent-sidecar.md` — dashboard action endpoints drop
+  `agent_inbox` rows; sidecar consumes them. Dashboard ships
+  before sidecar lands (single-consumer path today is fine); Phase
+  5 read-back ("your message was picked up") lights up once
+  sidecar is real.
+- `active/productization-saas.md` — depends on Phase 6 auth.
+
+---
+
+**Before I touch code I need sign-off on Decisions 1, 2, 3 above.**
+Reply with the picks (e.g. "A / Playwright / Standalone") and I
+start at Phase 0 Commit 0.1.
