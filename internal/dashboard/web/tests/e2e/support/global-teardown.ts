@@ -1,12 +1,21 @@
+import { execFile } from "node:child_process";
 import { rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { promisify } from "node:util";
 
+const execFileP = promisify(execFile);
 const STATE_FILE = path.join(tmpdir(), "maquinista-e2e-state.json");
 
 async function globalTeardown() {
-  let state: { pid: number; homeDir: string } | undefined;
+  let state:
+    | {
+        pid: number;
+        homeDir: string;
+        pgContainer?: string;
+      }
+    | undefined;
   try {
     state = JSON.parse(await readFile(STATE_FILE, "utf8"));
   } catch {
@@ -16,11 +25,10 @@ async function globalTeardown() {
 
   try {
     process.kill(state.pid, "SIGTERM");
-  } catch (err) {
-    // Already dead — fine.
+  } catch {
+    // already dead
   }
 
-  // Poll for exit; SIGKILL after 10 s.
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     try {
@@ -34,6 +42,14 @@ async function globalTeardown() {
     process.kill(state.pid, "SIGKILL");
   } catch {
     /* already gone */
+  }
+
+  if (state.pgContainer) {
+    try {
+      await execFileP("docker", ["rm", "-f", state.pgContainer]);
+    } catch {
+      /* best-effort */
+    }
   }
 
   try {

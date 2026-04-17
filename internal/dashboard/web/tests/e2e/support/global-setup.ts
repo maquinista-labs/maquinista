@@ -13,7 +13,7 @@
 
 import { spawn } from "node:child_process";
 import { createServer } from "node:net";
-import { access, cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { access, cp, mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,6 +21,7 @@ import process from "node:process";
 import { setTimeout as sleep } from "node:timers/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
+import { randomBytes } from "node:crypto";
 
 const execFileP = promisify(execFile);
 
@@ -140,9 +141,124 @@ async function waitForHealthz(url: string, timeoutMs: number) {
   );
 }
 
+async function hasDocker(): Promise<boolean> {
+  try {
+    await execFileP("docker", ["info"], { timeout: 5000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// startPostgres spins up a disposable postgres:16-alpine container
+// on an ephemeral port, applies maquinista migrations against it,
+// and returns the connection URL + container name. The container
+// is torn down in global-teardown via the state file.
+async function startPostgres(): Promise<{ url: string; container: string }> {
+  if (!(await hasDocker())) {
+    throw new Error(
+      "docker not available; Playwright e2e needs Docker for the Postgres fixture",
+    );
+  }
+  const container = `maquinista-e2e-${randomBytes(4).toString("hex")}`;
+  const pgPort = await pickFreePort();
+
+  await execFileP("docker", [
+    "run",
+    "-d",
+    "--rm",
+    "--name",
+    container,
+    "-e",
+    "POSTGRES_DB=maquinistadb",
+    "-e",
+    "POSTGRES_USER=maquinista",
+    "-e",
+    "POSTGRES_PASSWORD=maquinista",
+    "-p",
+    `${pgPort}:5432`,
+    "postgres:16-alpine",
+  ]);
+
+  const url = `postgres://maquinista:maquinista@127.0.0.1:${pgPort}/maquinistadb?sslmode=disable`;
+
+  // Wait for Postgres to accept connections.
+  const deadline = Date.now() + 30_000;
+  while (Date.now() < deadline) {
+    try {
+      await execFileP("docker", [
+        "exec",
+        container,
+        "pg_isready",
+        "-U",
+        "maquinista",
+        "-d",
+        "maquinistadb",
+      ]);
+      break;
+    } catch {
+      await sleep(250);
+    }
+  }
+
+  // Apply every .sql migration in order using the container's psql.
+  const migrationsDir = path.join(
+    REPO_ROOT,
+    "internal",
+    "db",
+    "migrations",
+  );
+  const files = (await readdir(migrationsDir)).filter((f) =>
+    f.endsWith(".sql"),
+  );
+  files.sort();
+  for (const f of files) {
+    const p = path.join(migrationsDir, f);
+    const content = await readFile(p, "utf8");
+    // Pipe via stdin to the container's psql.
+    await new Promise<void>((resolve, reject) => {
+      const psql = spawn(
+        "docker",
+        [
+          "exec",
+          "-i",
+          container,
+          "psql",
+          "-U",
+          "maquinista",
+          "-d",
+          "maquinistadb",
+          "-v",
+          "ON_ERROR_STOP=1",
+          "-q",
+        ],
+        { stdio: ["pipe", "ignore", "inherit"] },
+      );
+      psql.on("exit", (code) =>
+        code === 0
+          ? resolve()
+          : reject(new Error(`migration ${f} failed (exit ${code})`)),
+      );
+      psql.stdin!.end(content);
+    });
+  }
+
+  return { url, container };
+}
+
 async function globalSetup() {
   const bin = await ensureMaquinistaBinary();
   const standalone = await ensureNextStandalone();
+
+  let pg: { url: string; container: string } | undefined;
+  try {
+    pg = await startPostgres();
+  } catch (err) {
+    console.error("[playwright setup] Postgres fixture unavailable:", err);
+    console.error(
+      "[playwright setup] specs that rely on the DB will be skipped",
+    );
+  }
 
   const port = await pickFreePort();
   const listen = `127.0.0.1:${port}`;
@@ -165,6 +281,7 @@ async function globalSetup() {
         ...process.env,
         HOME: homeDir,
         MAQUINISTA_DASHBOARD_LISTEN: listen,
+        ...(pg ? { DATABASE_URL: pg.url } : {}),
       },
       stdio: ["ignore", "inherit", "inherit"],
       detached: false,
@@ -181,12 +298,20 @@ async function globalSetup() {
 
   const url = `http://${listen}`;
   process.env.MAQUINISTA_DASHBOARD_URL = url;
+  if (pg) process.env.MAQUINISTA_DASHBOARD_PG_URL = pg.url;
 
   await waitForHealthz(`${url}/api/healthz`, 60_000);
 
   await writeFile(
     STATE_FILE,
-    JSON.stringify({ pid: child.pid, homeDir, url, listen }),
+    JSON.stringify({
+      pid: child.pid,
+      homeDir,
+      url,
+      listen,
+      pgContainer: pg?.container,
+      pgUrl: pg?.url,
+    }),
     "utf8",
   );
 }

@@ -57,8 +57,17 @@ test.describe("dashboard shell", () => {
   });
 
   test("each placeholder page renders its marker", async ({ page }) => {
+    // /agents became a live page in Phase 2; match either the
+    // agents-list container (has data) or the agents-empty banner
+    // (fresh DB). The remaining three routes are still Phase-1
+    // placeholders.
+    await page.goto("/agents");
+    const agentsLive = page.getByTestId("agents-list");
+    const agentsEmpty = page.getByTestId("agents-empty");
+    const agentsError = page.getByTestId("agents-error");
+    await expect(agentsLive.or(agentsEmpty).or(agentsError)).toBeVisible();
+
     for (const [href, testid] of [
-      ["/agents", "agents-placeholder"],
       ["/inbox", "inbox-placeholder"],
       ["/conversations", "conversations-placeholder"],
       ["/jobs", "jobs-placeholder"],
