@@ -292,6 +292,92 @@ func TestRunDashboardLogs_ReadsFile(t *testing.T) {
 	}
 }
 
+// TestRunDashboardLogs_FollowStreamsAppends asserts --follow streams
+// lines appended after the initial read, and stops when ctx is done.
+func TestRunDashboardLogs_FollowStreamsAppends(t *testing.T) {
+	dir := withDashboardTempDir(t)
+	logDir := filepath.Join(dir, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	logPath := filepath.Join(logDir, "dashboard.log")
+	if err := os.WriteFile(logPath, []byte("initial\n"), 0o644); err != nil {
+		t.Fatalf("seeding log: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	buf := &syncBuffer{}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runDashboardLogs(ctx, buf, true) }()
+
+	// Wait until the initial line is visible to the consumer.
+	waitUntil(t, 2*time.Second, func() bool {
+		return strings.Contains(buf.String(), "initial")
+	}, "initial line never streamed")
+
+	// Append another line.
+	f, err := os.OpenFile(logPath, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open for append: %v", err)
+	}
+	if _, err := f.WriteString("appended\n"); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	f.Close()
+
+	waitUntil(t, 2*time.Second, func() bool {
+		return strings.Contains(buf.String(), "appended")
+	}, "appended line never streamed")
+
+	cancel()
+
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("runDashboardLogs returned %v; want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("runDashboardLogs did not return after ctx cancel")
+	}
+}
+
+// TestRunDashboardLogs_FollowWaitsForFile asserts --follow waits
+// for the log file to appear when it's missing at start.
+func TestRunDashboardLogs_FollowWaitsForFile(t *testing.T) {
+	dir := withDashboardTempDir(t)
+	logDir := filepath.Join(dir, "logs")
+	if err := os.MkdirAll(logDir, 0o755); err != nil {
+		t.Fatalf("mkdir logs: %v", err)
+	}
+	logPath := filepath.Join(logDir, "dashboard.log")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	buf := &syncBuffer{}
+	runDone := make(chan error, 1)
+	go func() { runDone <- runDashboardLogs(ctx, buf, true) }()
+
+	// Wait for the "waiting for file" banner.
+	waitUntil(t, 1*time.Second, func() bool {
+		return strings.Contains(buf.String(), "waiting for")
+	}, "follow did not emit waiting banner")
+
+	// Create the file and append a line.
+	if err := os.WriteFile(logPath, []byte("after-create\n"), 0o644); err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	waitUntil(t, 2*time.Second, func() bool {
+		return strings.Contains(buf.String(), "after-create")
+	}, "line after file-create never streamed")
+
+	cancel()
+	<-runDone
+}
+
 // --- helpers -----------------------------------------------------------------
 
 // startTestChild forks a real child process and registers a cleanup
@@ -354,5 +440,25 @@ func waitUntil(t *testing.T, timeout time.Duration, fn func() bool, msg string) 
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("waitUntil: %s (after %s)", msg, timeout)
+}
+
+// syncBuffer is a goroutine-safe io.Writer used by the --follow
+// tailing tests: runDashboardLogs writes from a child goroutine
+// while the test polls String() from the parent.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 

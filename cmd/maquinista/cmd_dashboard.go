@@ -343,27 +343,109 @@ func runDashboardStatus() (bool, int, error) {
 	return true, pid, nil
 }
 
-// runDashboardLogs tails the dashboard log. Phase 0 Commit 0.5
-// expands this with --follow; Commit 0.1 ships a read-once view that
-// prints an explanatory message if the log file doesn't exist yet.
+// runDashboardLogs prints the dashboard log to out. If follow is
+// true, tails the file until ctx is cancelled — new content is
+// streamed as it's appended.
+//
+// The tailing implementation is a simple poll loop rather than
+// fsnotify: the log file only grows (never rotates mid-run) and
+// polling every 100 ms is negligible. fsnotify would be nice but
+// introduces a cross-platform dependency for marginal benefit.
 func runDashboardLogs(ctx context.Context, out io.Writer, follow bool) error {
 	path := dashboardLogFilePath()
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		fmt.Fprintf(out, "dashboard: no log file at %s (start the dashboard first)\n", path)
-		return nil
-	}
+
+	f, err := os.Open(path)
 	if err != nil {
-		return fmt.Errorf("reading %s: %w", path, err)
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("opening %s: %w", path, err)
+		}
+		if !follow {
+			fmt.Fprintf(out, "dashboard: no log file at %s (start the dashboard first)\n", path)
+			return nil
+		}
+		// --follow: wait for the file to appear.
+		fmt.Fprintf(out, "dashboard: waiting for %s to appear\n", path)
+		f, err = waitForDashboardLog(ctx, path)
+		if err != nil {
+			return err
+		}
 	}
-	if _, err := out.Write(data); err != nil {
-		return err
+	defer f.Close()
+
+	// Dump existing content.
+	if _, err := io.Copy(out, f); err != nil {
+		return fmt.Errorf("reading %s: %w", path, err)
 	}
 	if !follow {
 		return nil
 	}
-	// Commit 0.5 implements --follow. Skeleton returns after a
-	// single read so the flag is callable today.
-	_ = ctx
-	return nil
+
+	// From here on: poll for new content until ctx is cancelled.
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	buf := make([]byte, 32*1024)
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+		}
+
+		// Check whether the file was truncated or recreated (e.g.
+		// supervisor rotated it). If the file's current size is
+		// less than our current offset, re-open from the top.
+		cur, err := f.Seek(0, 1) // SEEK_CUR
+		if err != nil {
+			return fmt.Errorf("seek: %w", err)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			// File was removed — keep waiting rather than erroring.
+			continue
+		}
+		if info.Size() < cur {
+			f.Close()
+			f, err = os.Open(path)
+			if err != nil {
+				return fmt.Errorf("reopen %s: %w", path, err)
+			}
+		}
+
+		for {
+			n, err := f.Read(buf)
+			if n > 0 {
+				if _, werr := out.Write(buf[:n]); werr != nil {
+					return werr
+				}
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return fmt.Errorf("reading %s: %w", path, err)
+			}
+		}
+	}
+}
+
+// waitForDashboardLog polls for the log file to appear. Returns
+// ctx.Err() if the context fires before the file exists.
+func waitForDashboardLog(ctx context.Context, path string) (*os.File, error) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		f, err := os.Open(path)
+		if err == nil {
+			return f, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("opening %s: %w", path, err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
