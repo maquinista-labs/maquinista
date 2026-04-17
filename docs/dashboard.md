@@ -90,7 +90,11 @@ See `plans/active/dashboard.md` for the full phase plan.
 # Fast Go-side suite (supervisor + CLI + integration).
 make dashboard-test
 
-# Playwright E2E (Phase 1 onwards):
+# Real-Next-server integration test (builds the bundle if needed).
+MAQUINISTA_DASHBOARD_NEXT_E2E=1 go test -run RealNext ./cmd/maquinista/ -v
+
+# Playwright E2E. First time on a host:
+#   make dashboard-e2e-install    # Chromium + OS deps (sudo)
 make dashboard-e2e
 ```
 

@@ -9,7 +9,8 @@ DASHBOARD_WEB_DIR := internal/dashboard/web
 .PHONY: build test vet clean \
         dashboard-test \
         dashboard-web-install dashboard-web-dev dashboard-web-build \
-        dashboard-web-package dashboard-web-test dashboard-e2e
+        dashboard-web-package dashboard-web-test \
+        dashboard-e2e dashboard-e2e-install
 
 build:
 	go build $(LDFLAGS) -o $(BINARY) $(BUILD_DIR)
@@ -80,13 +81,16 @@ dashboard-web-test:
 		echo "skip: $(DASHBOARD_WEB_DIR) not scaffolded yet (Phase 1 Commit 1.1)"; \
 	fi
 
-# Playwright end-to-end. Boots the Go binary against dbtest.PgContainer
-# and drives real browser journeys. Requires Docker + Playwright
-# browsers; install with: cd $(DASHBOARD_WEB_DIR) && npx playwright
-# install --with-deps chromium.
+# Playwright end-to-end. The global-setup hook builds the
+# maquinista binary + Next standalone bundle and spawns
+# `maquinista dashboard start` on an ephemeral port; specs drive
+# the running dashboard. Requires Playwright browser binaries
+# (~150 MiB) and their OS deps. On a fresh box:
+#   cd $(DASHBOARD_WEB_DIR) && npx playwright install --with-deps chromium
 dashboard-e2e:
-	@if [ -f $(DASHBOARD_WEB_DIR)/playwright.config.ts ]; then \
-		cd $(DASHBOARD_WEB_DIR) && npx playwright test; \
-	else \
-		echo "skip: Playwright not configured yet (Phase 1 Commit 1.7)"; \
-	fi
+	cd $(DASHBOARD_WEB_DIR) && npx playwright test
+
+# Install Playwright's Chromium binary + OS libs (requires sudo).
+# CI runs this once during image build.
+dashboard-e2e-install:
+	cd $(DASHBOARD_WEB_DIR) && npx playwright install --with-deps chromium
