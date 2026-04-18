@@ -30,7 +30,7 @@ func TestMain(m *testing.M) {
 			PIDPath:    os.Getenv("DAEMONIZE_TEST_PID"),
 			Foreground: true,
 		}
-		err := Run(spec, func(ctx context.Context) error {
+		err := Run(context.Background(), spec, func(ctx context.Context) error {
 			// Print a sentinel line so the parent test can verify the
 			// log pipe is wired.
 			fmt.Println("child: started")
@@ -203,7 +203,7 @@ func TestRunForeground_WritesAndRemovesPID(t *testing.T) {
 	started := make(chan int, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- Run(spec, func(ctx context.Context) error {
+		done <- Run(context.Background(), spec, func(ctx context.Context) error {
 			started <- os.Getpid()
 			<-ctx.Done()
 			return nil
@@ -238,7 +238,7 @@ func TestRunForeground_RefusesWhenAlreadyRunning(t *testing.T) {
 	if err := writePID(spec.PIDPath, os.Getpid()); err != nil {
 		t.Fatalf("writePID: %v", err)
 	}
-	err := Run(spec, func(ctx context.Context) error { return nil })
+	err := Run(context.Background(), spec, func(ctx context.Context) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("Run with live PID = %v; want already-running error", err)
 	}
@@ -250,7 +250,7 @@ func TestRunForeground_CleansStalePID(t *testing.T) {
 		t.Fatalf("writePID: %v", err)
 	}
 	ranCh := make(chan struct{}, 1)
-	err := Run(spec, func(ctx context.Context) error {
+	err := Run(context.Background(), spec, func(ctx context.Context) error {
 		ranCh <- struct{}{}
 		return nil
 	})
@@ -315,7 +315,7 @@ func TestDetach_EndToEnd(t *testing.T) {
 		bannerDone <- buf.String()
 	}()
 
-	if err := Run(spec, func(ctx context.Context) error {
+	if err := Run(context.Background(), spec, func(ctx context.Context) error {
 		t.Fatal("parent should not run work in detach path")
 		return nil
 	}); err != nil {
@@ -417,7 +417,7 @@ func TestDetach_RefusesWhenAlreadyRunning(t *testing.T) {
 	if err := writePID(spec.PIDPath, os.Getpid()); err != nil {
 		t.Fatalf("writePID: %v", err)
 	}
-	err := Run(spec, func(ctx context.Context) error { return nil })
+	err := Run(context.Background(), spec, func(ctx context.Context) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "already running") {
 		t.Fatalf("Run on live PID = %v; want already-running error", err)
 	}

@@ -69,9 +69,15 @@ var buildDetachCmd = func() (*exec.Cmd, error) {
 
 // Run executes work as the daemon's main loop. See the package doc
 // for the two branches (detach vs foreground).
-func Run(spec Spec, work func(ctx context.Context) error) error {
+//
+// In foreground mode, parentCtx is merged with a SIGINT/SIGTERM
+// signal handler — the ctx passed to work is cancelled when either
+// fires. Pass context.Background() if you want signals-only. In
+// detach mode parentCtx is unused (the child installs its own
+// handlers).
+func Run(parentCtx context.Context, spec Spec, work func(ctx context.Context) error) error {
 	if spec.Foreground {
-		return runForeground(spec, work)
+		return runForeground(parentCtx, spec, work)
 	}
 	return detach(spec)
 }
@@ -139,7 +145,7 @@ func Status(spec Spec) (pid int, alive bool, err error) {
 
 // ----- internal -------------------------------------------------------------
 
-func runForeground(spec Spec, work func(ctx context.Context) error) error {
+func runForeground(parentCtx context.Context, spec Spec, work func(ctx context.Context) error) error {
 	existing, err := readPID(spec.PIDPath)
 	if err != nil {
 		return fmt.Errorf("%s: reading PID file: %w", spec.Name, err)
@@ -158,7 +164,10 @@ func runForeground(spec Spec, work func(ctx context.Context) error) error {
 	}
 	defer func() { _ = os.Remove(spec.PIDPath) }()
 
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	if parentCtx == nil {
+		parentCtx = context.Background()
+	}
+	ctx, cancel := signal.NotifyContext(parentCtx, syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 	return work(ctx)
 }

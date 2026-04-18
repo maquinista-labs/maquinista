@@ -5,13 +5,14 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/daemonize"
 	"github.com/maquinista-labs/maquinista/internal/dashboard"
 	"github.com/spf13/cobra"
 )
@@ -75,7 +76,9 @@ func readDashboardPIDFile() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	pid, err := strconv.Atoi(string(data))
+	// daemonize writes with a trailing newline; earlier versions
+	// didn't. Trim whitespace so either format parses.
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
 		return 0, fmt.Errorf("invalid PID file: %w", err)
 	}
@@ -106,10 +109,23 @@ plans/active/dashboard.md for the full architecture.`,
 }
 
 var (
-	dashboardStartListen   string
-	dashboardStartNoEmbed  string
-	dashboardStartEmbedDir string
+	dashboardStartListen     string
+	dashboardStartNoEmbed    string
+	dashboardStartEmbedDir   string
+	dashboardStartForeground bool
 )
+
+// dashboardSpec returns the daemonize.Spec for the dashboard daemon.
+// Path resolution goes through dashboardPIDFilePath / dashboardLogFilePath
+// so tests can override the state directory via SetDashboardDir.
+func dashboardSpec() daemonize.Spec {
+	return daemonize.Spec{
+		Name:       "dashboard",
+		LogPath:    dashboardLogFilePath(),
+		PIDPath:    dashboardPIDFilePath(),
+		Foreground: dashboardStartForeground,
+	}
+}
 
 var dashboardStartCmd = &cobra.Command{
 	Use:   "start",
@@ -160,6 +176,7 @@ func init() {
 	dashboardStartCmd.Flags().StringVar(&dashboardStartListen, "listen", "", "host:port to bind (overrides MAQUINISTA_DASHBOARD_LISTEN and the default 127.0.0.1:8900)")
 	dashboardStartCmd.Flags().StringVar(&dashboardStartNoEmbed, "no-embed", "", "path to a pre-built Next.js .next/standalone directory (skips the embedded extract step; CI uses this to avoid paying the tarball extract per test)")
 	dashboardStartCmd.Flags().StringVar(&dashboardStartEmbedDir, "embed-dir", "", "override the extraction directory (default ~/.maquinista/dashboard/<version>)")
+	dashboardStartCmd.Flags().BoolVarP(&dashboardStartForeground, "foreground", "F", false, "run in the current terminal (default: detach and return immediately)")
 	dashboardLogsCmd.Flags().BoolVarP(&dashboardLogsFollow, "follow", "f", false, "follow the log file")
 	dashboardCmd.AddCommand(dashboardStartCmd, dashboardStopCmd, dashboardStatusCmd, dashboardLogsCmd)
 	rootCmd.AddCommand(dashboardCmd)
@@ -215,9 +232,12 @@ func parseListen(listen string) (host string, port string) {
 	return "127.0.0.1", listen
 }
 
-// runDashboardStart spawns the Node child via dashboard.Supervisor
-// and blocks until SIGTERM/SIGINT arrives or the restart budget is
-// exhausted.
+// runDashboardStart drives the dashboard lifecycle. Default behavior
+// is to detach: re-exec with --foreground appended, redirect the
+// child's stdio to dashboard.log, print the child PID, and return.
+// With --foreground, we supervise the Node child inline and block
+// until ctx is cancelled, SIGTERM/SIGINT arrives, or the restart
+// budget is exhausted.
 //
 // Child-process resolution, in priority order:
 //  1. --no-embed <dir>: run `node server.js` from <dir>. Used by
@@ -230,30 +250,35 @@ func parseListen(listen string) (host string, port string) {
 //     working on a fresh clone before `make dashboard-web-package`
 //     has run.
 func runDashboardStart(parentCtx context.Context) error {
-	existing, err := readDashboardPIDFile()
-	if err != nil {
-		return fmt.Errorf("reading PID file: %w", err)
-	}
-	if existing != 0 {
-		if dashboardProcessAlive(existing) {
-			return fmt.Errorf("dashboard is already running (PID %d); use 'maquinista dashboard stop' first", existing)
-		}
-		removeDashboardPIDFile()
-	}
-
+	// Cheap pre-flight validations run in both paths so bad input
+	// surfaces in the user's terminal rather than in a log file the
+	// detached child is the only one writing.
 	listen := resolveDashboardListen()
-	host, port := parseListen(listen)
-	if port == "" {
+	if _, port := parseListen(listen); port == "" {
 		return fmt.Errorf("invalid --listen %q (expected host:port)", listen)
 	}
-
-	nodeBin := resolveNodeBin()
-	if _, err := config.Load(); err != nil {
-		// Config load is best-effort for Phase 0/1 — we can run
-		// without Telegram config. Later phases (e.g. Phase 6
-		// auth via Telegram magic link) will tighten this.
-		_ = err
+	if dashboardStartNoEmbed != "" {
+		server := filepath.Join(dashboardStartNoEmbed, "server.js")
+		if _, err := os.Stat(server); err != nil {
+			return fmt.Errorf("--no-embed %q: %w", dashboardStartNoEmbed, err)
+		}
 	}
+
+	return daemonize.Run(parentCtx, dashboardSpec(), func(ctx context.Context) error {
+		return superviseDashboard(ctx, listen)
+	})
+}
+
+// superviseDashboard is the dashboard's foreground worker: resolve
+// the Node child, spin up dashboard.Supervisor, and block on it.
+// Invoked from daemonize.Run's foreground branch (either because
+// the operator passed --foreground, or because we are the re-exec'd
+// detached child).
+func superviseDashboard(ctx context.Context, listen string) error {
+	host, port := parseListen(listen)
+	nodeBin := resolveNodeBin()
+	// Config load is best-effort — see the original Phase 0 comment.
+	_, _ = config.Load()
 
 	source, err := resolveDashboardChild(nodeBin)
 	if err != nil {
@@ -261,7 +286,6 @@ func runDashboardStart(parentCtx context.Context) error {
 	}
 
 	logPath := dashboardLogFilePath()
-
 	sup := dashboard.New(dashboard.Config{
 		Bin:            source.Bin,
 		Args:           source.Args,
@@ -273,24 +297,13 @@ func runDashboardStart(parentCtx context.Context) error {
 		RestartBackoff: 500 * time.Millisecond,
 	})
 
-	if err := writeDashboardPIDFile(os.Getpid()); err != nil {
-		return fmt.Errorf("writing PID file: %w", err)
-	}
-
-	ctx, cancel := signal.NotifyContext(parentCtx, syscall.SIGTERM, syscall.SIGINT)
-	defer cancel()
-
 	fmt.Fprintf(os.Stdout, "dashboard: starting (listen=%s source=%s log=%s)\n", listen, source.Kind, logPath)
 
 	runErr := sup.Run(ctx)
-
-	removeDashboardPIDFile()
-
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "dashboard: supervisor error: %v\n", runErr)
 		return runErr
 	}
-
 	fmt.Fprintln(os.Stdout, "dashboard: stopped")
 	return nil
 }
@@ -359,169 +372,47 @@ func resolveDashboardChild(nodeBin string) (dashboardChildSource, error) {
 	}, nil
 }
 
-// runDashboardStop reads the PID file and terminates the recorded
-// process with SIGTERM, escalating to SIGKILL after a 10 s grace.
-// Tolerates missing / stale PID files (returns nil with a message).
+// runDashboardStop delegates to daemonize.Stop. Output mirrors the
+// previous inline behaviour so operator tooling / tests see the same
+// strings.
 func runDashboardStop() error {
-	pid, err := readDashboardPIDFile()
+	spec := dashboardSpec()
+	pid, alive, err := daemonize.Status(spec)
 	if err != nil {
 		return fmt.Errorf("reading PID file: %w", err)
 	}
-	if pid == 0 {
+	if pid == 0 && !alive {
+		// Either no PID file or a stale one. Stop will clean up the
+		// stale file if present.
+		_ = daemonize.Stop(spec, 10*time.Second)
+		// Distinguish "no file" from "stale" in operator output.
+		if _, statErr := os.Stat(spec.PIDPath); statErr == nil {
+			// Shouldn't happen after Stop, but be safe.
+			fmt.Fprintln(os.Stdout, "dashboard: not running")
+			return nil
+		}
 		fmt.Fprintln(os.Stdout, "dashboard: not running")
 		return nil
 	}
-	if !dashboardProcessAlive(pid) {
-		removeDashboardPIDFile()
-		fmt.Fprintf(os.Stdout, "dashboard: stale PID %d cleaned up\n", pid)
-		return nil
+	if err := daemonize.Stop(spec, 10*time.Second); err != nil {
+		return err
 	}
-
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("finding process %d: %w", pid, err)
-	}
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
-		return fmt.Errorf("sending SIGTERM to %d: %w", pid, err)
-	}
-
-	deadline := time.Now().Add(10 * time.Second)
-	for time.Now().Before(deadline) {
-		if !dashboardProcessAlive(pid) {
-			removeDashboardPIDFile()
-			fmt.Fprintf(os.Stdout, "dashboard: stopped (PID %d)\n", pid)
-			return nil
-		}
-		time.Sleep(250 * time.Millisecond)
-	}
-
-	_ = proc.Signal(syscall.SIGKILL)
-	// Give SIGKILL a beat to take effect before removing the PID file
-	// so a racing status check reports honest state.
-	for i := 0; i < 20 && dashboardProcessAlive(pid); i++ {
-		time.Sleep(100 * time.Millisecond)
-	}
-	removeDashboardPIDFile()
-	fmt.Fprintf(os.Stdout, "dashboard: killed (PID %d, did not respond to SIGTERM)\n", pid)
+	fmt.Fprintf(os.Stdout, "dashboard: stopped (PID %d)\n", pid)
 	return nil
 }
 
 // runDashboardStatus returns (running, pid, err). Caller decides how
 // to render / exit-code.
 func runDashboardStatus() (bool, int, error) {
-	pid, err := readDashboardPIDFile()
+	pid, alive, err := daemonize.Status(dashboardSpec())
 	if err != nil {
 		return false, 0, fmt.Errorf("reading PID file: %w", err)
 	}
-	if pid == 0 || !dashboardProcessAlive(pid) {
-		return false, 0, nil
-	}
-	return true, pid, nil
+	return alive, pid, nil
 }
 
 // runDashboardLogs prints the dashboard log to out. If follow is
-// true, tails the file until ctx is cancelled — new content is
-// streamed as it's appended.
-//
-// The tailing implementation is a simple poll loop rather than
-// fsnotify: the log file only grows (never rotates mid-run) and
-// polling every 100 ms is negligible. fsnotify would be nice but
-// introduces a cross-platform dependency for marginal benefit.
+// true, tails the file until ctx is cancelled.
 func runDashboardLogs(ctx context.Context, out io.Writer, follow bool) error {
-	path := dashboardLogFilePath()
-
-	f, err := os.Open(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return fmt.Errorf("opening %s: %w", path, err)
-		}
-		if !follow {
-			fmt.Fprintf(out, "dashboard: no log file at %s (start the dashboard first)\n", path)
-			return nil
-		}
-		// --follow: wait for the file to appear.
-		fmt.Fprintf(out, "dashboard: waiting for %s to appear\n", path)
-		f, err = waitForDashboardLog(ctx, path)
-		if err != nil {
-			return err
-		}
-	}
-	defer f.Close()
-
-	// Dump existing content.
-	if _, err := io.Copy(out, f); err != nil {
-		return fmt.Errorf("reading %s: %w", path, err)
-	}
-	if !follow {
-		return nil
-	}
-
-	// From here on: poll for new content until ctx is cancelled.
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	buf := make([]byte, 32*1024)
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case <-ticker.C:
-		}
-
-		// Check whether the file was truncated or recreated (e.g.
-		// supervisor rotated it). If the file's current size is
-		// less than our current offset, re-open from the top.
-		cur, err := f.Seek(0, 1) // SEEK_CUR
-		if err != nil {
-			return fmt.Errorf("seek: %w", err)
-		}
-		info, err := os.Stat(path)
-		if err != nil {
-			// File was removed — keep waiting rather than erroring.
-			continue
-		}
-		if info.Size() < cur {
-			f.Close()
-			f, err = os.Open(path)
-			if err != nil {
-				return fmt.Errorf("reopen %s: %w", path, err)
-			}
-		}
-
-		for {
-			n, err := f.Read(buf)
-			if n > 0 {
-				if _, werr := out.Write(buf[:n]); werr != nil {
-					return werr
-				}
-			}
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				return fmt.Errorf("reading %s: %w", path, err)
-			}
-		}
-	}
-}
-
-// waitForDashboardLog polls for the log file to appear. Returns
-// ctx.Err() if the context fires before the file exists.
-func waitForDashboardLog(ctx context.Context, path string) (*os.File, error) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		f, err := os.Open(path)
-		if err == nil {
-			return f, nil
-		}
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("opening %s: %w", path, err)
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
-		}
-	}
+	return daemonize.TailLogs(ctx, dashboardSpec(), follow, out)
 }

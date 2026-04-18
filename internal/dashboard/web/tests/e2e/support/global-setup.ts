@@ -282,6 +282,7 @@ async function globalSetup() {
     [
       "dashboard",
       "start",
+      "--foreground",
       "--listen",
       listen,
       "--no-embed",

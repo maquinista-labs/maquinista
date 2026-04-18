@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -16,9 +17,9 @@ import (
 // TestDashboardBinary_StartStopLifecycle is the Phase 0 Commit 0.4
 // gate: builds the real maquinista binary and drives the dashboard
 // through `dashboard start` → curl /api/healthz → `dashboard stop`.
-// This exercises the full operator-facing lifecycle including the
-// PID-file-based stop path (the in-process integration test covers
-// only the ctx-cancel path).
+// Post-D.2 `dashboard start` detaches by default: the invoked
+// process exits immediately after writing the child PID, and the
+// PID file names the detached child — not the CLI we spawned.
 func TestDashboardBinary_StartStopLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not on PATH; skipping binary integration test")
@@ -29,11 +30,7 @@ func TestDashboardBinary_StartStopLifecycle(t *testing.T) {
 
 	bin := buildMaquinistaBinary(t)
 
-	// Isolate the dashboard state directory. We pass it to the
-	// child as MAQUINISTA_DIR_OVERRIDE — but cmd_dashboard.go uses
-	// the user's ~/.maquinista by default. To isolate in a child
-	// process without leaking into ~/.maquinista we set HOME to a
-	// temp dir so the "~" expansion lands there.
+	// HOME override isolates ~/.maquinista to the test's temp dir.
 	home := t.TempDir()
 	port := pickFreePort(t)
 	listen := net.JoinHostPort("127.0.0.1", port)
@@ -43,55 +40,64 @@ func TestDashboardBinary_StartStopLifecycle(t *testing.T) {
 		"MAQUINISTA_DASHBOARD_LISTEN="+listen,
 	)
 
-	// Start the dashboard as a child of the test.
+	// `dashboard start` detaches; its own Wait returns after the
+	// parent prints the banner.
 	start := exec.Command(bin, "dashboard", "start")
 	start.Env = env
 	start.Stdout = os.Stdout
 	start.Stderr = os.Stderr
-
-	if err := start.Start(); err != nil {
-		t.Fatalf("start.Start: %v", err)
+	if err := start.Run(); err != nil {
+		t.Fatalf("dashboard start: %v", err)
 	}
 
-	// Reap the child in a background goroutine so we can assert on
-	// its exit state and avoid zombies.
-	var (
-		waitOnce sync.Once
-		waitErr  error
-	)
-	reaped := make(chan struct{})
-	waitOnce.Do(func() {
-		go func() {
-			waitErr = start.Wait()
-			close(reaped)
-		}()
-	})
-
-	t.Cleanup(func() {
-		if start.Process != nil && dashboardProcessAlive(start.Process.Pid) {
-			_ = start.Process.Signal(syscall.SIGKILL)
-		}
-		<-reaped
-	})
-
-	// Wait for the dashboard to report healthy on /api/healthz.
+	// Wait for the dashboard to report healthy on /api/healthz —
+	// proves the detached child is alive and bound.
 	url := "http://" + listen + "/api/healthz"
 	resp := waitForHealthz(t, url, 15*time.Second)
 	resp.Body.Close()
 
-	// Verify the PID file was created under the override HOME.
+	// Read the PID file — it now holds the detached child's PID,
+	// not start.Process.Pid (that parent already exited).
 	pidFile := filepath.Join(home, ".maquinista", "dashboard.pid")
 	data, err := os.ReadFile(pidFile)
 	if err != nil {
 		t.Fatalf("read %s: %v", pidFile, err)
 	}
-	pid, err := strconv.Atoi(string(data))
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
 	if err != nil {
 		t.Fatalf("PID file contents %q not an int: %v", data, err)
 	}
-	if pid != start.Process.Pid {
-		t.Fatalf("PID file = %d; want start.Process.Pid=%d", pid, start.Process.Pid)
+	if !dashboardProcessAlive(pid) {
+		t.Fatalf("detached child PID %d from %s is not alive", pid, pidFile)
 	}
+
+	// Reap the detached child in case `dashboard stop` fails below.
+	// The kernel parent is this test process (detach's Release only
+	// disowns Go bookkeeping), so we need Wait4 to reap its zombie
+	// when it exits.
+	reaped := make(chan struct{})
+	go func() {
+		defer close(reaped)
+		for {
+			var ws syscall.WaitStatus
+			wpid, err := syscall.Wait4(pid, &ws, 0, nil)
+			if err != nil {
+				return
+			}
+			if wpid == pid {
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		if dashboardProcessAlive(pid) {
+			_ = syscall.Kill(pid, syscall.SIGKILL)
+		}
+		select {
+		case <-reaped:
+		case <-time.After(5 * time.Second):
+		}
+	})
 
 	// Status subcommand should report running.
 	status := exec.Command(bin, "dashboard", "status")
@@ -104,7 +110,7 @@ func TestDashboardBinary_StartStopLifecycle(t *testing.T) {
 		t.Fatalf("status output = %q; want 'running' + PID", statusOut)
 	}
 
-	// Stop subcommand should terminate the dashboard gracefully.
+	// Stop subcommand should terminate the detached child.
 	stop := exec.Command(bin, "dashboard", "stop")
 	stop.Env = env
 	stopOut, stopErr := stop.CombinedOutput()
@@ -112,25 +118,13 @@ func TestDashboardBinary_StartStopLifecycle(t *testing.T) {
 		t.Fatalf("dashboard stop: %v\n%s", stopErr, stopOut)
 	}
 
-	// The start process should exit within the grace window.
+	// The detached child should exit within the grace window. We
+	// observe via the reaper goroutine (the child becomes a zombie,
+	// Wait4 succeeds, reaped closes).
 	select {
 	case <-reaped:
 	case <-time.After(15 * time.Second):
-		t.Fatal("dashboard start process did not exit after `dashboard stop`")
-	}
-
-	if waitErr != nil {
-		// A SIGTERM-induced exit is represented as "signal: terminated"
-		// on the error; the supervisor's clean path returns nil exit.
-		// Either is acceptable for this test.
-		exitErr, ok := waitErr.(*exec.ExitError)
-		if !ok {
-			t.Fatalf("start exit error = %v (not *ExitError)", waitErr)
-		}
-		if exitErr.ExitCode() < 0 {
-			// Negative exit code means the process was signalled;
-			// that's expected when the supervisor sends SIGTERM.
-		}
+		t.Fatal("detached dashboard child did not exit after `dashboard stop`")
 	}
 
 	// PID file should be gone.
@@ -157,7 +151,9 @@ func TestDashboardBinary_StartStopLifecycle(t *testing.T) {
 }
 
 // TestDashboardBinary_RefusesDoubleStart asserts that a second
-// `dashboard start` fails while the first is live.
+// `dashboard start` fails while the first is live. Post-D.2 the
+// "first" is a detached child; the CLI process that spawned it
+// exits immediately.
 func TestDashboardBinary_RefusesDoubleStart(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not on PATH; skipping binary integration test")
@@ -174,21 +170,29 @@ func TestDashboardBinary_RefusesDoubleStart(t *testing.T) {
 
 	first := exec.Command(bin, "dashboard", "start")
 	first.Env = env
-	if err := first.Start(); err != nil {
-		t.Fatalf("first.Start: %v", err)
+	if err := first.Run(); err != nil {
+		t.Fatalf("first dashboard start: %v", err)
 	}
-	firstReaped := make(chan struct{})
-	go func() { _ = first.Wait(); close(firstReaped) }()
-	t.Cleanup(func() {
-		if first.Process != nil && dashboardProcessAlive(first.Process.Pid) {
-			_ = first.Process.Signal(syscall.SIGTERM)
-		}
-		<-firstReaped
-	})
 
 	url := "http://" + listen + "/api/healthz"
 	resp := waitForHealthz(t, url, 15*time.Second)
 	resp.Body.Close()
+
+	// Reap the detached child on cleanup.
+	pidFile := filepath.Join(home, ".maquinista", "dashboard.pid")
+	pidData, _ := os.ReadFile(pidFile)
+	childPID, _ := strconv.Atoi(strings.TrimSpace(string(pidData)))
+	if childPID > 0 {
+		t.Cleanup(func() {
+			if dashboardProcessAlive(childPID) {
+				_ = syscall.Kill(childPID, syscall.SIGTERM)
+			}
+			// Best-effort reap so the child doesn't linger as a
+			// zombie under the test process.
+			var ws syscall.WaitStatus
+			_, _ = syscall.Wait4(childPID, &ws, 0, nil)
+		})
+	}
 
 	// Second start: same HOME, so the PID file collides.
 	second := exec.Command(bin, "dashboard", "start")
@@ -207,7 +211,6 @@ func TestDashboardBinary_RefusesDoubleStart(t *testing.T) {
 	if stopOut, stopErr := stop.CombinedOutput(); stopErr != nil {
 		t.Fatalf("cleanup stop: %v\n%s", stopErr, stopOut)
 	}
-	<-firstReaped
 }
 
 // --- helpers -----------------------------------------------------------------

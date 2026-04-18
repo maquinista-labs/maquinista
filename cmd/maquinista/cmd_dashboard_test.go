@@ -16,12 +16,23 @@ import (
 // withDashboardTempDir sets dashboardDir to a fresh t.TempDir() for
 // the duration of the test. Used by every dashboard-subcommand test
 // so they don't trample the user's real ~/.maquinista.
+//
+// Also flips dashboardStartForeground on for the duration of the
+// test — post-D.2, the default is to detach, but tests still expect
+// `runDashboardStart` to block in-process so they can assert on its
+// lifecycle without forking. The real detach path is covered by the
+// daemonize package's own tests.
 func withDashboardTempDir(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	prev := dashboardDir
 	SetDashboardDir(dir)
-	t.Cleanup(func() { SetDashboardDir(prev) })
+	prevForeground := dashboardStartForeground
+	dashboardStartForeground = true
+	t.Cleanup(func() {
+		SetDashboardDir(prev)
+		dashboardStartForeground = prevForeground
+	})
 	return dir
 }
 
