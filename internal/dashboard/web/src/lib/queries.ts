@@ -7,6 +7,8 @@ import type { Pool } from "pg";
 import type {
   AgentListItem,
   ConversationItem,
+  ConversationRow,
+  GlobalInboxRow,
   InboxRow,
   JobsList,
   KPIs,
@@ -167,6 +169,53 @@ export async function listInbox(
   }));
 }
 
+export type GlobalInboxOpts = {
+  limit?: number;
+  status?: InboxRow["status"][]; // defaults to ['pending','processing']
+};
+
+// listGlobalInbox: cross-agent feed of in-flight inbox rows. Joins
+// agents to carry the handle so the row can render a human label
+// without a second fetch.
+export async function listGlobalInbox(
+  pool: Pool,
+  opts: GlobalInboxOpts = {},
+): Promise<GlobalInboxRow[]> {
+  const limit = Math.min(opts.limit ?? 100, 200);
+  const statuses =
+    opts.status && opts.status.length > 0
+      ? opts.status
+      : ["pending", "processing"];
+  const { rows } = await pool.query(
+    `
+    SELECT i.id, i.agent_id, a.handle AS agent_handle,
+           i.from_kind, i.from_id, i.status,
+           i.origin_channel, i.origin_user_id,
+           i.content, i.enqueued_at
+    FROM agent_inbox i
+    JOIN agents a ON a.id = i.agent_id
+    WHERE i.status = ANY($1::text[])
+    ORDER BY i.enqueued_at DESC
+    LIMIT ${limit}
+    `,
+    [statuses],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    agent_id: r.agent_id,
+    agent_handle: r.agent_handle,
+    from_kind: r.from_kind,
+    from_id: r.from_id,
+    status: r.status,
+    origin_channel: r.origin_channel,
+    origin_user_id: r.origin_user_id,
+    excerpt: excerptFromContent(r.content),
+    enqueued_at: r.enqueued_at.toISOString
+      ? r.enqueued_at.toISOString()
+      : String(r.enqueued_at),
+  }));
+}
+
 export async function listOutbox(
   pool: Pool,
   agentId: string,
@@ -198,6 +247,63 @@ export async function listOutbox(
     created_at: r.created_at.toISOString
       ? r.created_at.toISOString()
       : String(r.created_at),
+  }));
+}
+
+// listConversations: one row per (conversation_id, agent_id) merging
+// inbox + outbox, carrying the latest message preview and the count
+// of still-pending inbox rows. Drives the top-level /conversations
+// (Chats) feed — the single cross-agent mailbox surface after G.1/G.2
+// merged.
+export async function listConversations(
+  pool: Pool,
+  limit = 50,
+): Promise<ConversationRow[]> {
+  const lim = Math.min(limit, 200);
+  const { rows } = await pool.query(
+    `
+    WITH last_msg AS (
+      SELECT conversation_id, agent_id,
+             MAX(at)                                     AS last_at,
+             (ARRAY_AGG(content ORDER BY at DESC))[1]    AS preview,
+             COUNT(*)::int                               AS msg_count,
+             COALESCE(SUM(pending),0)::int               AS pending_count
+      FROM (
+        SELECT conversation_id, agent_id, content,
+               enqueued_at AS at,
+               CASE WHEN status IN ('pending','processing')
+                    THEN 1 ELSE 0 END AS pending
+        FROM agent_inbox
+        WHERE conversation_id IS NOT NULL
+        UNION ALL
+        SELECT conversation_id, agent_id, content,
+               created_at AS at,
+               0 AS pending
+        FROM agent_outbox
+        WHERE conversation_id IS NOT NULL
+      ) m
+      GROUP BY conversation_id, agent_id
+    )
+    SELECT lm.conversation_id, lm.agent_id,
+           a.handle AS agent_handle,
+           lm.last_at, lm.preview,
+           lm.msg_count, lm.pending_count
+    FROM last_msg lm
+    JOIN agents a ON a.id = lm.agent_id
+    ORDER BY lm.last_at DESC
+    LIMIT ${lim}
+    `,
+  );
+  return rows.map((r) => ({
+    conversation_id: r.conversation_id,
+    agent_id: r.agent_id,
+    agent_handle: r.agent_handle,
+    last_at: r.last_at.toISOString
+      ? r.last_at.toISOString()
+      : String(r.last_at),
+    preview: excerptFromContent(r.preview),
+    msg_count: Number(r.msg_count) || 0,
+    pending_count: Number(r.pending_count) || 0,
   }));
 }
 

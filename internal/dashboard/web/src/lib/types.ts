@@ -53,6 +53,27 @@ export type OutboxRow = {
   created_at: string;
 };
 
+// GlobalInboxRow: an InboxRow enriched with the owning agent's
+// handle (if set) — the /inbox feed shows rows from across every
+// agent, so the per-row agent label would otherwise be ambiguous.
+export type GlobalInboxRow = InboxRow & {
+  agent_handle: string | null;
+};
+
+// ConversationRow: one row per conversation_id for the global /chats
+// feed. Merges inbox + outbox into a single timeline metadata shape
+// and surfaces pending_count so operators can spot unresolved items
+// at a glance.
+export type ConversationRow = {
+  conversation_id: string;
+  agent_id: string;
+  agent_handle: string | null;
+  last_at: string;
+  preview: string | null;
+  msg_count: number;
+  pending_count: number;
+};
+
 export type ConversationItem = {
   /** "inbox" | "outbox" — direction. */
   kind: "inbox" | "outbox";

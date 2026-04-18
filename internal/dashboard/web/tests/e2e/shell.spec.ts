@@ -56,33 +56,20 @@ test.describe("dashboard shell", () => {
     );
   });
 
-  test("each placeholder page renders its marker", async ({ page }) => {
-    // /agents became a live page in Phase 2; match either the
-    // agents-list container (has data) or the agents-empty banner
-    // (fresh DB). The remaining three routes are still Phase-1
-    // placeholders.
-    await page.goto("/agents");
-    // /agents always renders its heading; the inner list / empty
-    // banner / error is phase-dependent. Assert the page is loaded
-    // by the heading itself.
-    await expect(
-      page.getByRole("heading", { name: "Agents" }),
-    ).toBeVisible();
-
-    // /jobs became live in Phase 4 — assert its heading instead
-    // of the Phase-1 placeholder.
-    await page.goto("/jobs");
-    await expect(
-      page.getByRole("heading", { name: "Jobs" }),
-    ).toBeVisible();
-
-    // /inbox + /conversations are still Phase-1 placeholders.
-    for (const [href, testid] of [
-      ["/inbox", "inbox-placeholder"],
-      ["/conversations", "conversations-placeholder"],
+  test("every top-level route renders its heading", async ({ page }) => {
+    // /inbox + /conversations became live in G.1 / G.2 — all four
+    // nav destinations now render real headings, no placeholders
+    // remain.
+    for (const [href, title] of [
+      ["/agents", "Agents"],
+      ["/inbox", "Inbox"],
+      ["/conversations", "Chats"],
+      ["/jobs", "Jobs"],
     ] as const) {
       await page.goto(href);
-      await expect(page.getByTestId(testid)).toBeVisible();
+      await expect(
+        page.getByRole("heading", { name: title }),
+      ).toBeVisible();
     }
   });
 

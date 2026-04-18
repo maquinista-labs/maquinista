@@ -3,6 +3,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   excerptFromContent,
   listAgents,
+  listConversations,
+  listGlobalInbox,
   listInbox,
   listOutbox,
 } from "./queries";
@@ -130,6 +132,112 @@ describe("listInbox", () => {
     const params = args[1] as unknown[];
     expect(sql).toContain("enqueued_at < $2");
     expect(params[1]).toBe("2026-04-17T00:00:00Z");
+  });
+});
+
+describe("listGlobalInbox", () => {
+  it("defaults to pending+processing, caps limit at 200", async () => {
+    const pool = mockPool([[]]);
+    await listGlobalInbox(pool, { limit: 9999 });
+    const args = (pool.query as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls[0];
+    const sql = String(args[0]);
+    const params = args[1] as unknown[];
+    expect(sql).toContain("LIMIT 200");
+    expect(sql).toContain("JOIN agents");
+    expect(sql).toContain("ORDER BY i.enqueued_at DESC");
+    expect(params[0]).toEqual(["pending", "processing"]);
+  });
+
+  it("accepts a custom status filter", async () => {
+    const pool = mockPool([[]]);
+    await listGlobalInbox(pool, { status: ["failed", "dead"] });
+    const args = (pool.query as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls[0];
+    const params = args[1] as unknown[];
+    expect(params[0]).toEqual(["failed", "dead"]);
+  });
+
+  it("maps rows with agent_handle and excerpt", async () => {
+    const now = new Date("2026-04-18T10:00:00Z");
+    const pool = mockPool([
+      [
+        {
+          id: "i1",
+          agent_id: "a1",
+          agent_handle: "coder",
+          from_kind: "user",
+          from_id: null,
+          status: "pending",
+          origin_channel: "telegram",
+          origin_user_id: "42",
+          content: { text: "Please fix the dedup bug" },
+          enqueued_at: now,
+        },
+      ],
+    ]);
+    const items = await listGlobalInbox(pool);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      id: "i1",
+      agent_id: "a1",
+      agent_handle: "coder",
+      excerpt: "Please fix the dedup bug",
+      enqueued_at: now.toISOString(),
+    });
+  });
+});
+
+describe("listConversations", () => {
+  it("issues one query with a CTE merging inbox + outbox", async () => {
+    const pool = mockPool([[]]);
+    await listConversations(pool);
+    const args = (pool.query as unknown as { mock: { calls: unknown[][] } })
+      .mock.calls[0];
+    const sql = String(args[0]);
+    expect(sql).toContain("WITH last_msg AS");
+    expect(sql).toContain("FROM agent_inbox");
+    expect(sql).toContain("FROM agent_outbox");
+    expect(sql).toContain("ORDER BY lm.last_at DESC");
+    expect(sql).toContain("LIMIT 50");
+  });
+
+  it("caps limit at 200", async () => {
+    const pool = mockPool([[]]);
+    await listConversations(pool, 9999);
+    const sql = String(
+      (pool.query as unknown as { mock: { calls: unknown[][] } }).mock
+        .calls[0][0],
+    );
+    expect(sql).toContain("LIMIT 200");
+  });
+
+  it("maps rows with preview excerpt + pending_count", async () => {
+    const now = new Date("2026-04-18T10:00:00Z");
+    const pool = mockPool([
+      [
+        {
+          conversation_id: "c1",
+          agent_id: "a1",
+          agent_handle: null,
+          last_at: now,
+          preview: { text: "Here's the plan" },
+          msg_count: 7,
+          pending_count: 2,
+        },
+      ],
+    ]);
+    const rows = await listConversations(pool);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      conversation_id: "c1",
+      agent_id: "a1",
+      agent_handle: null,
+      preview: "Here's the plan",
+      msg_count: 7,
+      pending_count: 2,
+    });
+    expect(rows[0].last_at).toBe(now.toISOString());
   });
 });
 
