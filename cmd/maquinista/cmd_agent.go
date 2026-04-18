@@ -10,6 +10,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
@@ -80,6 +81,40 @@ var agentSpawnCmd = &cobra.Command{
 	},
 }
 
+// agentLogsLines + agentLogsCmd — pre-D.5 this was the top-level
+// `maquinista logs <agent-id>` command; it now lives under
+// `maquinista agent logs <agent-id>` since `logs` belongs to the
+// daemon tailer (see cmd_logs.go).
+var agentLogsLines int
+
+var agentLogsCmd = &cobra.Command{
+	Use:   "logs <agent-id>",
+	Short: "Capture last N lines from an agent's tmux window",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runAgentLogs(args[0])
+	},
+}
+
+func runAgentLogs(agentID string) error {
+	if err := connectDB(); err != nil {
+		return err
+	}
+	a, err := db.GetAgent(pool, agentID)
+	if err != nil {
+		return err
+	}
+	if a == nil {
+		return fmt.Errorf("agent %q not found", agentID)
+	}
+	output, err := tmux.CapturePaneLines(a.TmuxSession, a.TmuxWindow, agentLogsLines)
+	if err != nil {
+		return fmt.Errorf("capturing pane: %w", err)
+	}
+	fmt.Println(output)
+	return nil
+}
+
 func init() {
 	agentAddCmd.Flags().StringVar(&agentAddRunner, "runner", "claude", "runner_type (claude, openclaude, opencode, custom)")
 	agentAddCmd.Flags().StringVar(&agentAddRole, "role", "user", "agent role (user | executor)")
@@ -94,7 +129,9 @@ func init() {
 	agentEditCmd.Flags().StringVar(&agentAddSystemPrompt, "system-prompt", "", "new system prompt file")
 	agentEditCmd.Flags().StringVar(&agentAddPersona, "persona", "", "new persona text")
 
-	agentCmd.AddCommand(agentAddCmd, agentArchiveCmd, agentKillCmd, agentEditCmd, agentSpawnCmd)
+	agentLogsCmd.Flags().IntVar(&agentLogsLines, "lines", 50, "number of lines to capture")
+
+	agentCmd.AddCommand(agentAddCmd, agentArchiveCmd, agentKillCmd, agentEditCmd, agentSpawnCmd, agentLogsCmd)
 	rootCmd.AddCommand(agentCmd)
 }
 
