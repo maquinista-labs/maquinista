@@ -175,6 +175,15 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		// Uses --resume <session_id> when the hook has recorded one so
 		// Claude's context carries across restarts.
 		if cwd, cwdErr := resolveStartCWD(cfg); cwdErr == nil {
+			// G.4 of plans/active/dashboard-gaps.md — seed the
+			// coordinator/planner/coder trio on a fresh install.
+			// Idempotent; reconcile (below) brings their panes up.
+			seedCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := seedDefaultAgents(seedCtx, cfg, pool, cwd); err != nil {
+				log.Printf("seed-agents: %v", err)
+			}
+			cancel()
+
 			respawnCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 			if n, err := reconcileAgentPanes(respawnCtx, cfg, pool, b.State(), cwd); err != nil {
 				log.Printf("reconcile: %v", err)
