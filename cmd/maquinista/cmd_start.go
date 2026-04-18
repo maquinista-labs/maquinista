@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/hook"
 	"github.com/maquinista-labs/maquinista/internal/bot"
 	"github.com/maquinista-labs/maquinista/internal/config"
@@ -266,6 +267,15 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		} else {
 			b.SetTopicAgentSpawner(newTopicAgentSpawner(cfg, pool, b.State(), cwd))
 		}
+
+		// Periodic dashboard agent reconcile: spawn panes for agents
+		// created via dashboard (status='stopped', tmux_window='').
+		// This bridges the gap between dashboard DB-only spawn and
+		// reconcile-only-once-at-startup logic.
+		if cwd, cwdErr := resolveStartCWD(cfg); cwdErr == nil {
+			go runDashboardAgentReconcile(ctx, cfg, pool, b.State(), cwd)
+			log.Println("dashboard: periodic agent reconcile started")
+		}
 	} else {
 		log.Println("mailbox: DB pool unavailable — inbox routing will error")
 	}
@@ -347,4 +357,26 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	}
 
 	return err
+}
+
+// runDashboardAgentReconcile periodically scans for dashboard-spawned
+// agents (status='stopped', tmux_window='') and provisions their tmux
+// panes. Runs as a background goroutine; terminates on ctx cancel.
+func runDashboardAgentReconcile(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, botState *state.State, defaultCWD string) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("dashboard: agent reconcile stopped")
+			return
+		case <-ticker.C:
+			if n, err := reconcileAgentPanes(ctx, cfg, pool, botState, defaultCWD); err != nil {
+				log.Printf("dashboard: reconcile error: %v", err)
+			} else if n > 0 {
+				log.Printf("dashboard: provisioned %d new agent pane(s)", n)
+			}
+		}
+	}
 }

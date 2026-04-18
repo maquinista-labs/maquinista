@@ -165,7 +165,12 @@ func Load(envFile ...string) (*Config, error) {
 
 	maquinistaBin := os.Getenv("MAQUINISTA_BIN")
 	if maquinistaBin == "" {
-		maquinistaBin = "maquinista"
+		// Try to discover the maquinista binary path from the running executable
+		if exe, err := os.Executable(); err == nil {
+			maquinistaBin = exe
+		} else {
+			maquinistaBin = "maquinista"
+		}
 	}
 
 	pollInterval := 2.0
