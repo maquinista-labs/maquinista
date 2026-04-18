@@ -18,6 +18,7 @@ import {
 } from "@/components/ui/sheet";
 import type { ModelChoice, RunnerChoice } from "@/lib/catalog";
 import { HANDLE_REGEX, isValidHandle } from "@/lib/utils";
+import { CreateTemplate } from "./create-template";
 
 type Catalog = {
   runners: RunnerChoice[];
@@ -284,6 +285,9 @@ export function SpawnAgent() {
               ))}
             </select>
           </label>
+          <CreateTemplate
+            onCreated={(templateId) => setSoul(templateId)}
+          />
         </div>
 
         <SheetFooter>
