@@ -6,8 +6,10 @@ import { notFound } from "next/navigation";
 import { AgentActions } from "@/components/dash/agent-actions";
 import { AgentDetailTabs } from "@/components/dash/agent-detail-tabs";
 import { Composer } from "@/components/dash/composer";
+import { RenameAgent } from "@/components/dash/rename-agent";
 import { getPool } from "@/lib/db";
 import { getAgent } from "@/lib/queries";
+import { displayName } from "@/lib/utils";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -36,7 +38,12 @@ export default async function AgentDetailPage(props: {
       className="mx-auto max-w-screen-sm px-4 py-4"
     >
       <header className="mb-3 flex flex-wrap items-center gap-2">
-        <h2 className="text-xl font-semibold">{id}</h2>
+        <h2 data-testid="agent-detail-title" className="text-xl font-semibold">
+          {agent ? displayName(agent) : id}
+        </h2>
+        {agent && (
+          <RenameAgent agentId={id} currentHandle={agent.handle} />
+        )}
         {agent && (
           <span
             data-testid="agent-detail-runner"

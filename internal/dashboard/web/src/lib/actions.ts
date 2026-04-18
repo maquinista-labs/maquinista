@@ -56,6 +56,42 @@ export async function requestKill(
   return (rowCount ?? 0) > 0;
 }
 
+// renameAgent sets (or clears) the agent's `handle` — the operator-
+// facing display name. `id` stays untouched (referenced by mailbox
+// rows, soul rows, tmux names). Callers validate the regex; this
+// helper just runs the UPDATE and surfaces the outcome.
+//
+// Return values:
+//   "updated" — row exists, handle written.
+//   "not_found" — no row matched the id.
+//   "conflict" — unique index on lower(handle) rejected the value.
+export type RenameAgentResult = "updated" | "not_found" | "conflict";
+
+export async function renameAgent(
+  pool: Pool,
+  id: string,
+  handle: string | null,
+): Promise<RenameAgentResult> {
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE agents SET handle = $2 WHERE id = $1`,
+      [id, handle],
+    );
+    return (rowCount ?? 0) > 0 ? "updated" : "not_found";
+  } catch (err) {
+    // Postgres unique violation is 23505.
+    if (
+      typeof err === "object" &&
+      err !== null &&
+      "code" in err &&
+      (err as { code: string }).code === "23505"
+    ) {
+      return "conflict";
+    }
+    throw err;
+  }
+}
+
 // requestRespawn clears tmux_window and stop_requested so the
 // reconcile loop starts a fresh pane on its next tick. agents.tmux_window
 // is NOT NULL, so we write empty string (convention for "no active pane").

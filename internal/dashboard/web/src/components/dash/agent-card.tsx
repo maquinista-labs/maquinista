@@ -4,7 +4,7 @@ import Link from "next/link";
 
 import { Badge } from "@/components/ui/badge";
 import { Card } from "@/components/ui/card";
-import { cn } from "@/lib/utils";
+import { cn, displayName } from "@/lib/utils";
 import type { AgentListItem } from "@/lib/types";
 
 // Status dot palette from plans/active/dashboard.md Phase 2:
@@ -72,7 +72,13 @@ export function AgentCard({ agent }: { agent: AgentListItem }) {
               dotClass(dot),
             )}
           />
-          <span className="font-medium">{agent.id}</span>
+          <span
+            data-testid="agent-card-title"
+            data-agent-id={agent.id}
+            className="font-medium"
+          >
+            {displayName(agent)}
+          </span>
           <span className="ml-auto text-xs text-muted-foreground">
             {agent.runner}
             {agent.model ? ` · ${agent.model}` : ""}
