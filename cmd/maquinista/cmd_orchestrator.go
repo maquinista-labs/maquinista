@@ -65,6 +65,13 @@ func orchestratorSpec() daemonize.Spec {
 		LogPath:    orchestratorLogFilePath(),
 		PIDPath:    orchestratorPIDFilePath(),
 		Foreground: orchestratorStartForeground,
+		// Pin the re-exec'd child to "orchestrator start" regardless
+		// of how the caller got here. Top-level `maquinista start`
+		// invokes runOrchestratorStart, but os.Args is still
+		// ["maquinista","start"] — without this the child would be
+		// re-exec'd as `maquinista start --foreground` and crash on
+		// an unknown flag.
+		ChildArgs: []string{"orchestrator", "start"},
 	}
 }
 

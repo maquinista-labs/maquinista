@@ -110,6 +110,82 @@ func TestHasForegroundFlag(t *testing.T) {
 	}
 }
 
+// --- buildDetachCmd argv resolution -----------------------------------------
+
+// TestBuildDetachCmd_UsesChildArgsWhenSet asserts that when Spec.ChildArgs
+// is non-empty, the re-exec'd child gets those args verbatim (with
+// --foreground appended). Regression guard for the bug where top-level
+// `maquinista start` was re-execing children as `maquinista start
+// --foreground` instead of `maquinista orchestrator start --foreground`
+// and `maquinista dashboard start --foreground`.
+func TestBuildDetachCmd_UsesChildArgsWhenSet(t *testing.T) {
+	origArgs := os.Args
+	defer func() { os.Args = origArgs }()
+	os.Args = []string{"./maquinista", "start"}
+
+	spec := Spec{
+		Name:      "orchestrator",
+		ChildArgs: []string{"orchestrator", "start"},
+	}
+	cmd, err := buildDetachCmd(spec)
+	if err != nil {
+		t.Fatalf("buildDetachCmd: %v", err)
+	}
+	want := []string{"orchestrator", "start", "--foreground"}
+	got := cmd.Args[1:] // skip argv[0] (the executable path)
+	if !equalArgs(got, want) {
+		t.Fatalf("child args = %v; want %v", got, want)
+	}
+}
+
+// TestBuildDetachCmd_InheritsArgsWhenUnset asserts the back-compat path:
+// callers invoked from their own subcommand don't need to set ChildArgs
+// and still get the right re-exec.
+func TestBuildDetachCmd_InheritsArgsWhenUnset(t *testing.T) {
+	origArgs := os.Args
+	defer func() { os.Args = origArgs }()
+	os.Args = []string{"./maquinista", "dashboard", "start"}
+
+	cmd, err := buildDetachCmd(Spec{Name: "dashboard"})
+	if err != nil {
+		t.Fatalf("buildDetachCmd: %v", err)
+	}
+	want := []string{"dashboard", "start", "--foreground"}
+	got := cmd.Args[1:]
+	if !equalArgs(got, want) {
+		t.Fatalf("child args = %v; want %v", got, want)
+	}
+}
+
+// TestBuildDetachCmd_ChildArgsSkipsForegroundWhenAlreadyPresent asserts
+// we don't double-append --foreground if the caller already included it.
+func TestBuildDetachCmd_ChildArgsSkipsForegroundWhenAlreadyPresent(t *testing.T) {
+	spec := Spec{
+		Name:      "orchestrator",
+		ChildArgs: []string{"orchestrator", "start", "--foreground"},
+	}
+	cmd, err := buildDetachCmd(spec)
+	if err != nil {
+		t.Fatalf("buildDetachCmd: %v", err)
+	}
+	want := []string{"orchestrator", "start", "--foreground"}
+	if !equalArgs(cmd.Args[1:], want) {
+		t.Fatalf("child args = %v; want %v", cmd.Args[1:], want)
+	}
+}
+
+func equalArgs(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // --- Status -----------------------------------------------------------------
 
 func TestStatus_NotRunning(t *testing.T) {
@@ -291,7 +367,7 @@ func TestDetach_EndToEnd(t *testing.T) {
 	// child mode, not the test runner).
 	prev := buildDetachCmd
 	defer func() { buildDetachCmd = prev }()
-	buildDetachCmd = func() (*exec.Cmd, error) {
+	buildDetachCmd = func(_ Spec) (*exec.Cmd, error) {
 		cmd := exec.Command(os.Args[0], "-test.run=^$")
 		cmd.Env = append(os.Environ(),
 			testChildEnv+"=1",

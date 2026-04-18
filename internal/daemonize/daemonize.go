@@ -50,17 +50,38 @@ type Spec struct {
 	// re-exec'd child always sees Foreground=true because detach
 	// appends --foreground to argv.
 	Foreground bool
+	// ChildArgs overrides the argv passed to the re-exec'd child. When
+	// non-empty, detach uses these args (plus --foreground) instead
+	// of os.Args[1:]. Callers reached via a different command path
+	// than their own subcommand MUST set this — e.g. the top-level
+	// `maquinista start` bootstrap calls runOrchestratorStart but
+	// os.Args is still ["maquinista","start"], so the child would be
+	// re-exec'd as "maquinista start --foreground" (wrong command).
+	// Setting ChildArgs = []string{"orchestrator","start"} pins the
+	// child to its canonical command regardless of how the parent
+	// entered.
+	ChildArgs []string
 }
 
 // buildDetachCmd produces the exec.Cmd used by the detach path. It's
 // a package-level var so tests can replace it with a helper that
 // spawns the test binary in a controlled child mode.
-var buildDetachCmd = func() (*exec.Cmd, error) {
+//
+// When spec.ChildArgs is set, those args are used verbatim (with
+// --foreground appended if missing). Otherwise the current process's
+// os.Args[1:] is inherited, which works when the caller was invoked
+// by the same command path the child should re-enter.
+var buildDetachCmd = func(spec Spec) (*exec.Cmd, error) {
 	exe, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("resolving executable: %w", err)
 	}
-	childArgs := append([]string{}, os.Args[1:]...)
+	var childArgs []string
+	if len(spec.ChildArgs) > 0 {
+		childArgs = append(childArgs, spec.ChildArgs...)
+	} else {
+		childArgs = append(childArgs, os.Args[1:]...)
+	}
 	if !hasForegroundFlag(childArgs) {
 		childArgs = append(childArgs, "--foreground")
 	}
@@ -203,7 +224,7 @@ func detach(spec Spec) error {
 	}
 	defer devnull.Close()
 
-	cmd, err := buildDetachCmd()
+	cmd, err := buildDetachCmd(spec)
 	if err != nil {
 		return err
 	}

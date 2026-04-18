@@ -124,6 +124,12 @@ func dashboardSpec() daemonize.Spec {
 		LogPath:    dashboardLogFilePath(),
 		PIDPath:    dashboardPIDFilePath(),
 		Foreground: dashboardStartForeground,
+		// Pin the re-exec'd child to "dashboard start" so the top-
+		// level `maquinista start` bootstrap (which calls
+		// runDashboardStart while os.Args is ["maquinista","start"])
+		// can't accidentally re-exec the child into the wrong
+		// command path.
+		ChildArgs: []string{"dashboard", "start"},
 	}
 }
 
