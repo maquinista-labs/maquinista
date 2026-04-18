@@ -31,7 +31,7 @@ export function GlobalInboxList({
         data-testid="inbox-empty"
         className="p-4 text-sm text-muted-foreground"
       >
-        No pending or processing messages.
+        No messages yet.
       </Card>
     );
   }

@@ -250,11 +250,16 @@ export async function listOutbox(
   }));
 }
 
-// listConversations: one row per (conversation_id, agent_id) merging
-// inbox + outbox, carrying the latest message preview and the count
-// of still-pending inbox rows. Drives the top-level /conversations
-// (Chats) feed — the single cross-agent mailbox surface after G.1/G.2
-// merged.
+// listConversations: one row per chat thread, merging inbox + outbox.
+// Threads are keyed by conversation_id when set (multi-agent a2a
+// handoffs) and fall back to agent_id when it's null (single-agent
+// Telegram topic chats — the common case). Without that fallback
+// every Telegram-originated message would be silently dropped from
+// the feed.
+//
+// The `conversation_id` column on the row stays null for the fallback
+// case so the UI can deep-link into the agent's cross-conversation
+// timeline (no specific conversation filter).
 export async function listConversations(
   pool: Pool,
   limit = 50,
@@ -263,28 +268,29 @@ export async function listConversations(
   const { rows } = await pool.query(
     `
     WITH last_msg AS (
-      SELECT conversation_id, agent_id,
-             MAX(at)                                     AS last_at,
-             (ARRAY_AGG(content ORDER BY at DESC))[1]    AS preview,
-             COUNT(*)::int                               AS msg_count,
-             COALESCE(SUM(pending),0)::int               AS pending_count
+      SELECT
+        COALESCE(conversation_id::text, agent_id)    AS thread_key,
+        conversation_id,
+        agent_id,
+        MAX(at)                                      AS last_at,
+        (ARRAY_AGG(content ORDER BY at DESC))[1]     AS preview,
+        COUNT(*)::int                                AS msg_count,
+        COALESCE(SUM(pending),0)::int                AS pending_count
       FROM (
         SELECT conversation_id, agent_id, content,
                enqueued_at AS at,
                CASE WHEN status IN ('pending','processing')
                     THEN 1 ELSE 0 END AS pending
         FROM agent_inbox
-        WHERE conversation_id IS NOT NULL
         UNION ALL
         SELECT conversation_id, agent_id, content,
                created_at AS at,
                0 AS pending
         FROM agent_outbox
-        WHERE conversation_id IS NOT NULL
       ) m
-      GROUP BY conversation_id, agent_id
+      GROUP BY thread_key, conversation_id, agent_id
     )
-    SELECT lm.conversation_id, lm.agent_id,
+    SELECT lm.thread_key, lm.conversation_id, lm.agent_id,
            a.handle AS agent_handle,
            lm.last_at, lm.preview,
            lm.msg_count, lm.pending_count
@@ -295,7 +301,12 @@ export async function listConversations(
     `,
   );
   return rows.map((r) => ({
+    // thread_key is what the UI keys on; conversation_id remains
+    // null for single-agent threads so the row links to the agent's
+    // cross-conversation timeline rather than a non-existent
+    // conversation filter.
     conversation_id: r.conversation_id,
+    thread_key: r.thread_key,
     agent_id: r.agent_id,
     agent_handle: r.agent_handle,
     last_at: r.last_at.toISOString

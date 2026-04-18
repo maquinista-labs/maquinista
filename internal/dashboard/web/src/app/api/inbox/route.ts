@@ -4,9 +4,14 @@ import { getPool } from "@/lib/db";
 import { listGlobalInbox } from "@/lib/queries";
 import type { InboxRow } from "@/lib/types";
 
-// GET /api/inbox — cross-agent feed of in-flight inbox rows. Default
-// statuses are pending+processing; callers can widen via `?status=`
-// (comma-separated). G.1 of plans/active/dashboard-gaps.md.
+// GET /api/inbox — cross-agent inbox feed. Default shows recent
+// activity across every status so operators see what came in, not
+// only what's still queued (empty "nothing pending" was
+// confusing when the agents had already consumed everything). The
+// `pending` status is always ordered first via listGlobalInbox so
+// action-needed rows still stand out.
+//
+// Callers can narrow via `?status=pending,processing`.
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
@@ -23,14 +28,14 @@ export async function GET(req: Request) {
   const limitParam = url.searchParams.get("limit");
   const limit = limitParam ? Math.max(1, Number(limitParam)) : 100;
   const statusParam = url.searchParams.get("status");
-  const status = statusParam
+  const status: InboxRow["status"][] = statusParam
     ? statusParam
         .split(",")
         .map((s) => s.trim())
         .filter((s): s is InboxRow["status"] =>
           VALID.has(s as InboxRow["status"]),
         )
-    : undefined;
+    : (Array.from(VALID) as InboxRow["status"][]);
   try {
     const items = await listGlobalInbox(getPool(), { limit, status });
     return NextResponse.json(

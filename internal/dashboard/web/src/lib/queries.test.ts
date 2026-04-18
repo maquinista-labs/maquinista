@@ -200,6 +200,11 @@ describe("listConversations", () => {
     expect(sql).toContain("FROM agent_outbox");
     expect(sql).toContain("ORDER BY lm.last_at DESC");
     expect(sql).toContain("LIMIT 50");
+    // Fallback to agent_id when conversation_id is null — crucial
+    // for single-agent Telegram topic chats which don't populate
+    // conversation_id. Without this the feed silently drops every
+    // real-world message.
+    expect(sql).toContain("COALESCE(conversation_id::text, agent_id)");
   });
 
   it("caps limit at 200", async () => {
@@ -212,12 +217,13 @@ describe("listConversations", () => {
     expect(sql).toContain("LIMIT 200");
   });
 
-  it("maps rows with preview excerpt + pending_count", async () => {
+  it("maps rows with preview excerpt + pending_count + thread_key", async () => {
     const now = new Date("2026-04-18T10:00:00Z");
     const pool = mockPool([
       [
         {
           conversation_id: "c1",
+          thread_key: "c1",
           agent_id: "a1",
           agent_handle: null,
           last_at: now,
@@ -231,6 +237,7 @@ describe("listConversations", () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       conversation_id: "c1",
+      thread_key: "c1",
       agent_id: "a1",
       agent_handle: null,
       preview: "Here's the plan",
@@ -238,6 +245,28 @@ describe("listConversations", () => {
       pending_count: 2,
     });
     expect(rows[0].last_at).toBe(now.toISOString());
+  });
+
+  it("keeps conversation_id null and thread_key=agent_id for single-agent chats", async () => {
+    const now = new Date("2026-04-18T10:00:00Z");
+    const pool = mockPool([
+      [
+        {
+          conversation_id: null,
+          thread_key: "t-1-1",
+          agent_id: "t-1-1",
+          agent_handle: "coder",
+          last_at: now,
+          preview: { text: "ack" },
+          msg_count: 3,
+          pending_count: 0,
+        },
+      ],
+    ]);
+    const [row] = await listConversations(pool);
+    expect(row.conversation_id).toBeNull();
+    expect(row.thread_key).toBe("t-1-1");
+    expect(row.agent_id).toBe("t-1-1");
   });
 });
 

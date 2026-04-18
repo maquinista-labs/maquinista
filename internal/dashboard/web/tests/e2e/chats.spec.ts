@@ -119,4 +119,37 @@ test.describe("global chats feed", () => {
     await page.goto("/conversations");
     await expect(page.getByTestId("chats-empty")).toBeVisible();
   });
+
+  test("single-agent chat without conversation_id falls back to agent_id", async ({
+    page,
+  }) => {
+    // Single-agent Telegram topic chats never populate conversation_id
+    // — only multi-agent a2a handoffs do. The feed must still surface
+    // them; the fallback grouping uses agent_id as the thread key.
+    await insertAgent({ id: "t-1-42", handle: "topic-agent" });
+    await withDb(async (c) => {
+      await c.query(
+        `INSERT INTO agent_inbox (agent_id, from_kind, content, status)
+         VALUES ($1, 'user', $2, 'processed')`,
+        ["t-1-42", JSON.stringify({ text: "telegram msg" })],
+      );
+      await c.query(
+        `INSERT INTO agent_outbox (agent_id, content)
+         VALUES ($1, $2)`,
+        ["t-1-42", JSON.stringify({ text: "agent reply" })],
+      );
+    });
+
+    await page.goto("/conversations");
+    const list = page.getByTestId("chats-list");
+    await expect(list).toBeVisible();
+
+    const row = page.getByTestId("chat-row-t-1-42");
+    await expect(row).toBeVisible();
+    // Fallback thread links to the agent's timeline without a
+    // `conversation=` query param (there's no real conversation row
+    // to filter on).
+    await row.click();
+    await expect(page).toHaveURL(/\/agents\/t-1-42\?tab=chat$/);
+  });
 });

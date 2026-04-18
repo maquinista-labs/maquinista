@@ -50,14 +50,17 @@ export function ConversationList({
     <ul data-testid="chats-list" className="flex flex-col gap-2">
       {rows.map((r) => {
         const label = r.agent_handle ?? r.agent_id;
-        const href = `/agents/${encodeURIComponent(
-          r.agent_id,
-        )}?tab=chat&conversation=${encodeURIComponent(r.conversation_id)}`;
+        const href = r.conversation_id
+          ? `/agents/${encodeURIComponent(
+              r.agent_id,
+            )}?tab=chat&conversation=${encodeURIComponent(r.conversation_id)}`
+          : `/agents/${encodeURIComponent(r.agent_id)}?tab=chat`;
+        const rowKey = r.conversation_id ?? r.thread_key;
         return (
-          <li key={`${r.agent_id}-${r.conversation_id}`}>
+          <li key={`${r.agent_id}-${rowKey}`}>
             <Link
               href={href}
-              data-testid={`chat-row-${r.conversation_id}`}
+              data-testid={`chat-row-${rowKey}`}
               data-agent-id={r.agent_id}
               className="block focus-visible:outline-none"
             >
@@ -66,7 +69,7 @@ export function ConversationList({
                   <span className="font-medium">{label}</span>
                   {r.pending_count > 0 && (
                     <Badge
-                      data-testid={`chat-pending-${r.conversation_id}`}
+                      data-testid={`chat-pending-${rowKey}`}
                       variant="default"
                     >
                       {r.pending_count}

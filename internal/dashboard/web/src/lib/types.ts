@@ -65,7 +65,13 @@ export type GlobalInboxRow = InboxRow & {
 // and surfaces pending_count so operators can spot unresolved items
 // at a glance.
 export type ConversationRow = {
-  conversation_id: string;
+  // conversation_id is the real UUID when the thread is a multi-agent
+  // a2a conversation; null for single-agent Telegram-topic chats.
+  // UI uses thread_key as the React key and decides whether to add
+  // a `conversation=` filter to the agent detail link based on
+  // whether conversation_id is set.
+  conversation_id: string | null;
+  thread_key: string;
   agent_id: string;
   agent_handle: string | null;
   last_at: string;
