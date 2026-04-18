@@ -25,6 +25,16 @@ time. It is a **living triage doc** — as new gaps surface during
 operator use, append a G.N entry under `## Scope` and add a
 reference line under `### Triage backlog`.
 
+## Status
+
+| Gap | Status | Notes |
+|---|---|---|
+| G.1 Global Inbox | **shipped** (5cde0ca) | `listGlobalInbox` + `/api/inbox` + `<GlobalInboxList>`, 3 Playwright specs. |
+| G.2 Global Chats | **shipped** (5cde0ca) | `listConversations` CTE + `/api/conversations` + `<ConversationList>`. Pending-count badge folded in; AgentDetailTabs now respects `?tab=`+`?conversation=`. 3 Playwright specs. |
+| G.3 Rename agent | **shipped** (8e689a9) | `renameAgent` + `POST /api/agents/:id/rename` + Sheet affordance + `displayName(a)` helper. 5 Vitest + 8 Playwright. |
+| G.4 Seed default agents | **shipped** (6044d30) | Migration 028 adds coordinator/planner/coder templates; `seedDefaultAgents` runs before reconcile on every orchestrator start. `MAQUINISTA_SKIP_SEED_AGENTS=1` opts out. 4 Go integration tests + 2 Playwright. |
+| G.5 Spawn from UI | **shipped (v1)** (b349ce6) | Migration 029 adds `agents.model`. Catalog + check-handle + POST /api/agents endpoints; Sheet with four fields + live availability. **Deferred:** Telegram forum-topic creation and per-agent model threading into the runner LaunchCommand — both require cross-process bot exposure that doesn't exist yet. Dashboard-local spawn works end-to-end; @mention from Telegram still resolves via handle. |
+
 ## Scope
 
 One small commit per gap, each with a Playwright spec and green on
