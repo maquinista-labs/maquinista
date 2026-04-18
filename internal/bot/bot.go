@@ -9,13 +9,14 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/bridge"
+	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/queue"
 	"github.com/maquinista-labs/maquinista/internal/routing"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
+	"github.com/maquinista-labs/maquinista/internal/tunnel"
 )
 
 // Bot is the main Telegram bot instance.
@@ -60,6 +61,14 @@ type Bot struct {
 	// directly. May be nil; a nil spawner forces the routing ladder to
 	// surface the tier-4 picker via ErrRequirePicker.
 	topicAgentSpawner routing.SpawnFunc
+
+	// Cloudflare Quick Tunnel manager (Phase 7 dashboard command).
+	tunnel *tunnel.Manager
+	// tunnelNotify* stores the chat/thread the operator used to start the
+	// tunnel so expiry messages are sent to the right place.
+	tunnelNotifyMu       sync.Mutex
+	tunnelNotifyChatID   int64
+	tunnelNotifyThreadID int
 }
 
 // SetTopicAgentSpawner injects the tier-3 spawn callback. Call before Run.
@@ -88,7 +97,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		return nil, fmt.Errorf("ensuring tmux session: %w", err)
 	}
 
-	return &Bot{
+	b := &Bot{
 		api:                api,
 		config:             cfg,
 		state:              st,
@@ -102,7 +111,21 @@ func New(cfg *config.Config) (*Bot, error) {
 		pendingInputs:      make(map[int64]*pendingInput),
 		planStates:         make(map[int64]*planState),
 		minuanoBridge:      bridge.NewBridge(cfg.MaquinistaBin, cfg.DatabaseURL),
-	}, nil
+	}
+
+	// Wire tunnel expiry notifications back through the bot so the operator
+	// receives a follow-up message when the time limit expires.
+	b.tunnel = tunnel.NewManager(func(text string) {
+		b.tunnelNotifyMu.Lock()
+		chatID := b.tunnelNotifyChatID
+		threadID := b.tunnelNotifyThreadID
+		b.tunnelNotifyMu.Unlock()
+		if chatID != 0 {
+			b.reply(chatID, threadID, text)
+		}
+	})
+
+	return b, nil
 }
 
 // registerCommands sets the bot's command menu in Telegram.
@@ -142,6 +165,8 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "hooks", Description: "List webhook handlers"},
 		tgbotapi.BotCommand{Command: "job_runs", Description: "Show run history for a job"},
 		tgbotapi.BotCommand{Command: "ws", Description: "Manage agent workspaces (list/new/switch/archive)"},
+		tgbotapi.BotCommand{Command: "dashboard", Description: "Open a public tunnel to the dashboard [duration]"},
+		tgbotapi.BotCommand{Command: "dashboard_stop", Description: "Close the dashboard tunnel"},
 	)
 	if _, err := b.api.Request(commands); err != nil {
 		log.Printf("Warning: failed to register bot commands: %v", err)
@@ -160,6 +185,9 @@ func (b *Bot) Run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			b.saveState()
+			if b.tunnel != nil {
+				b.tunnel.Stop()
+			}
 			log.Println("Bot shutting down.")
 			return nil
 		default:

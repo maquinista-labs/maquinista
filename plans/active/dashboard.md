@@ -719,6 +719,129 @@ are Playwright specs; phase is not merged until its spec is green.
 8. **Export.** CSV export of costs + audit log probably yes;
    conversations no (privacy). Defer to Phase 4/6.
 
+### Phase 7 — Telegram `/dashboard` command with Cloudflare quick tunnel
+
+**Goal:** operator sends `/dashboard [duration]` from mobile and receives a
+public URL (e.g. `https://random-name.trycloudflare.com`) they can open
+directly in a mobile browser, with no SSH setup. The tunnel self-destructs
+after the requested duration.
+
+**Prerequisite:** `cloudflared` installed on the host machine:
+```bash
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+  -o /usr/local/bin/cloudflared && chmod +x /usr/local/bin/cloudflared
+```
+No Cloudflare account needed — quick tunnels are ephemeral and anonymous.
+
+**Command surface:**
+```
+/dashboard          → start tunnel, default 15 min
+/dashboard 30m      → start tunnel, 30 minutes
+/dashboard 1h       → start tunnel, 1 hour
+/dashboard 0        → start tunnel, no expiry (explicit)
+/dashboard_stop     → tear down tunnel immediately
+```
+
+If a tunnel is already running, `/dashboard` returns the existing URL and
+remaining time instead of starting a new one.
+
+**Architecture:**
+
+```
+Telegram /dashboard
+  └─→ Bot.handleDashboard()
+        1. b.tunnel.IsRunning() → return existing URL + TTL if yes
+        2. ensure dashboard process is up (exec `maquinista dashboard start`)
+        3. b.tunnel.Start(ctx, duration)
+              spawns: cloudflared tunnel --no-autoupdate --url localhost:8900
+              scans stderr for: https://[a-z0-9-]+\.trycloudflare\.com
+              returns URL once found (timeout 10 s)
+        4. schedules auto-stop via context.WithTimeout(duration)
+        5. replies with URL + inline [Open] button
+              on expiry → bot sends follow-up "Tunnel expired. /dashboard to reopen."
+```
+
+**New file — `internal/tunnel/manager.go`:**
+
+```go
+type Manager struct {
+    mu      sync.Mutex
+    cmd     *exec.Cmd
+    url     string
+    cancel  context.CancelFunc
+    notify  func(msg string) // callback → sends Telegram message on expiry
+}
+
+func (m *Manager) Start(ctx context.Context, dur time.Duration) (string, error)
+func (m *Manager) Stop()
+func (m *Manager) URL() string
+func (m *Manager) IsRunning() bool
+func (m *Manager) RemainingTime() time.Duration
+```
+
+`Start()` implementation:
+1. Spawns `cloudflared tunnel --no-autoupdate --url localhost:8900` via
+   `exec.CommandContext` with a derived context.
+2. Scans `stderr` line-by-line with a 10 s deadline until the regex
+   `https://[a-z0-9-]+\.trycloudflare\.com` matches.
+3. If `dur > 0`, wraps the process context with `context.WithTimeout(dur)`.
+   When the timeout fires, `cloudflared` is killed and `notify()` is called.
+4. If `dur == 0`, the process runs until `Stop()` is called or the bot shuts down.
+
+**Changes to existing files:**
+
+| File | Change |
+|---|---|
+| `internal/bot/bot.go` | Add `tunnel *tunnel.Manager` field; init in `New()`; call `Stop()` in shutdown |
+| `internal/bot/commands.go` | Add `"/dashboard"` and `"/dashboard_stop"` cases to `handleCommand()` |
+| `internal/bot/dashboard_commands.go` | New file: `handleDashboard()`, `handleDashboardStop()` |
+
+**`handleDashboard()` sketch:**
+
+```go
+func (b *Bot) handleDashboard(msg *tgbotapi.Message) {
+    // parse optional duration from msg.CommandArguments()
+    // if tunnel running: reply with URL + remaining time, return
+    // ensure dashboard process is up
+    // start tunnel with parsed duration (default 15m)
+    // build reply with URL string + InlineKeyboardMarkup url-button
+}
+```
+
+**Edge cases:**
+
+| Scenario | Handling |
+|---|---|
+| `cloudflared` not in PATH | Reply with install one-liner |
+| URL not found within 10 s | Reply with error; kill the stuck process |
+| Dashboard process not running | Auto-start via `maquinista dashboard start` before tunneling |
+| `/dashboard` called while tunnel active | Return existing URL + `expires in Xm` |
+| Bot restart | Tunnel dies with process; fresh `/dashboard` starts a new one |
+| `dur == 0` + bot restart | Same — no persistent tunnel state needed |
+
+**Security note:** Quick tunnel URLs are public and unauthenticated. The
+obscurity of a random subdomain is the only barrier until Phase 6 auth ships.
+Running `/dashboard` before Phase 6 is intentional operator risk — documented
+and opt-in.
+
+→ **Commit 7.1** `internal/tunnel/manager.go` — `Manager` with `Start/Stop/
+URL/IsRunning/RemainingTime`; unit tests covering: happy path URL parse,
+10 s timeout, duration expiry, `Stop()` idempotence, `cloudflared` not
+on PATH error.
+
+→ **Commit 7.2** `internal/bot/dashboard_commands.go` — `handleDashboard()`
+and `handleDashboardStop()`; mock `Manager` interface in tests; covers: fresh
+start default duration, custom duration parse, already-running reply, stop.
+
+→ **Commit 7.3** Wire `Manager` into `Bot` struct; register commands in
+`commands.go`; integration test: spawn real `cloudflared` (skipped if not
+on PATH) → assert URL returned → assert tunnel reachable → assert expiry
+message sent after TTL.
+
+Gate: sending `/dashboard 2m` from Telegram returns a working URL; the bot
+sends "Tunnel expired" 2 minutes later; `/dashboard` after expiry opens a
+new tunnel.
+
 ## Interaction with other active plans
 
 - `active/multi-agent-registry.md` — agent list reads the same

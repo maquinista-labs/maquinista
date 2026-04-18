@@ -100,6 +100,10 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleJobRunsCommand(msg)
 	case "ws":
 		b.handleWsCommand(msg)
+	case "dashboard":
+		b.handleDashboard(msg)
+	case "dashboard_stop":
+		b.handleDashboardStop(msg)
 	default:
 		b.reply(msg.Chat.ID, getThreadID(msg), "Unknown command: /"+msg.Command())
 	}
