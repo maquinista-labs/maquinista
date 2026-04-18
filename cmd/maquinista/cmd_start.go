@@ -25,9 +25,9 @@ import (
 
 // Per plans/active/detached-processes.md, the orchestrator daemon
 // lives under `maquinista orchestrator start` (see
-// cmd_orchestrator.go). Top-level `start` is temporarily kept as a
-// deprecation shim that delegates to the same supervisor body. D.4
-// replaces it with a two-daemon (orchestrator + dashboard) bootstrap.
+// cmd_orchestrator.go). Top-level `start` (post-D.4) bootstraps the
+// full stack: orchestrator + dashboard, both detached. Operators
+// who want one half only use the per-component subcommands.
 
 var (
 	// start --runner flag (default runner for all agents)
@@ -44,23 +44,53 @@ var (
 
 var startCmd = &cobra.Command{
 	Use:   "start",
-	Short: "Start the orchestrator daemon (deprecated alias for `orchestrator start`)",
+	Short: "Start the full stack: orchestrator + dashboard (detached)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Fprintln(os.Stderr, "warning: `maquinista start` is a deprecated alias; use `maquinista orchestrator start` for the bot daemon (D.4 will repurpose `maquinista start` for the full stack).")
-		return runOrchestratorStart(cmd.Context())
+		return runTopLevelStart(cmd.Context())
 	},
 }
 
 func init() {
 	startCmd.Flags().StringVar(&cfgPath, "env", "", "path to .env config file")
-	startCmd.Flags().StringVar(&startRunner, "runner", "", "default agent runner (claude, openclaude, opencode)")
+	startCmd.Flags().StringVar(&startRunner, "runner", "", "default orchestrator runner (claude, openclaude, opencode)")
 	startCmd.Flags().StringVar(&startAgentCWD, "agent-cwd", "", "working dir inherited by newly-spawned topic agents (overrides cfg.DefaultAgentCWD; defaults to $PWD)")
-	startCmd.Flags().BoolVar(&startOrchestrate, "orchestrate", false, "run orchestrator alongside bot")
-	startCmd.Flags().StringVar(&startOrchProject, "orchestrate-project", "", "project for orchestrator")
-	startCmd.Flags().IntVar(&startOrchMaxAgents, "orchestrate-max-agents", 3, "max agents for orchestrator")
-	startCmd.Flags().StringVar(&startOrchRunner, "orchestrate-runner", "claude", "runner for orchestrator")
-	startCmd.Flags().BoolVar(&startOrchWorktrees, "orchestrate-worktrees", false, "use worktrees for orchestrator agents")
-	startCmd.Flags().BoolVarP(&orchestratorStartForeground, "foreground", "F", false, "run in the current terminal (default: detach and return immediately)")
+	startCmd.Flags().BoolVar(&startOrchestrate, "orchestrate", false, "run orchestrator engine alongside bot")
+	startCmd.Flags().StringVar(&startOrchProject, "orchestrate-project", "", "project for orchestrator engine")
+	startCmd.Flags().IntVar(&startOrchMaxAgents, "orchestrate-max-agents", 3, "max agents for orchestrator engine")
+	startCmd.Flags().StringVar(&startOrchRunner, "orchestrate-runner", "claude", "runner for orchestrator engine")
+	startCmd.Flags().BoolVar(&startOrchWorktrees, "orchestrate-worktrees", false, "use worktrees for orchestrator engine agents")
+	startCmd.Flags().StringVar(&dashboardStartListen, "dashboard-listen", "", "host:port for the dashboard (overrides MAQUINISTA_DASHBOARD_LISTEN)")
+	startCmd.Flags().StringVar(&dashboardStartNoEmbed, "dashboard-no-embed", "", "path to a pre-built Next.js .next/standalone directory")
+	startCmd.Flags().StringVar(&dashboardStartEmbedDir, "dashboard-embed-dir", "", "override the dashboard extraction directory")
+}
+
+// runTopLevelStart boots both daemons (orchestrator first so the
+// dashboard's first render has something to show). If the dashboard
+// fails to start the orchestrator is torn back down — we never
+// leave a half-started stack for the operator to chase. Both
+// daemons detach; the function returns once the banners have been
+// printed.
+func runTopLevelStart(ctx context.Context) error {
+	// Force detach — top-level start's contract is "return the
+	// shell." If an operator needs in-process, they use
+	// `orchestrator start --foreground` / `dashboard start --foreground`
+	// directly.
+	orchestratorStartForeground = false
+	dashboardStartForeground = false
+
+	if err := runOrchestratorStart(ctx); err != nil {
+		return fmt.Errorf("orchestrator: %w", err)
+	}
+	if err := runDashboardStart(ctx); err != nil {
+		// Rollback: the orchestrator is already running; stop it
+		// before returning so the operator's tree is the same as
+		// before they typed the command.
+		if stopErr := runOrchestratorStop(); stopErr != nil {
+			log.Printf("rollback: orchestrator stop failed: %v", stopErr)
+		}
+		return fmt.Errorf("dashboard: %w", err)
+	}
+	return nil
 }
 
 // runOrchestratorSupervised is the bot + monitor + mailbox +

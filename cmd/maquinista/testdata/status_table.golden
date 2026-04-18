@@ -1,0 +1,3 @@
+COMPONENT     PID    STATE    LOG
+orchestrator  12345  running  /home/x/.maquinista/logs/orchestrator.log
+dashboard     —      stopped  /home/x/.maquinista/logs/dashboard.log

@@ -1,23 +1,25 @@
 package main
 
 import (
-	"fmt"
-	"os"
+	"log"
 
 	"github.com/spf13/cobra"
 )
 
-// Per plans/active/detached-processes.md, the tmux + DB-agent
-// cleanup used to live here; it moved to runOrchestratorStop (see
-// cmd_orchestrator.go) where it sits alongside the daemon it cleans
-// up after. This top-level `stop` is a deprecation shim that calls
-// through; D.4 replaces it with a "stop both daemons" bootstrap.
+// Per plans/active/detached-processes.md, top-level `stop` (post-D.4)
+// tears down the full stack: dashboard first (so the UI stops
+// sending actions into the bot), then orchestrator (which finishes
+// draining mailbox and takes tmux + DB cleanup with it). Each half
+// is independent — a dead dashboard doesn't block the orchestrator
+// shutdown.
 
 var stopCmd = &cobra.Command{
 	Use:   "stop",
-	Short: "Stop the Maquinista orchestrator (deprecated alias for `orchestrator stop`)",
+	Short: "Stop the full stack: dashboard then orchestrator",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		fmt.Fprintln(os.Stderr, "warning: `maquinista stop` is a deprecated alias; use `maquinista orchestrator stop` (D.4 will repurpose `maquinista stop` for the full stack).")
+		if err := runDashboardStop(); err != nil {
+			log.Printf("dashboard stop failed: %v", err)
+		}
 		return runOrchestratorStop()
 	},
 }
