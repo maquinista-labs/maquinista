@@ -6,17 +6,14 @@ import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+  SheetTrigger,
+} from "@/components/ui/sheet";
 import { useQueryClient } from "@tanstack/react-query";
 
 type CreateTemplateProps = {
@@ -105,138 +102,137 @@ export function CreateTemplate({ onCreated }: CreateTemplateProps) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
+    <Sheet open={open} onOpenChange={setOpen}>
+      <SheetTrigger asChild>
         <Button variant="ghost" size="sm" className="gap-1 w-full justify-start">
           <PlusIcon className="h-4 w-4" />
           Create new template
         </Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-lg max-h-[90vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>Create Soul Template</DialogTitle>
-          <DialogDescription>
+      </SheetTrigger>
+      <SheetContent side="bottom" className="max-w-lg max-h-[90vh] overflow-y-auto">
+        <SheetHeader>
+          <SheetTitle>Create Soul Template</SheetTitle>
+          <SheetDescription>
             Define a reusable agent identity that can be assigned to new agents.
-          </DialogDescription>
-        </DialogHeader>
+          </SheetDescription>
+        </SheetHeader>
 
-        <div className="grid gap-4 py-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div className="space-y-2">
-              <Label htmlFor="template-id">Template ID</Label>
-              <Input
-                id="template-id"
+        <div className="flex flex-col gap-3 p-4">
+          <div className="grid grid-cols-2 gap-3">
+            <label className="text-sm text-muted-foreground">
+              Template ID
+              <input
                 value={form.id}
                 onChange={(e) =>
                   setForm({ ...form, id: e.target.value.toLowerCase() })
                 }
                 placeholder="e.g. reviewer"
+                className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
               />
-              <p className="text-xs text-muted-foreground">
-                Lowercase, hyphen allowed
-              </p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="template-name">Display Name</Label>
-              <Input
-                id="template-name"
+            </label>
+            <label className="text-sm text-muted-foreground">
+              Display Name
+              <input
                 value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })}
                 placeholder="e.g. Code Reviewer"
+                className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
               />
-            </div>
+            </label>
           </div>
 
-          <div className="space-y-2">
-            <Label htmlFor="template-tagline">Tagline</Label>
-            <Input
-              id="template-tagline"
+          <label className="text-sm text-muted-foreground">
+            Tagline
+            <input
               value={form.tagline}
               onChange={(e) => setForm({ ...form, tagline: e.target.value })}
               placeholder="e.g. Gatekeeper: catch bugs before they ship"
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
-          </div>
+          </label>
 
-          <div className="space-y-2">
-            <Label htmlFor="template-role">Role</Label>
-            <Input
-              id="template-role"
+          <label className="text-sm text-muted-foreground">
+            Role
+            <input
               value={form.role}
               onChange={(e) => setForm({ ...form, role: e.target.value })}
               placeholder="e.g. Reviewer"
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
-          </div>
+          </label>
 
-          <div className="space-y-2">
-            <Label htmlFor="template-goal">Goal</Label>
-            <Textarea
-              id="template-goal"
+          <label className="text-sm text-muted-foreground">
+            Goal
+            <textarea
               value={form.goal}
               onChange={(e) => setForm({ ...form, goal: e.target.value })}
               placeholder="e.g. Review PRs thoroughly, flag issues, approve only when safe"
               rows={2}
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
-          </div>
+          </label>
 
-          <div className="space-y-2">
-            <Label htmlFor="template-truths">Core Truths</Label>
-            <Textarea
-              id="template-truths"
+          <label className="text-sm text-muted-foreground">
+            Core Truths
+            <textarea
               value={form.core_truths}
               onChange={(e) =>
                 setForm({ ...form, core_truths: e.target.value })
               }
               placeholder="One principle per line, e.g.:&#10;- Always verify before approving&#10;- Flag security issues immediately"
               rows={3}
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
-          </div>
+          </label>
 
-          <div className="space-y-2">
-            <Label htmlFor="template-boundaries">Boundaries</Label>
-            <Textarea
-              id="template-boundaries"
+          <label className="text-sm text-muted-foreground">
+            Boundaries
+            <textarea
               value={form.boundaries}
               onChange={(e) =>
                 setForm({ ...form, boundaries: e.target.value })
               }
               placeholder="What this agent should NOT do, e.g.:&#10;- Do not modify code&#10;- Do not merge without approval"
               rows={2}
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
-          </div>
+          </label>
 
-          <div className="space-y-2">
-            <Label htmlFor="template-vibe">Vibe</Label>
-            <Input
-              id="template-vibe"
+          <label className="text-sm text-muted-foreground">
+            Vibe
+            <input
               value={form.vibe}
               onChange={(e) => setForm({ ...form, vibe: e.target.value })}
               placeholder="e.g. Thorough, skeptical, kind"
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
-          </div>
+          </label>
 
-          <div className="space-y-2">
-            <Label htmlFor="template-continuity">Continuity</Label>
-            <Textarea
-              id="template-continuity"
+          <label className="text-sm text-muted-foreground">
+            Continuity
+            <textarea
               value={form.continuity}
               onChange={(e) =>
                 setForm({ ...form, continuity: e.target.value })
               }
               placeholder="How state persists, e.g.: Reviews persist in PR threads"
               rows={2}
+              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
             />
-          </div>
+          </label>
         </div>
 
-        <DialogFooter>
-          <Button variant="outline" onClick={() => setOpen(false)}>
-            Cancel
-          </Button>
-          <Button disabled={!canSubmit} onClick={submit}>
-            {busy ? "Creating…" : "Create Template"}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        <SheetFooter>
+          <div className="flex gap-2 p-4">
+            <Button variant="outline" onClick={() => setOpen(false)}>
+              Cancel
+            </Button>
+            <Button disabled={!canSubmit} onClick={submit}>
+              {busy ? "Creating…" : "Create Template"}
+            </Button>
+          </div>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   );
 }
