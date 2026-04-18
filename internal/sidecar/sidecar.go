@@ -30,6 +30,15 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 )
 
+// activeInbox tracks the inbox row currently being driven to the PTY so that
+// outbox rows appended by consumeTranscript carry the correct in_reply_to
+// foreign key. The relay uses this to fan out responses to the origin channel
+// (e.g. Telegram) even for agents that have no topic_agent_bindings.
+type activeInbox struct {
+	mu sync.RWMutex
+	id *uuid.UUID
+}
+
 // PtyDriver pipes `text` into the agent's interactive pty. The input is a
 // full user turn; the driver is responsible for chunking large inputs and
 // appending an Enter keystroke.
@@ -82,6 +91,7 @@ type SidecarRunner struct {
 	cfg     Config
 	driver  PtyDriver
 	tailer  TranscriptTailer
+	current activeInbox // last inbox row driven; stamped on outbox rows
 }
 
 // New constructs a sidecar. Both driver and tailer are required.
@@ -170,6 +180,15 @@ func (s *SidecarRunner) processOneInbox(ctx context.Context) (bool, error) {
 	}
 	row := rows[0]
 
+	// Record the active inbox row before driving so that any outbox rows
+	// appended by consumeTranscript during this turn carry the correct
+	// in_reply_to. The relay needs this to fan out responses to the origin
+	// Telegram chat for agents without topic_agent_bindings.
+	s.current.mu.Lock()
+	id := row.ID
+	s.current.id = &id
+	s.current.mu.Unlock()
+
 	text := extractInboxText(row.Content)
 	driveErr := s.driver.Drive(ctx, text)
 
@@ -220,6 +239,14 @@ func (s *SidecarRunner) appendOutbox(ctx context.Context, ev TranscriptEvent) {
 	if err != nil {
 		return
 	}
+
+	// Snapshot the active inbox id under the read lock. This stamps the
+	// outbox row with the inbox message that triggered this response so the
+	// relay can route replies back to the origin Telegram chat.
+	s.current.mu.RLock()
+	inReplyTo := s.current.id
+	s.current.mu.RUnlock()
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		log.Printf("sidecar %s: outbox begin: %v", s.cfg.AgentID, err)
@@ -227,8 +254,9 @@ func (s *SidecarRunner) appendOutbox(ctx context.Context, ev TranscriptEvent) {
 	}
 	defer tx.Rollback(ctx)
 	if _, err := mailbox.AppendOutbox(ctx, tx, mailbox.OutboxMessage{
-		AgentID: s.cfg.AgentID,
-		Content: content,
+		AgentID:   s.cfg.AgentID,
+		InReplyTo: inReplyTo,
+		Content:   content,
 	}); err != nil {
 		log.Printf("sidecar %s: outbox append: %v", s.cfg.AgentID, err)
 		return
