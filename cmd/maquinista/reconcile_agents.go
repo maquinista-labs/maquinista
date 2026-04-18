@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maquinista-labs/maquinista/internal/agent"
 	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/git"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
@@ -41,7 +44,9 @@ func reconcileAgentPanes(ctx context.Context, cfg *config.Config, pool *pgxpool.
 	// and 'dead' are permanent terminal states — skipped.
 	rows, err := pool.Query(ctx, `
 		SELECT id, COALESCE(cwd,''), COALESCE(tmux_window,''), COALESCE(runner_type,''),
-		       COALESCE(session_id,'')
+		       COALESCE(session_id,''),
+		       COALESCE(workspace_scope,'shared'),
+		       COALESCE(workspace_repo_root,'')
 		FROM agents
 		WHERE role = 'user'
 		  AND task_id IS NULL
@@ -55,12 +60,12 @@ func reconcileAgentPanes(ctx context.Context, cfg *config.Config, pool *pgxpool.
 	defer rows.Close()
 
 	type agentRow struct {
-		ID, CWD, TmuxWindow, RunnerType, SessionID string
+		ID, CWD, TmuxWindow, RunnerType, SessionID, WorkspaceScope, RepoRoot string
 	}
 	var agents []agentRow
 	for rows.Next() {
 		var a agentRow
-		if err := rows.Scan(&a.ID, &a.CWD, &a.TmuxWindow, &a.RunnerType, &a.SessionID); err != nil {
+		if err := rows.Scan(&a.ID, &a.CWD, &a.TmuxWindow, &a.RunnerType, &a.SessionID, &a.WorkspaceScope, &a.RepoRoot); err != nil {
 			return 0, err
 		}
 		agents = append(agents, a)
@@ -77,7 +82,7 @@ func reconcileAgentPanes(ctx context.Context, cfg *config.Config, pool *pgxpool.
 		if a.TmuxWindow != "" && tmuxWindowExists(cfg.TmuxSessionName, a.TmuxWindow) {
 			continue
 		}
-		if err := respawnAgent(ctx, cfg, pool, botState, defaultCWD, a.ID, a.CWD, a.RunnerType, a.SessionID); err != nil {
+		if err := respawnAgent(ctx, cfg, pool, botState, defaultCWD, a.ID, a.CWD, a.RunnerType, a.SessionID, a.WorkspaceScope, a.RepoRoot); err != nil {
 			log.Printf("reconcile: respawn %s: %v", a.ID, err)
 			continue
 		}
@@ -89,12 +94,57 @@ func reconcileAgentPanes(ctx context.Context, cfg *config.Config, pool *pgxpool.
 // respawnAgent recreates a tmux window for a known agent row. Reuses
 // the agents row's cwd / runner_type / session_id when set, falling
 // back to the daemon default for missing values.
-func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, botState *state.State, defaultCWD, agentID, cwd, runnerType, sessionID string) error {
+//
+// When workspaceScope is "agent" or "task" and workspaceRepoRoot is
+// populated, the tmux window opens in the resolved worktree dir and
+// the worktree is created on demand if missing (restart path).
+func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, botState *state.State, defaultCWD, agentID, cwd, runnerType, sessionID, workspaceScope, workspaceRepoRoot string) error {
 	if cwd == "" {
 		cwd = defaultCWD
 	}
 	if cwd == "" {
 		return errors.New("no cwd and no defaultCWD")
+	}
+
+	// Resolve the workspace layout. For scope=shared this is a no-op;
+	// for scope=agent we create (or reuse) a worktree under the
+	// project's repo root. scope=task agents don't go through this
+	// reconcile path — they're orchestrator-owned — but we handle the
+	// case defensively.
+	scope := agent.WorkspaceScope(workspaceScope)
+	if scope == "" {
+		scope = agent.ScopeShared
+	}
+	if scope != agent.ScopeShared {
+		repoRoot := workspaceRepoRoot
+		if repoRoot == "" {
+			// Legacy rows without workspace_repo_root: derive from cwd
+			// best-effort. Log once so the operator sees the deprecation.
+			if root, rerr := git.RepoRoot(cwd); rerr == nil {
+				repoRoot = root
+				log.Printf("reconcile: %s has scope=%s but no workspace_repo_root; inferred %s from cwd", agentID, scope, repoRoot)
+			} else {
+				return fmt.Errorf("scope=%s requires workspace_repo_root (row has cwd=%s, not a git repo: %v)", scope, cwd, rerr)
+			}
+		}
+		layout, err := agent.ResolveLayout(scope, repoRoot, agentID, "")
+		if err != nil {
+			return fmt.Errorf("resolving workspace layout: %w", err)
+		}
+		// Create the worktree on first start. If the directory already
+		// exists and is a worktree, reuse it — preserves in-flight work
+		// across daemon restarts.
+		if layout.WorktreeDir != "" {
+			if _, statErr := os.Stat(layout.WorktreeDir); os.IsNotExist(statErr) {
+				if werr := git.WorktreeAdd(layout.RepoRoot, layout.WorktreeDir, layout.Branch); werr != nil {
+					return fmt.Errorf("creating worktree %s: %w", layout.WorktreeDir, werr)
+				}
+				log.Printf("reconcile: %s created worktree %s on branch %s", agentID, layout.WorktreeDir, layout.Branch)
+			} else if statErr != nil {
+				return fmt.Errorf("stat worktree %s: %w", layout.WorktreeDir, statErr)
+			}
+		}
+		cwd = layout.WindowCWD()
 	}
 
 	// Temporarily override the daemon's default runner so

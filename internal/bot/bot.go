@@ -141,6 +141,7 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "jobs", Description: "List scheduled jobs"},
 		tgbotapi.BotCommand{Command: "hooks", Description: "List webhook handlers"},
 		tgbotapi.BotCommand{Command: "job_runs", Description: "Show run history for a job"},
+		tgbotapi.BotCommand{Command: "ws", Description: "Manage agent workspaces (list/new/switch/archive)"},
 	)
 	if _, err := b.api.Request(commands); err != nil {
 		log.Printf("Warning: failed to register bot commands: %v", err)

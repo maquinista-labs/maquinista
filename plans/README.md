@@ -32,6 +32,7 @@
 | [`active/resume-memory-refresh.md`](active/resume-memory-refresh.md) | not started | First-turn catch-up inject so `claude --resume <sid>` picks up memory / soul deltas written while the daemon was down. |
 | [`active/pi-integration.md`](active/pi-integration.md) | not started | Add pi (`@mariozechner/pi-coding-agent`) as a fourth runner — `PiRunner`, `PiProfile`, `PiSource`. |
 | [`active/productization-saas.md`](active/productization-saas.md) | not started | Multi-tenant SaaS turn — workspaces, RLS, billing, onboarding, pricing. Depends on dashboard auth. |
+| [`active/workspace-scopes.md`](active/workspace-scopes.md) | partial (Phases 1–4 shipped) | Unify the three spawn paths (`Spawn`, `SpawnWithWorktree`, `/t_pickw`) behind `WorkspaceScope` + `Layout`. Phase 2 fixes the `git.RepoRoot(".")` bug. Phase 3 adds migration 027 + scope-aware reconcile. Phase 4 rewires `maquinista spawn/run` (`--worktrees` deprecated for `--scope`). Phase 5 (lifecycle parity on Kill), Phase 6 (workspaces as first-class child rows of agents, migration 028 + `ws` subcommands), Phase 7 (dashboard + Telegram `/ws` surfaces) outstanding. |
 
 ### Reference (design docs)
 

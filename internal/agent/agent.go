@@ -27,102 +27,146 @@ type Agent struct {
 	Branch      *string
 }
 
-// Spawn registers an agent in the DB, creates a tmux window, and sends the bootstrap command.
-// role should be "executor" (default) or "planner".
+// Spawn registers an agent in the DB, creates a tmux window, and sends
+// the bootstrap command. role should be "executor" (default) or "planner".
+//
+// Thin wrapper around SpawnWithLayout: ScopeShared, repoRoot = abs(".").
+// Prefer SpawnWithLayout for new callers so the repo root is explicit.
 func Spawn(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env map[string]string, r runner.AgentRunner, role string) (*Agent, error) {
-	runnerName := "claude"
-	if r != nil {
-		runnerName = r.Name()
+	cwd, err := filepath.Abs(".")
+	if err != nil {
+		return nil, fmt.Errorf("resolving cwd: %w", err)
 	}
-	if role == "" {
-		role = "executor"
+	layout, err := ResolveLayout(ScopeShared, cwd, agentID, "")
+	if err != nil {
+		return nil, err
 	}
-
-	if err := db.RegisterAgent(pool, agentID, tmuxSession, agentID, nil, nil, runnerName, nil, role); err != nil {
-		return nil, fmt.Errorf("registering agent: %w", err)
-	}
-
-	// Merge runner env overrides into the tmux window env.
-	mergedEnv := mergeEnv(env, r)
-
-	if err := tmux.NewWindowWithDir(tmuxSession, agentID, ".", mergedEnv); err != nil {
-		db.DeleteAgent(pool, agentID)
-		return nil, fmt.Errorf("creating tmux window: %w", err)
-	}
-
-	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, nil, nil, r)
-
-	if r != nil && !r.HasSessionHook() {
-		workDir, _ := filepath.Abs(".")
-		upsertHooklessAgentCWD(pool, agentID, workDir)
-	}
-
-	now := time.Now()
-	return &Agent{
-		ID:          agentID,
-		TmuxSession: tmuxSession,
-		TmuxWindow:  agentID,
-		Status:      "idle",
-		StartedAt:   now,
-		LastSeen:    &now,
-	}, nil
+	return SpawnWithLayout(pool, tmuxSession, agentID, claudeMDPath, env, r, role, layout)
 }
 
 // SpawnWithWorktree registers an agent with an isolated git worktree.
 // role should be "executor" (default) or "planner".
+//
+// Legacy wrapper around SpawnWithLayout. Resolves the repo root from
+// the process cwd via git.RepoRoot(".") — callers that can't guarantee
+// the binary was launched from inside the target repo should use
+// SpawnWithLayout + ResolveLayout(ScopeAgent, ...) directly.
 func SpawnWithWorktree(pool *pgxpool.Pool, tmuxSession, agentID, claudeMDPath string, env map[string]string, r runner.AgentRunner, role string) (*Agent, error) {
 	repoRoot, err := git.RepoRoot(".")
 	if err != nil {
 		return nil, fmt.Errorf("finding repo root: %w", err)
 	}
+	layout, err := ResolveLayout(ScopeAgent, repoRoot, agentID, "")
+	if err != nil {
+		return nil, err
+	}
+	return SpawnWithLayout(pool, tmuxSession, agentID, claudeMDPath, env, r, role, layout)
+}
 
-	worktreeDir := filepath.Join(repoRoot, ".maquinista", "worktrees", agentID)
-	branch := "maquinista/" + agentID
-
-	if err := git.WorktreeAdd(repoRoot, worktreeDir, branch); err != nil {
-		return nil, fmt.Errorf("creating worktree: %w", err)
+// SpawnWithLayout is the unified spawn entry point parameterized by a
+// resolved workspace Layout. For ScopeShared it behaves like the old
+// Spawn(); for ScopeAgent / ScopeTask it creates (or reuses) the
+// worktree at layout.WorktreeDir on layout.Branch.
+//
+// Reuse semantics: if layout.WorktreeDir already exists and is a git
+// worktree, the existing directory is reused in place (no new branch,
+// no WorktreeAdd). Intended for persistent ScopeAgent panes that
+// restart across daemon restarts.
+func SpawnWithLayout(
+	pool *pgxpool.Pool,
+	tmuxSession, agentID, claudeMDPath string,
+	env map[string]string,
+	r runner.AgentRunner,
+	role string,
+	layout Layout,
+) (*Agent, error) {
+	if err := layout.Scope.Validate(); err != nil {
+		return nil, err
+	}
+	if layout.RepoRoot == "" {
+		return nil, fmt.Errorf("SpawnWithLayout: layout.RepoRoot is empty")
 	}
 
 	runnerName := "claude"
 	if r != nil {
 		runnerName = r.Name()
 	}
-
 	if role == "" {
 		role = "executor"
 	}
 
-	if err := db.RegisterAgent(pool, agentID, tmuxSession, agentID, &worktreeDir, &branch, runnerName, nil, role); err != nil {
-		git.WorktreeRemove(repoRoot, worktreeDir)
+	// Create the worktree for scoped layouts. Reuse if the directory
+	// already exists (restart case).
+	createdWorktree := false
+	if layout.WorktreeDir != "" {
+		switch existing, err := os.Stat(layout.WorktreeDir); {
+		case err == nil && existing.IsDir():
+			// Reuse in place. Sanity-check that the dir actually belongs
+			// to the expected repo — a stale directory from a different
+			// project would silently bind the agent to the wrong code.
+			if actualRoot, rerr := git.RepoRoot(layout.WorktreeDir); rerr != nil {
+				return nil, fmt.Errorf("reusing worktree %s: %w", layout.WorktreeDir, rerr)
+			} else if filepath.Clean(actualRoot) != filepath.Clean(layout.WorktreeDir) && filepath.Clean(actualRoot) != filepath.Clean(layout.RepoRoot) {
+				// actualRoot being the worktree itself is fine (git
+				// reports the worktree as its own root). We only fail
+				// when it's clearly a different repo.
+				return nil, fmt.Errorf("worktree %s belongs to %s, not %s", layout.WorktreeDir, actualRoot, layout.RepoRoot)
+			}
+		case err == nil && !existing.IsDir():
+			return nil, fmt.Errorf("worktree path %s exists and is not a directory", layout.WorktreeDir)
+		case os.IsNotExist(err):
+			if err := git.WorktreeAdd(layout.RepoRoot, layout.WorktreeDir, layout.Branch); err != nil {
+				return nil, fmt.Errorf("creating worktree: %w", err)
+			}
+			createdWorktree = true
+		default:
+			return nil, fmt.Errorf("stat worktree %s: %w", layout.WorktreeDir, err)
+		}
+	}
+
+	// DB registration.
+	var worktreeDirPtr, branchPtr *string
+	if layout.WorktreeDir != "" {
+		worktreeDirPtr = &layout.WorktreeDir
+		branchPtr = &layout.Branch
+	}
+	if err := db.RegisterAgent(pool, agentID, tmuxSession, agentID, worktreeDirPtr, branchPtr, runnerName, nil, role); err != nil {
+		if createdWorktree {
+			git.WorktreeRemove(layout.RepoRoot, layout.WorktreeDir)
+		}
 		return nil, fmt.Errorf("registering agent: %w", err)
 	}
 
-	// Merge runner env overrides into the tmux window env.
+	// Tmux window.
 	mergedEnv := mergeEnv(env, r)
-
-	if err := tmux.NewWindowWithDir(tmuxSession, agentID, worktreeDir, mergedEnv); err != nil {
+	if err := tmux.NewWindowWithDir(tmuxSession, agentID, layout.WindowCWD(), mergedEnv); err != nil {
 		db.DeleteAgent(pool, agentID)
-		git.WorktreeRemove(repoRoot, worktreeDir)
+		if createdWorktree {
+			git.WorktreeRemove(layout.RepoRoot, layout.WorktreeDir)
+		}
 		return nil, fmt.Errorf("creating tmux window: %w", err)
 	}
 
-	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, &worktreeDir, &branch, r)
+	sendBootstrap(tmuxSession, agentID, claudeMDPath, env, worktreeDirPtr, branchPtr, r)
 
 	if r != nil && !r.HasSessionHook() {
-		upsertHooklessAgentCWD(pool, agentID, worktreeDir)
+		upsertHooklessAgentCWD(pool, agentID, layout.WindowCWD())
 	}
 
 	now := time.Now()
-	return &Agent{
+	a := &Agent{
 		ID:          agentID,
 		TmuxSession: tmuxSession,
 		TmuxWindow:  agentID,
 		Status:      "idle",
 		StartedAt:   now,
 		LastSeen:    &now,
-		WorktreeDir: &worktreeDir,
-		Branch:      &branch,
-	}, nil
+	}
+	if layout.WorktreeDir != "" {
+		a.WorktreeDir = &layout.WorktreeDir
+		a.Branch = &layout.Branch
+	}
+	return a, nil
 }
 
 // upsertHooklessAgentCWD persists the working directory on the agents

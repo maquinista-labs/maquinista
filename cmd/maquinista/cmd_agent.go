@@ -9,8 +9,10 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/maquinista-labs/maquinista/internal/agent"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/git"
 	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
@@ -34,6 +36,8 @@ var (
 	agentAddSoulTemplate string
 	agentAddSystemPrompt string
 	agentAddPersona      string
+	agentAddScope        string
+	agentAddRepoRoot     string
 )
 
 var agentAddCmd = &cobra.Command{
@@ -123,11 +127,15 @@ func init() {
 	agentAddCmd.Flags().StringVar(&agentAddSoulTemplate, "soul-template", "", "soul template id (default: 'default')")
 	agentAddCmd.Flags().StringVar(&agentAddSystemPrompt, "system-prompt", "", "file to load into agent_settings.system_prompt")
 	agentAddCmd.Flags().StringVar(&agentAddPersona, "persona", "", "agent_settings.persona text")
+	agentAddCmd.Flags().StringVar(&agentAddScope, "scope", "shared", "workspace scope: shared | agent | task (see plans/active/workspace-scopes.md)")
+	agentAddCmd.Flags().StringVar(&agentAddRepoRoot, "repo", "", "project git repo root (required when --scope=agent; defaults to --cwd if that's a git repo)")
 
 	agentEditCmd.Flags().StringVar(&agentAddRunner, "runner", "", "new runner_type")
 	agentEditCmd.Flags().StringVar(&agentAddCWD, "cwd", "", "new agent working directory")
 	agentEditCmd.Flags().StringVar(&agentAddSystemPrompt, "system-prompt", "", "new system prompt file")
 	agentEditCmd.Flags().StringVar(&agentAddPersona, "persona", "", "new persona text")
+	agentEditCmd.Flags().StringVar(&agentAddScope, "scope", "", "new workspace scope (shared | agent | task); empty = unchanged")
+	agentEditCmd.Flags().StringVar(&agentAddRepoRoot, "repo", "", "new project git repo root; empty = unchanged")
 
 	agentLogsCmd.Flags().IntVar(&agentLogsLines, "lines", 50, "number of lines to capture")
 
@@ -195,6 +203,38 @@ func runAgentAdd(id string) error {
 		}
 	}
 
+	// Resolve + validate the workspace scope. For scope='agent' we need
+	// a repo root: honor --repo, otherwise infer from --cwd if that's a
+	// git repo. Persisting workspace_repo_root now (rather than deriving
+	// at reconcile time) keeps the layout deterministic across daemon
+	// restarts.
+	scope := agent.WorkspaceScope(agentAddScope)
+	if scope == "" {
+		scope = agent.ScopeShared
+	}
+	if err := scope.Validate(); err != nil {
+		return err
+	}
+	repoRoot := agentAddRepoRoot
+	if scope == agent.ScopeAgent && repoRoot == "" {
+		repoRoot = cwd
+	}
+	if scope == agent.ScopeAgent {
+		if repoRoot == "" {
+			return fmt.Errorf("--scope=agent requires --repo or a --cwd that's a git repo")
+		}
+		// Trial resolve so the operator sees typos early.
+		if _, err := agent.ResolveLayout(scope, repoRoot, id, ""); err != nil {
+			return fmt.Errorf("validate workspace layout: %w", err)
+		}
+		// Confirm the repo_root is actually a git repo — catches /tmp,
+		// typos, and non-git directories before spawn time, where the
+		// error would surface as an opaque "git worktree add" failure.
+		if _, err := git.RepoRoot(repoRoot); err != nil {
+			return fmt.Errorf("--repo %q is not a git repository: %w", repoRoot, err)
+		}
+	}
+
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -206,9 +246,10 @@ func runAgentAdd(id string) error {
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO agents
 			(id, tmux_session, tmux_window, role, status, runner_type,
-			 cwd, window_name, started_at, last_seen, stop_requested)
-		VALUES ($1, 'maquinista', '', $2, 'stopped', $3, $4, $1, NOW(), NOW(), FALSE)
-	`, id, agentAddRole, agentAddRunner, cwd); err != nil {
+			 cwd, window_name, started_at, last_seen, stop_requested,
+			 workspace_scope, workspace_repo_root)
+		VALUES ($1, 'maquinista', '', $2, 'stopped', $3, $4, $1, NOW(), NOW(), FALSE, $5, NULLIF($6, ''))
+	`, id, agentAddRole, agentAddRunner, cwd, string(scope), repoRoot); err != nil {
 		return fmt.Errorf("insert agent %s: %w", id, err)
 	}
 
@@ -252,10 +293,48 @@ func runAgentAdd(id string) error {
 		return fmt.Errorf("soul create: %w", err)
 	}
 
+	// Phase 6 of plans/active/workspace-scopes.md: every agent gets a
+	// default workspace row at creation so the "workspaces as children"
+	// invariant holds for new agents too (migration 028 backfilled
+	// pre-existing rows). For scope=shared this is just a cwd pointer;
+	// for scope=agent it carries the resolved worktree_dir + branch.
+	wsID := id + "@default"
+	if err := insertWorkspaceRow(ctx, tx, wsID, id, scope, repoRoot); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE agents SET active_workspace_id=$1 WHERE id=$2`, wsID, id); err != nil {
+		return fmt.Errorf("activate default workspace: %w", err)
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
-	fmt.Printf("Added agent %s (runner=%s, cwd=%s)\n", id, agentAddRunner, cwd)
+	fmt.Printf("Added agent %s (runner=%s, cwd=%s, scope=%s, workspace=%s)\n",
+		id, agentAddRunner, cwd, scope, wsID)
+	return nil
+}
+
+// insertWorkspaceRow inserts a canonical agent_workspaces row given a
+// resolved scope + repo root. For scope=shared, worktree_dir and branch
+// are left NULL. For scope=agent/task, the worktree path and branch
+// name come from ResolveLayout so the SQL backfill in migration 028
+// and the runtime formula stay in lockstep.
+func insertWorkspaceRow(ctx context.Context, tx pgx.Tx, workspaceID, agentID string, scope agent.WorkspaceScope, repoRoot string) error {
+	var worktreeDir, branch *string
+	if scope != agent.ScopeShared {
+		layout, err := agent.ResolveLayout(scope, repoRoot, agentID, "")
+		if err != nil {
+			return fmt.Errorf("resolve layout for workspace: %w", err)
+		}
+		worktreeDir = &layout.WorktreeDir
+		branch = &layout.Branch
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agent_workspaces (id, agent_id, scope, repo_root, worktree_dir, branch)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, workspaceID, agentID, string(scope), repoRoot, worktreeDir, branch); err != nil {
+		return fmt.Errorf("insert agent_workspaces: %w", err)
+	}
 	return nil
 }
 
@@ -331,6 +410,20 @@ func runAgentEdit(id string) error {
 	if agentAddCWD != "" {
 		if _, err := tx.Exec(ctx, `UPDATE agents SET cwd=$1 WHERE id=$2`, agentAddCWD, id); err != nil {
 			return fmt.Errorf("set cwd: %w", err)
+		}
+	}
+	if agentAddScope != "" {
+		scope := agent.WorkspaceScope(agentAddScope)
+		if err := scope.Validate(); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE agents SET workspace_scope=$1 WHERE id=$2`, string(scope), id); err != nil {
+			return fmt.Errorf("set workspace_scope: %w", err)
+		}
+	}
+	if agentAddRepoRoot != "" {
+		if _, err := tx.Exec(ctx, `UPDATE agents SET workspace_repo_root=$1 WHERE id=$2`, agentAddRepoRoot, id); err != nil {
+			return fmt.Errorf("set workspace_repo_root: %w", err)
 		}
 	}
 	if agentAddSystemPrompt != "" {

@@ -19,6 +19,8 @@ var (
 	runAttach    bool
 	runWorktrees bool
 	runRunner    string
+	runScope     string
+	runRepoRoot  string
 )
 
 var runCmd = &cobra.Command{
@@ -53,12 +55,40 @@ var runCmd = &cobra.Command{
 			return fmt.Errorf("unknown runner %q: %w", runRunner, err)
 		}
 
-		// Pre-flight checks for worktree mode.
-		if runWorktrees {
-			if _, err := git.RepoRoot("."); err != nil {
-				return fmt.Errorf("--worktrees requires a git repository: %w", err)
+		// Resolve scope. --worktrees is the deprecated alias for
+		// --scope=agent; --scope wins on conflict.
+		scope := agent.WorkspaceScope(runScope)
+		if scope == "" {
+			if runWorktrees {
+				fmt.Fprintln(os.Stderr, "warning: --worktrees is deprecated; use --scope=agent")
+				scope = agent.ScopeAgent
+			} else {
+				scope = agent.ScopeShared
 			}
-			if dirty, _ := git.HasUncommittedChanges("."); dirty {
+		} else if runWorktrees {
+			fmt.Fprintln(os.Stderr, "warning: both --scope and --worktrees set; --scope wins")
+		}
+		if err := scope.Validate(); err != nil {
+			return err
+		}
+
+		// Resolve the project repo root explicitly — no magic process
+		// cwd dependency baked into the agent package.
+		repoRoot := runRepoRoot
+		if repoRoot == "" {
+			if scope == agent.ScopeAgent {
+				root, rerr := git.RepoRoot(".")
+				if rerr != nil {
+					return fmt.Errorf("--scope=agent requires --repo or to be run from inside a git repository: %w", rerr)
+				}
+				repoRoot = root
+			} else {
+				cwd, _ := os.Getwd()
+				repoRoot = cwd
+			}
+		}
+		if scope == agent.ScopeAgent {
+			if dirty, _ := git.HasUncommittedChanges(repoRoot); dirty {
 				fmt.Println("warning: working tree has uncommitted changes")
 			}
 		}
@@ -75,13 +105,11 @@ var runCmd = &cobra.Command{
 		}
 
 		for _, name := range names {
-			var a *agent.Agent
-			var err error
-			if runWorktrees {
-				a, err = agent.SpawnWithWorktree(pool, session, name, claudeMD, env, r, "executor")
-			} else {
-				a, err = agent.Spawn(pool, session, name, claudeMD, env, r, "executor")
+			layout, lerr := agent.ResolveLayout(scope, repoRoot, name, "")
+			if lerr != nil {
+				return lerr
 			}
+			a, err := agent.SpawnWithLayout(pool, session, name, claudeMD, env, r, "executor", layout)
 			if err != nil {
 				return fmt.Errorf("spawning %s: %w", name, err)
 			}
@@ -104,7 +132,9 @@ func init() {
 	runCmd.Flags().IntVar(&runAgents, "agents", 1, "number of agents to spawn")
 	runCmd.Flags().StringVar(&runNames, "names", "", "comma-separated agent names")
 	runCmd.Flags().BoolVar(&runAttach, "attach", false, "attach to tmux session after spawning")
-	runCmd.Flags().BoolVar(&runWorktrees, "worktrees", false, "isolate each agent in a git worktree")
+	runCmd.Flags().BoolVar(&runWorktrees, "worktrees", false, "deprecated alias for --scope=agent")
+	runCmd.Flags().StringVar(&runScope, "scope", "", "workspace scope: shared | agent (default: shared; see plans/active/workspace-scopes.md)")
+	runCmd.Flags().StringVar(&runRepoRoot, "repo", "", "project git repo root (defaults to process cwd's git root for --scope=agent)")
 	runCmd.Flags().StringVar(&runRunner, "runner", "claude", "agent runner to use (claude, openclaude, opencode)")
 	rootCmd.AddCommand(runCmd)
 }

@@ -98,6 +98,8 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleHooksCommand(msg)
 	case "job_runs":
 		b.handleJobRunsCommand(msg)
+	case "ws":
+		b.handleWsCommand(msg)
 	default:
 		b.reply(msg.Chat.ID, getThreadID(msg), "Unknown command: /"+msg.Command())
 	}
