@@ -5,10 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/signal"
 	"path/filepath"
-	"strconv"
-	"syscall"
 	"time"
 
 	"github.com/maquinista-labs/maquinista/hook"
@@ -26,6 +23,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Per plans/active/detached-processes.md, the orchestrator daemon
+// lives under `maquinista orchestrator start` (see
+// cmd_orchestrator.go). Top-level `start` is temporarily kept as a
+// deprecation shim that delegates to the same supervisor body. D.4
+// replaces it with a two-daemon (orchestrator + dashboard) bootstrap.
+
 var (
 	// start --runner flag (default runner for all agents)
 	startRunner string
@@ -41,15 +44,10 @@ var (
 
 var startCmd = &cobra.Command{
 	Use:   "start",
-	Short: "Start the Telegram bot daemon",
-	PreRunE: func(cmd *cobra.Command, args []string) error {
-		if cfgPath != "" {
-			return nil
-		}
-		return nil
-	},
+	Short: "Start the orchestrator daemon (deprecated alias for `orchestrator start`)",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runStart()
+		fmt.Fprintln(os.Stderr, "warning: `maquinista start` is a deprecated alias; use `maquinista orchestrator start` for the bot daemon (D.4 will repurpose `maquinista start` for the full stack).")
+		return runOrchestratorStart(cmd.Context())
 	},
 }
 
@@ -62,66 +60,15 @@ func init() {
 	startCmd.Flags().IntVar(&startOrchMaxAgents, "orchestrate-max-agents", 3, "max agents for orchestrator")
 	startCmd.Flags().StringVar(&startOrchRunner, "orchestrate-runner", "claude", "runner for orchestrator")
 	startCmd.Flags().BoolVar(&startOrchWorktrees, "orchestrate-worktrees", false, "use worktrees for orchestrator agents")
+	startCmd.Flags().BoolVarP(&orchestratorStartForeground, "foreground", "F", false, "run in the current terminal (default: detach and return immediately)")
 }
 
-func pidFilePath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "/tmp/maquinista.pid"
-	}
-	dir := filepath.Join(home, ".maquinista")
-	_ = os.MkdirAll(dir, 0o755)
-	return filepath.Join(dir, "maquinista.pid")
-}
-
-func writePIDFile() error {
-	return os.WriteFile(pidFilePath(), []byte(strconv.Itoa(os.Getpid())), 0o644)
-}
-
-func removePIDFile() {
-	_ = os.Remove(pidFilePath())
-}
-
-// readPIDFile returns the PID from the PID file. Returns 0 if the file doesn't exist.
-func readPIDFile() (int, error) {
-	data, err := os.ReadFile(pidFilePath())
-	if os.IsNotExist(err) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	pid, err := strconv.Atoi(string(data))
-	if err != nil {
-		return 0, fmt.Errorf("invalid PID file: %w", err)
-	}
-	return pid, nil
-}
-
-// processAlive checks if a process with the given PID is running.
-func processAlive(pid int) bool {
-	proc, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	// Signal 0 checks if process exists without actually sending a signal.
-	return proc.Signal(syscall.Signal(0)) == nil
-}
-
-func runStart() error {
-	// Check for existing instance.
-	pid, err := readPIDFile()
-	if err != nil {
-		return fmt.Errorf("reading PID file: %w", err)
-	}
-	if pid != 0 {
-		if processAlive(pid) {
-			return fmt.Errorf("maquinista is already running (PID %d), use 'maquinista stop' first", pid)
-		}
-		log.Printf("Cleaning up stale PID file (PID %d is dead)", pid)
-		removePIDFile()
-	}
-
+// runOrchestratorSupervised is the bot + monitor + mailbox +
+// optional-orchestrator engine body. It used to live in a function
+// called runStart(); post-D.3 it's invoked from
+// daemonize.Run's foreground branch via runOrchestratorStart. The
+// ctx is pre-wired with SIGINT/SIGTERM handling by daemonize.
+func runOrchestratorSupervised(ctx context.Context) error {
 	// Ensure the Claude Code SessionStart hook is registered.
 	if err := hook.EnsureInstalled(); err != nil {
 		log.Printf("Warning: failed to ensure hook is installed: %v", err)
@@ -137,14 +84,8 @@ func runStart() error {
 		cfg.DefaultRunner = startRunner
 	}
 
-	// Write PID file.
-	if err := writePIDFile(); err != nil {
-		return fmt.Errorf("writing PID file: %w", err)
-	}
-
 	b, err := bot.New(cfg)
 	if err != nil {
-		removePIDFile()
 		return fmt.Errorf("creating bot: %w", err)
 	}
 
@@ -248,15 +189,6 @@ func runStart() error {
 	}
 
 	sp := bot.NewStatusPoller(b, q, mon)
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
-
-	// Remove PID file on shutdown.
-	go func() {
-		<-ctx.Done()
-		removePIDFile()
-	}()
 
 	go mon.Run(ctx)
 	go sp.Run(ctx)

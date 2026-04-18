@@ -51,7 +51,7 @@ var serveCmd = &cobra.Command{
 	Short:  "Start the Telegram bot (alias for 'start')",
 	Hidden: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runStart()
+		return runOrchestratorStart(cmd.Context())
 	},
 }
 
