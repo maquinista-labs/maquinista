@@ -79,6 +79,16 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			}
 			return agentID, nil
 		}
+		// Race guard: another goroutine is already spawning this agent
+		// (status='spawning', tmux_window still empty). Return the existing
+		// agentID so the message gets enqueued — the in-progress spawn will
+		// assign the window. Without this, a second rapid message would
+		// create a second tmux pane and the two spawns race to write
+		// tmux_window, leaving state.json pointing at the wrong window.
+		if err == nil && status == "spawning" {
+			log.Printf("spawn_topic_agent: %s is already spawning; reusing", agentID)
+			return agentID, nil
+		}
 		if err == nil {
 			log.Printf("spawn_topic_agent: %s row says %s; respawning pane", agentID, status)
 			if _, uerr := pool.Exec(ctx, `
@@ -98,20 +108,22 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			return "", fmt.Errorf("ensuring tmux session: %w", err)
 		}
 
-		// Pre-register an agents row (status='stopped', no tmux_window yet)
-		// so the soul's FK resolves. We flip to 'running' with the real
-		// tmux_window after the pane is up.
+		// Pre-register an agents row with status='spawning' so any concurrent
+		// spawn (rapid second message before W1 is ready) sees the marker and
+		// returns early instead of creating a second tmux pane. We flip to
+		// 'running' with the real tmux_window after the pane is up.
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO agents
 				(id, tmux_session, tmux_window, role, status, runner_type,
 				 session_id, cwd, window_name,
 				 started_at, last_seen, stop_requested)
-			VALUES ($1, $2, '', 'user', 'stopped', $3, NULL, $4, $1, NOW(), NOW(), FALSE)
+			VALUES ($1, $2, '', 'user', 'spawning', $3, NULL, $4, $1, NOW(), NOW(), FALSE)
 			ON CONFLICT (id) DO UPDATE SET
 				tmux_session   = EXCLUDED.tmux_session,
 				runner_type    = EXCLUDED.runner_type,
 				cwd            = EXCLUDED.cwd,
 				window_name    = EXCLUDED.window_name,
+				status         = 'spawning',
 				stop_requested = FALSE
 		`, agentID, cfg.TmuxSessionName, cfg.DefaultRunner, cwd); err != nil {
 			return "", fmt.Errorf("pre-registering topic agent row: %w", err)

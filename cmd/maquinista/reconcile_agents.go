@@ -51,7 +51,14 @@ func reconcileAgentPanes(ctx context.Context, cfg *config.Config, pool *pgxpool.
 		WHERE role = 'user'
 		  AND task_id IS NULL
 		  AND stop_requested = FALSE
-		  AND status IN ('running','idle','working','stopped')
+		  AND (
+		        status IN ('running','idle','working','stopped')
+		        -- 'spawning' rows whose last_seen is stale mean the spawn process
+		        -- died mid-flight; treat them like 'stopped' so reconcile can
+		        -- recover. Fresh 'spawning' rows (last_seen < 60s ago) are
+		        -- skipped — another goroutine is actively creating the window.
+		        OR (status = 'spawning' AND last_seen < NOW() - INTERVAL '60 seconds')
+		      )
 		ORDER BY started_at ASC
 	`)
 	if err != nil {
