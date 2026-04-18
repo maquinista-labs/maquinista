@@ -232,6 +232,204 @@ Tests:
   display names (leans on G.3 landing first so the display helper
   is in place).
 
+### Commit G.5 — Spawn new agent from the dashboard
+
+Today: there is no way to create an agent from the UI. The only
+paths are `maquinista agent add <id>` on the command line and
+the bot's `/agent` command on a new Telegram topic. The
+dashboard operator has to context-switch to a terminal or to
+Telegram to expand the fleet — a painful gap on mobile, which
+is the dashboard's primary axis.
+
+What it should be: a "New agent" button on `/agents` opens a
+modal with four choices — **handle**, **runtime**, **model**,
+and **agent type** (soul template). Submitting creates a new
+Telegram forum topic in the operator's configured chat, mints
+the agent id as `t-<chat>-<thread>` (matching
+`cmd/maquinista/spawn_topic_agent.go:60`), inserts the agents
+row with `status='stopped'`, clones the selected soul template
+into `agent_souls`, and the existing reconcile loop brings the
+tmux pane online. The new agent shows up in `/agents` and
+`@mention` routing works from minute one because the Telegram
+topic already exists.
+
+Implementation notes:
+
+- **Models catalog.** New `internal/runner/models.yaml` (embedded
+  via `//go:embed`) — a fixed list of model ids the dashboard
+  offers per runtime. Starts minimal, edited in-tree as new
+  models land:
+
+  ```yaml
+  claude:
+    - id: claude-opus-4-7
+      label: Opus 4.7 (default)
+    - id: claude-sonnet-4-6
+      label: Sonnet 4.6
+  openclaude:
+    - id: GLM-5.1
+      label: GLM-5.1 (z.ai, default)
+    - id: minimax-m1
+      label: MiniMax M1
+  opencode:
+    - id: claude-sonnet-4-6
+      label: Sonnet 4.6 via opencode
+  ```
+
+  Loader in `internal/runner/models.go` exposes `Models(runner
+  string) []ModelChoice`. Default per runner is the first entry.
+
+- **Per-agent model storage.** Model is not on the `agents`
+  table today; each runner struct holds a `Model` field. New
+  migration `029_agent_model.sql` adds a nullable
+  `model TEXT` column to `agents`. `NULL` means "use the
+  runtime's hard-coded default" (today's behaviour). The
+  runner's `LaunchCommand(cfg)` signature already takes a
+  `Config` — extend `Config` with a `Model` field so each
+  runner can thread the choice into its launch string (e.g.
+  `claude --model=<model>` for Claude, `OPENAI_MODEL=<model>`
+  for openclaude). Falls back to the runner's default when
+  empty.
+
+- **Telegram topic creation.** Call the existing
+  `bot.createForumTopic(ctx, chatID, name)` helper
+  (`internal/bot/telegram.go:256`). The operator's chat id is
+  already configured for the bot — surface it via
+  `bot.PrimaryChatID()` (add the accessor if missing). The
+  topic name defaults to the handle the operator entered;
+  override is out of scope for v1.
+
+- **Spawn helper.** Extract the Go-side spawn path from
+  `cmd/maquinista/spawn_topic_agent.go` into a reusable helper
+  `agent.SpawnFromDashboard(ctx, pool, bot, spec)` where
+  `spec` holds `{handle, runner, model, soulTemplateID}`.
+  Helper:
+  1. Resolves primary chat id.
+  2. Calls `createForumTopic(chatID, handle)` → `threadID`.
+  3. Builds `agentID := fmt.Sprintf("t-%d-%s", chatID, threadID)`.
+  4. `INSERT INTO agents (id, handle, runner_type, model,
+     role, cwd, status, tmux_session, tmux_window)
+     VALUES (..., 'stopped', ...)`. `tmux_session` +
+     `tmux_window` derived the same way `cmd_agent.go` derives
+     them today.
+  5. `soul.CreateFromTemplate(ctx, pool, agentID, templateID,
+     nil)` (clone, no overrides).
+  6. Return the new agent row.
+  Reconcile picks it up on its next tick and the tmux pane
+  comes online within seconds.
+
+- **API endpoint.** `POST /api/agents` — body
+  `{handle, runner, model, soul_template}`. Validates: handle
+  matches existing regex `^[a-z0-9_-]{2,32}$` and is unique;
+  runner is in `runner.Runners()`; model is in
+  `runner.Models(runner)` (or empty → default); template exists
+  in `soul_templates`. Returns the new agent row. Emits an
+  `agent.spawned` audit entry.
+
+- **Uniqueness / collision handling — non-negotiable.** The UI
+  must never create a second agent that clashes with an existing
+  one on either the stable `id` or the human-facing `handle`.
+  Three layers enforce this, in this order:
+
+  1. **Live availability check (pre-submit UX).** The modal's
+     handle input debounces to `GET /api/agents/check-handle?
+     h=<value>` on every keystroke (300ms debounce). The endpoint
+     runs `SELECT 1 FROM agents WHERE lower(handle) = lower($1)
+     LIMIT 1` and returns `{available: bool}`. On `false`, the
+     form shows an inline error ("`coder` is already taken")
+     and the Submit button is disabled. This is UX only — the
+     server still re-validates on POST.
+  2. **Server-side pre-flight check in
+     `SpawnFromDashboard`.** Before calling
+     `createForumTopic` (which is the expensive, externally-
+     visible side effect), the helper runs the same handle
+     uniqueness query inside the same transaction it will use
+     for the insert. If the handle is taken → return 409
+     immediately. This avoids creating a stranded Telegram
+     topic for a request that was always going to fail.
+  3. **DB unique index as the final guard.** The existing
+     unique index on `lower(handle)` (migration 014) is the
+     last line of defence against race conditions — two
+     dashboards + one CLI fire simultaneously with the same
+     handle, only one insert wins. The loser's path hits
+     the constraint violation, runs the compensating
+     `deleteForumTopic` (if its topic call had already
+     succeeded), and surfaces a 409 to its caller.
+
+  Handle of the `t-<chat>-<thread>` id: id collisions are
+  impossible by construction (Telegram allocates a fresh
+  `message_thread_id` every call), but we still keep the
+  primary-key constraint as a belt-and-braces guard and treat
+  a 23505 on `agents.id` the same way — 409 + compensating
+  `deleteForumTopic`.
+
+  Error copy: server returns `{error: "handle_taken", handle:
+  "<value>"}` for 409s so the UI can render a tailored message
+  ("Handle `coder` is already taken — pick another.") instead
+  of a generic "409 Conflict".
+
+- **Catalog endpoint.** `GET /api/agents/new-catalog` returns
+  the three picklists in one payload so the modal can populate
+  without chained requests:
+
+  ```ts
+  {
+    runners: [{id, label}],
+    models:  {[runner]: [{id, label}]},
+    souls:   [{id, name, tagline}]
+  }
+  ```
+
+- **UI.** "New agent" button on `/agents` header, next to the
+  status filter. Opens a shadcn `<Dialog>` with four fields:
+  handle (text input with regex hint + live availability
+  check), runtime (`<Select>` from `runners`), model (`<Select>`
+  dependent on runtime — repopulates on runtime change), agent
+  type (`<Select>` from `souls`, showing `name` + `tagline`).
+  Submit calls `POST /api/agents`, optimistically appends the
+  new agent to the `useAgents()` cache, routes to
+  `/agents/[id]` on success. Failure toasts surface the API
+  error verbatim.
+
+- **Edge cases.**
+  - If `createForumTopic` fails (bot lacks forum perms, chat
+    isn't a forum): return 502 with the Telegram error,
+    **don't** insert the agents row.
+  - If the DB insert fails after topic creation: best-effort
+    `deleteForumTopic` call, otherwise log a "stranded topic"
+    warning with the thread id (the operator can clean up from
+    Telegram). Log line is the fallback until a proper
+    compensating action ships.
+  - Concurrent spawns with the same handle: rely on the
+    existing unique index on `lower(handle)` — second request
+    gets a 409 and the UI surfaces it.
+
+Tests:
+
+- Go unit tests for the models catalog loader (bad yaml, empty
+  runner, unknown runner).
+- Go integration test for `SpawnFromDashboard` against an
+  ephemeral Postgres **with a stubbed bot** that fakes
+  `createForumTopic` / `deleteForumTopic`. Covers happy path,
+  topic-creation failure (no row inserted), DB failure after
+  topic (compensation attempted).
+- Playwright: mock the Telegram stub at the Go layer (existing
+  test harness already has a bot stub), open `/agents`, click
+  "New agent", fill the form, assert the modal closes and we
+  land on `/agents/[id]` with the right handle / runtime /
+  model / soul. Assert the DB row has `status='stopped'` and
+  `agent_souls` has the template cloned.
+- Playwright collision spec: seed an agent with handle
+  `coder`, open the spawn modal, type `coder`, assert the
+  inline "already taken" error shows up, assert Submit is
+  disabled. Then seed a race by toggling the live check to
+  return `available=true` briefly and submitting anyway —
+  assert the server returns 409 with `error: "handle_taken"`
+  and the Telegram stub is called zero extra times (i.e. no
+  stranded topic). Seed a second race where the topic call
+  succeeds but the DB insert loses to a constraint violation
+  — assert the compensating `deleteForumTopic` fires.
+
 ### Triage backlog
 
 Gaps discovered but not yet scoped into a commit. Move up into
