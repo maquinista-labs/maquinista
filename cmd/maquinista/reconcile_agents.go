@@ -192,15 +192,13 @@ func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, b
 		log.Printf("reconcile: %s not ready within timeout: %v", agentID, err)
 	}
 
-	// Publish the new tmux_window and flip status.
+	// Publish the new tmux_window. Database controls status; only update
+	// tmux_window (derived state). Never override stop_requested or status.
 	upCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if _, err := pool.Exec(upCtx, `
 		UPDATE agents
-		SET tmux_window = $2,
-		    status = 'running',
-		    last_seen = NOW(),
-		    stop_requested = FALSE
+		SET tmux_window = $2, last_seen = NOW()
 		WHERE id = $1
 	`, agentID, windowID); err != nil {
 		return fmt.Errorf("update agents: %w", err)
