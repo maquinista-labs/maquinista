@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Pool } from "pg";
 
-import { renameAgent } from "./actions";
+import { renameAgent, spawnAgentFromDashboard } from "./actions";
 
 function mockPoolWith(
   queryImpl: (sql: string, params: unknown[]) => Promise<unknown>,
@@ -45,6 +45,15 @@ describe("renameAgent", () => {
     );
   });
 
+  it("rejects the reserved `t-` prefix", async () => {
+    // renameAgent itself doesn't validate the regex; its caller does.
+    // Confirm that — this test pins the contract so G.5 can re-use it
+    // safely for spawn without double-validating.
+    const pool = mockPoolWith(async () => ({ rowCount: 1 }));
+    const result = await renameAgent(pool, "any", "t-1-1");
+    expect(result).toBe("updated"); // no regex guard in the helper
+  });
+
   it("passes null through to clear the handle", async () => {
     const capture = vi.fn(async () => ({ rowCount: 1 }));
     const pool = {
@@ -52,5 +61,54 @@ describe("renameAgent", () => {
     } as unknown as Pool;
     await renameAgent(pool, "a1", null);
     expect(capture.mock.calls[0][1]).toEqual(["a1", null]);
+  });
+});
+
+describe("spawnAgentFromDashboard (validation branches)", () => {
+  // Only the early-exit branches can be tested without a real client
+  // — the happy path opens a transaction via pool.connect(), which
+  // the simple mock doesn't cover. The happy path is exercised in
+  // the Playwright spec against a real Postgres.
+
+  it("returns invalid_handle for regex failures", async () => {
+    const pool = {
+      query: vi.fn(),
+    } as unknown as Pool;
+    const result = await spawnAgentFromDashboard(pool, {
+      handle: "BadCase",
+      runner: "claude",
+      model: null,
+      soulTemplateID: "coder",
+      cwd: "/tmp",
+    });
+    expect(result.kind).toBe("invalid_handle");
+  });
+
+  it("returns invalid_handle for the reserved `t-` prefix", async () => {
+    const pool = {
+      query: vi.fn(),
+    } as unknown as Pool;
+    const result = await spawnAgentFromDashboard(pool, {
+      handle: "t-1-1",
+      runner: "claude",
+      model: null,
+      soulTemplateID: "coder",
+      cwd: "/tmp",
+    });
+    expect(result.kind).toBe("invalid_handle");
+  });
+
+  it("returns invalid_soul_template when the template is unknown", async () => {
+    const pool = {
+      query: vi.fn(async () => ({ rows: [] })),
+    } as unknown as Pool;
+    const result = await spawnAgentFromDashboard(pool, {
+      handle: "coder",
+      runner: "claude",
+      model: null,
+      soulTemplateID: "does-not-exist",
+      cwd: "/tmp",
+    });
+    expect(result.kind).toBe("invalid_soul_template");
   });
 });

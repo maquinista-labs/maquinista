@@ -6,6 +6,8 @@
 
 import type { Pool } from "pg";
 
+import { isValidHandle } from "@/lib/utils";
+
 export async function enqueueInboxFromDashboard(
   pool: Pool,
   args: {
@@ -89,6 +91,117 @@ export async function renameAgent(
       return "conflict";
     }
     throw err;
+  }
+}
+
+// spawnAgentFromDashboard creates a fresh agents row + cloned soul.
+// Uses the operator-entered handle as the stable id (agents.id is a
+// free-form TEXT pk; handle already matches the required regex).
+//
+// Phase-1 of G.5 — Telegram topic creation is deferred (expose
+// bot API across process boundary is out of scope for v1). The
+// agent comes up in the fleet and is reachable from the dashboard;
+// @mention routing from Telegram lands on the agent via the
+// existing handle-lookup path.
+//
+// Outcomes mirror renameAgent: returns either {kind:"created", id}
+// or a discriminated error for UX copy.
+export type SpawnAgentResult =
+  | { kind: "created"; id: string }
+  | { kind: "invalid_handle" }
+  | { kind: "invalid_runner" }
+  | { kind: "invalid_model" }
+  | { kind: "invalid_soul_template" }
+  | { kind: "handle_taken"; handle: string };
+
+export type SpawnAgentSpec = {
+  handle: string;
+  runner: string;
+  model: string | null;
+  soulTemplateID: string;
+  cwd: string;
+};
+
+export async function spawnAgentFromDashboard(
+  pool: Pool,
+  spec: SpawnAgentSpec,
+): Promise<SpawnAgentResult> {
+  if (!isValidHandle(spec.handle)) {
+    return { kind: "invalid_handle" };
+  }
+
+  const soulCheck = await pool.query(
+    `SELECT 1 FROM soul_templates WHERE id = $1 LIMIT 1`,
+    [spec.soulTemplateID],
+  );
+  if (soulCheck.rows.length === 0) {
+    return { kind: "invalid_soul_template" };
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const taken = await client.query(
+      `SELECT 1 FROM agents WHERE lower(handle) = lower($1) LIMIT 1`,
+      [spec.handle],
+    );
+    if (taken.rows.length > 0) {
+      await client.query("ROLLBACK");
+      return { kind: "handle_taken", handle: spec.handle };
+    }
+
+    try {
+      await client.query(
+        `INSERT INTO agents
+           (id, handle, tmux_session, tmux_window, role, status,
+            runner_type, model, cwd, window_name,
+            started_at, last_seen, stop_requested, workspace_scope)
+         VALUES
+           ($1, $1, 'maquinista', '', 'user', 'stopped',
+            $2, $3, $4, $1,
+            NOW(), NOW(), FALSE, 'shared')`,
+        [spec.handle, spec.runner, spec.model, spec.cwd],
+      );
+    } catch (err) {
+      await client.query("ROLLBACK");
+      if (
+        typeof err === "object" &&
+        err !== null &&
+        "code" in err &&
+        (err as { code: string }).code === "23505"
+      ) {
+        return { kind: "handle_taken", handle: spec.handle };
+      }
+      throw err;
+    }
+
+    // Clone the soul template into agent_souls. The SQL mirrors
+    // soul.CreateFromTemplate in Go — keep in sync if that signature
+    // changes.
+    await client.query(
+      `INSERT INTO agent_souls
+         (agent_id, template_id, name, tagline, role, goal,
+          core_truths, boundaries, vibe, continuity, extras,
+          allow_delegation, max_iter)
+       SELECT $1, id, name, tagline, role, goal,
+              core_truths, boundaries, vibe, continuity, extras,
+              allow_delegation, max_iter
+       FROM soul_templates WHERE id = $2`,
+      [spec.handle, spec.soulTemplateID],
+    );
+
+    await client.query("COMMIT");
+    return { kind: "created", id: spec.handle };
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch {
+      /* best effort */
+    }
+    throw err;
+  } finally {
+    client.release();
   }
 }
 

@@ -70,7 +70,7 @@ export async function listAgents(pool: Pool): Promise<AgentListItem[]> {
       a.id,
       a.handle,
       a.runner_type   AS runner,
-      NULL::text      AS model,
+      a.model         AS model,
       a.role,
       a.status,
       a.stop_requested,

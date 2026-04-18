@@ -5,6 +5,7 @@
 
 import { AgentsListClient } from "@/components/dash/agents-list-client";
 import { KpiStrip } from "@/components/dash/kpi-strip";
+import { SpawnAgent } from "@/components/dash/spawn-agent";
 import { SystemHealthCard } from "@/components/dash/system-health-card";
 import { getPool } from "@/lib/db";
 import { computeKPIs, listAgents } from "@/lib/queries";
@@ -26,7 +27,12 @@ export default async function AgentsPage() {
 
   return (
     <section className="mx-auto max-w-screen-sm px-4 py-6">
-      <h2 className="mb-3 text-xl font-semibold">Agents</h2>
+      <header className="mb-3 flex items-center gap-2">
+        <h2 className="text-xl font-semibold">Agents</h2>
+        <div className="ml-auto">
+          <SpawnAgent />
+        </div>
+      </header>
 
       {error && (
         <p
