@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strings"
@@ -123,11 +124,27 @@ func (b *Bot) handleAgentKillCommand(msg *tgbotapi.Message) {
 		return
 	}
 
-	// Resolve partial ID
 	agentID, err := resolveAgentID(pool, partialID)
 	if err != nil {
 		b.reply(chatID, threadID, fmt.Sprintf("Error: %v", err))
 		return
+	}
+
+	// Close the Telegram topic bound to this agent (if any) before killing.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var boundChatID int64
+	var boundThreadID int
+	if err := pool.QueryRow(ctx, `
+		SELECT chat_id::bigint, thread_id::int
+		FROM topic_agent_bindings
+		WHERE agent_id=$1 AND binding_type='owner'
+		  AND chat_id IS NOT NULL AND thread_id IS NOT NULL
+		LIMIT 1
+	`, agentID).Scan(&boundChatID, &boundThreadID); err == nil {
+		if err := b.closeForumTopic(boundChatID, boundThreadID); err != nil {
+			log.Printf("agent_kill: closeForumTopic for %s: %v", agentID, err)
+		}
 	}
 
 	if err := agent.Kill(pool, b.config.TmuxSessionName, agentID); err != nil {
