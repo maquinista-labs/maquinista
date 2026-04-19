@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +14,37 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+// waitForDNS polls Cloudflare's resolver (1.1.1.1) until tunnelURL's hostname
+// resolves or the context expires. Quick Tunnels are registered in Cloudflare
+// DNS within seconds; this prevents the browser from caching NXDOMAIN if the
+// user opens the URL before propagation completes.
+func waitForDNS(ctx context.Context, tunnelURL string) {
+	parsed, err := url.Parse(tunnelURL)
+	if err != nil {
+		return
+	}
+	host := parsed.Hostname()
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			// 2606:4700:4700::1111 is the IPv6 address of 1.1.1.1 — needed on
+			// IPv6-only hosts (e.g. Hetzner) where the IPv4 address is unreachable.
+			return (&net.Dialer{}).DialContext(ctx, "udp6", "[2606:4700:4700::1111]:53")
+		},
+	}
+	for {
+		if _, err := resolver.LookupHost(ctx, host); err == nil {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			log.Printf("auto-tunnel: DNS for %s did not resolve within timeout — proceeding anyway", host)
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
 
 // handleDashboard handles the /dashboard [duration] command.
 // It starts a Cloudflare Quick Tunnel to the local dashboard and replies with
@@ -166,6 +199,15 @@ func (b *Bot) StartPersistentTunnel(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("starting tunnel: %w", err)
 	}
+
+	log.Printf("auto-tunnel: tunnel established → %s (waiting for DNS…)", url)
+
+	// Poll until DNS resolves before surfacing the URL. Quick Tunnels register
+	// within seconds, but opening the URL before propagation causes browsers
+	// to cache NXDOMAIN, making the URL unusable until caches expire.
+	dnsCtx, dnsCancel := context.WithTimeout(ctx, 20*time.Second)
+	defer dnsCancel()
+	waitForDNS(dnsCtx, url)
 
 	log.Printf("auto-tunnel: dashboard ready → %s", url)
 

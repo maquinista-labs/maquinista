@@ -54,7 +54,7 @@ const mdComponents = {
     <em className="italic">{children}</em>
   ),
   code: ({ children }: { children?: React.ReactNode }) => (
-    <code className="rounded bg-foreground/10 px-1 py-0.5 font-mono text-xs">
+    <code className="rounded px-1 py-0.5 font-mono text-xs">
       {children}
     </code>
   ),
