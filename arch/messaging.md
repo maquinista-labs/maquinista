@@ -128,10 +128,11 @@ topic_agent_bindings (
 ```
 
 Dashboard-spawned agents have no binding at creation time. The
-`RunTopicProvisioner` background goroutine (15 s interval) finds agents
-without an owner binding and creates a Telegram forum topic + binding row
-for each. Until it fires, the agent is reachable from the dashboard but
-invisible to Telegram.
+`RunTopicProvisioner` background goroutine (15 s interval):
+- **Creates** topics for agents without an owner binding.
+- **Closes** topics and removes bindings for agents that are archived,
+  dead, or deleted so the relay stops delivering to them and the Telegram
+  group stays clean.
 
 ## in_reply_to is a routing hint, not required
 

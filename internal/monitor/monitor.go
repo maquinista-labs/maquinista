@@ -164,6 +164,33 @@ func (m *Monitor) poll() {
 					}
 				}
 			}
+
+			// Write assistant responses to agent_outbox once per entry,
+			// regardless of Telegram user binding. Dashboard-spawned agents
+			// have no state binding (users == nil) so enqueueEntry is never
+			// called for them — this ensures their outbox rows are written.
+			if m.OutboxWriter != nil {
+				for _, pe := range parsed {
+					if pe.Role != "assistant" {
+						continue
+					}
+					var text string
+					switch pe.ContentType {
+					case "text":
+						text = render.FormatText(pe.Text)
+					case "thinking":
+						text = render.FormatThinking(pe.Text)
+					}
+					if text == "" {
+						continue
+					}
+					m.OutboxWriter(OutboxEvent{
+						AgentID: sess.WindowID,
+						Role:    pe.Role,
+						Text:    text,
+					})
+				}
+			}
 		}
 	}
 
@@ -253,22 +280,6 @@ func (m *Monitor) enqueueEntry(userID int64, threadID int, chatID int64, windowI
 		ToolUseID:   pe.ToolUseID,
 		WindowID:    windowID,
 	})
-
-	// Shadow-mode mirror: write the same response into agent_outbox so the
-	// relay/dispatcher pipeline can be validated in parallel with the
-	// legacy Telegram path. Only assistant-produced content is mirrored —
-	// user echoes and internal thinking stay out of the outbox to match
-	// what reaches Telegram as an agent turn.
-	if m.OutboxWriter != nil && pe.Role == "assistant" && (pe.ContentType == "text" || pe.ContentType == "thinking") {
-		m.OutboxWriter(OutboxEvent{
-			AgentID:  windowID,
-			UserID:   userID,
-			ThreadID: threadID,
-			ChatID:   chatID,
-			Role:     pe.Role,
-			Text:     text,
-		})
-	}
 }
 
 // extractPlanJSON finds "PLAN_JSON:" marker followed by a JSON array,

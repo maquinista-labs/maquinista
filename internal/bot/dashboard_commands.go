@@ -32,12 +32,10 @@ func (b *Bot) handleDashboard(msg *tgbotapi.Message) {
 		rem := b.tunnel.RemainingTime()
 		if rem > 0 {
 			b.replyWithURLButton(chatID, threadID,
-				fmt.Sprintf("Tunnel already running (expires in %s):\n%s", rem.Round(time.Second), url),
+				fmt.Sprintf("Tunnel already running (expires in %s).", rem.Round(time.Second)),
 				url)
 		} else {
-			b.replyWithURLButton(chatID, threadID,
-				fmt.Sprintf("Tunnel running (no expiry):\n%s", url),
-				url)
+			b.replyWithURLButton(chatID, threadID, "Tunnel running (no expiry).", url)
 		}
 		return
 	}
@@ -79,9 +77,9 @@ func (b *Bot) handleDashboard(msg *tgbotapi.Message) {
 
 	var text string
 	if dur > 0 {
-		text = fmt.Sprintf("Dashboard available for %s:\n%s", dur.Round(time.Second), url)
+		text = fmt.Sprintf("Dashboard tunnel ready for %s (may take a few seconds to be reachable).", dur.Round(time.Second))
 	} else {
-		text = fmt.Sprintf("Dashboard (no expiry):\n%s", url)
+		text = "Dashboard tunnel ready (may take a few seconds to be reachable)."
 	}
 	b.replyWithURLButton(chatID, threadID, text, url)
 }

@@ -67,7 +67,8 @@ func (m *Manager) Start(ctx context.Context, localAddr string, dur time.Duration
 	}
 
 	// Verify cloudflared is available before spawning.
-	if _, err := exec.LookPath("cloudflared"); err != nil {
+	cfPath, err := lookupCloudflared()
+	if err != nil {
 		return "", ErrCloudflaredNotFound
 	}
 
@@ -75,8 +76,9 @@ func (m *Manager) Start(ctx context.Context, localAddr string, dur time.Duration
 	// process can be stopped independently of the caller's ctx.
 	procCtx, cancel := context.WithCancel(ctx)
 
-	cmd := exec.CommandContext(procCtx, "cloudflared", "tunnel",
+	cmd := exec.CommandContext(procCtx, cfPath, "tunnel",
 		"--no-autoupdate",
+		"--edge-ip-version", "6",
 		"--url", "http://"+localAddr,
 	)
 
@@ -205,4 +207,20 @@ func (m *Manager) RemainingTime() time.Duration {
 		return 0
 	}
 	return m.dur - elapsed
+}
+
+// lookupCloudflared finds the cloudflared binary. It first tries PATH, then
+// falls back to common install locations that may not be in the daemon's PATH.
+func lookupCloudflared() (string, error) {
+	for _, candidate := range []string{
+		"cloudflared",
+		"/usr/local/bin/cloudflared",
+		"/usr/bin/cloudflared",
+		"/opt/homebrew/bin/cloudflared",
+	} {
+		if p, err := exec.LookPath(candidate); err == nil {
+			return p, nil
+		}
+	}
+	return "", ErrCloudflaredNotFound
 }

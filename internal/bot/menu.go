@@ -60,6 +60,14 @@ func buildMenuKeyboard() tgbotapi.InlineKeyboardMarkup {
 		tgbotapi.NewInlineKeyboardRow(
 			tgbotapi.NewInlineKeyboardButtonData("Unclaim", "menu_t_unclaim"),
 		),
+		// Tunnel header
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("── Tunnel ──", "noop"),
+		),
+		tgbotapi.NewInlineKeyboardRow(
+			tgbotapi.NewInlineKeyboardButtonData("Dashboard", "menu_dashboard"),
+			tgbotapi.NewInlineKeyboardButtonData("Stop Tunnel", "menu_dashboard_stop"),
+		),
 	)
 }
 
@@ -103,6 +111,10 @@ func (b *Bot) handleMenuCallback(cq *tgbotapi.CallbackQuery) {
 		b.handlePlanCommand(msg)
 	case "t_unclaim":
 		b.handleUnclaimCommand(msg)
+	case "dashboard":
+		b.handleDashboard(msg)
+	case "dashboard_stop":
+		b.handleDashboardStop(msg)
 	}
 }
 

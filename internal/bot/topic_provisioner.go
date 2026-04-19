@@ -9,12 +9,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// RunTopicProvisioner runs as a background goroutine. Every 15 s it checks
-// for user agents that have no Telegram owner binding and creates a forum
-// topic for each one so the relay can deliver their responses to Telegram.
+// RunTopicProvisioner runs as a background goroutine. Every 15 s it:
+//   - creates Telegram forum topics for user agents that have none, and
+//   - closes + removes bindings for agents that have been archived or deleted.
 //
-// No-ops when AllowedGroups is empty (no group configured). Terminates when
-// ctx is cancelled.
+// No-ops when AllowedGroups is empty. Terminates when ctx is cancelled.
 func (b *Bot) RunTopicProvisioner(ctx context.Context, pool *pgxpool.Pool) {
 	if len(b.config.AllowedGroups) == 0 {
 		log.Println("topic provisioner: no ALLOWED_GROUPS configured — skipping")
@@ -34,6 +33,9 @@ func (b *Bot) RunTopicProvisioner(ctx context.Context, pool *pgxpool.Pool) {
 		case <-ticker.C:
 			if err := b.provisionMissingTopics(ctx, pool); err != nil {
 				log.Printf("topic provisioner: %v", err)
+			}
+			if err := b.closeOrphanedTopics(ctx, pool); err != nil {
+				log.Printf("topic provisioner (close): %v", err)
 			}
 		}
 	}
@@ -97,6 +99,59 @@ func (b *Bot) provisionMissingTopics(ctx context.Context, pool *pgxpool.Pool) er
 			continue
 		}
 		log.Printf("topic provisioner: created topic %d (chat %d) for agent %s", threadID, chatID, a.id)
+	}
+	return nil
+}
+
+// closeOrphanedTopics closes Telegram forum topics for agents that have been
+// archived (or whose row no longer exists) and removes the binding so the
+// relay stops delivering to them.
+func (b *Bot) closeOrphanedTopics(ctx context.Context, pool *pgxpool.Pool) error {
+	// Bindings whose agent is archived, dead, or deleted (LEFT JOIN → NULL).
+	rows, err := pool.Query(ctx, `
+		SELECT b.chat_id, b.thread_id::bigint, b.agent_id
+		FROM topic_agent_bindings b
+		LEFT JOIN agents a ON a.id = b.agent_id
+		WHERE b.binding_type = 'owner'
+		  AND b.chat_id IS NOT NULL
+		  AND b.thread_id IS NOT NULL
+		  AND (a.id IS NULL OR a.status IN ('archived', 'dead'))
+	`)
+	if err != nil {
+		return fmt.Errorf("query orphaned bindings: %w", err)
+	}
+	defer rows.Close()
+
+	type orphan struct {
+		chatID   int64
+		threadID int64
+		agentID  string
+	}
+	var orphans []orphan
+	for rows.Next() {
+		var o orphan
+		if err := rows.Scan(&o.chatID, &o.threadID, &o.agentID); err != nil {
+			return fmt.Errorf("scan: %w", err)
+		}
+		orphans = append(orphans, o)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, o := range orphans {
+		if err := b.closeForumTopic(o.chatID, int(o.threadID)); err != nil {
+			// Topic may already be closed or deleted — log and clean up binding anyway.
+			log.Printf("topic provisioner: close topic %d for agent %s: %v (removing binding)", o.threadID, o.agentID, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			DELETE FROM topic_agent_bindings
+			WHERE agent_id = $1 AND binding_type = 'owner'
+		`, o.agentID); err != nil {
+			log.Printf("topic provisioner: remove binding for agent %s: %v", o.agentID, err)
+			continue
+		}
+		log.Printf("topic provisioner: closed topic %d and removed binding for agent %s", o.threadID, o.agentID)
 	}
 	return nil
 }
