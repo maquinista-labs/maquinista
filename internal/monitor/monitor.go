@@ -216,6 +216,18 @@ func (m *Monitor) poll() {
 					if pe.ContentType != "tool_use" && pe.ContentType != "tool_result" {
 						continue
 					}
+					// When tool_use and tool_result arrive in the same poll batch,
+					// ParseEntries suppresses the tool_use entry to avoid duplicate
+					// Telegram messages. Re-emit it here so the dashboard live banner
+					// always receives tool_use before tool_result.
+					if pe.ContentType == "tool_result" && pe.ToolName != "" && pe.ToolName != "unknown" {
+						m.ToolEventWriter(ToolEvent{
+							AgentID:   sess.WindowID,
+							Type:      "tool_use",
+							ToolName:  pe.ToolName,
+							ToolUseID: pe.ToolUseID,
+						})
+					}
 					m.ToolEventWriter(ToolEvent{
 						AgentID:   sess.WindowID,
 						Type:      pe.ContentType,
