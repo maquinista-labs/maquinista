@@ -74,6 +74,8 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleAgentListCommand(msg)
 	case "agent_spawn":
 		b.handleAgentSpawnCommand(msg)
+	case "kill":
+		b.handleKillCommand(msg)
 	case "agent_kill":
 		b.handleAgentKillCommand(msg)
 	case "agent_kill_all":
@@ -314,10 +316,108 @@ func (b *Bot) handleTopicClose(msg *tgbotapi.Message) {
 		cleaned = true
 	}
 
+	// Also clean up any DB-bound agents (topic_agent_bindings) for this thread.
+	// These are not reflected in b.state, so the in-memory loop above misses them.
+	if pool := b.getPool(); pool != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		rows, err := pool.Query(ctx, `
+			SELECT agent_id FROM topic_agent_bindings
+			WHERE thread_id = $1 AND binding_type = 'owner'
+		`, threadIDStr)
+		if err == nil {
+			var agentIDs []string
+			for rows.Next() {
+				var id string
+				if rows.Scan(&id) == nil {
+					agentIDs = append(agentIDs, id)
+				}
+			}
+			rows.Close()
+			for _, aid := range agentIDs {
+				if _, err := pool.Exec(ctx, `
+					UPDATE agents SET status='archived', stop_requested=TRUE, last_seen=NOW()
+					WHERE id=$1
+				`, aid); err != nil {
+					log.Printf("handleTopicClose: archive agent %s: %v", aid, err)
+				}
+				if _, err := pool.Exec(ctx, `
+					DELETE FROM topic_agent_bindings WHERE agent_id=$1 AND binding_type='owner'
+				`, aid); err != nil {
+					log.Printf("handleTopicClose: remove binding %s: %v", aid, err)
+				}
+				log.Printf("Topic %d closed: archived DB-bound agent %s", threadID, aid)
+				cleaned = true
+			}
+		}
+	}
+
 	if cleaned {
 		b.saveState()
 		log.Printf("Topic %d closed: cleaned up bindings and killed window", threadID)
 	}
+}
+
+// handleKillCommand kills the agent bound to the current topic (owner binding).
+// Usage: /kill  — no arguments needed; infers agent from current thread.
+func (b *Bot) handleKillCommand(msg *tgbotapi.Message) {
+	chatID := msg.Chat.ID
+	threadID := getThreadID(msg)
+	threadIDStr := strconv.Itoa(threadID)
+
+	pool := b.getPool()
+	if pool == nil {
+		b.reply(chatID, threadID, "Database not available.")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var agentID string
+	err := pool.QueryRow(ctx, `
+		SELECT agent_id FROM topic_agent_bindings
+		WHERE thread_id = $1 AND binding_type = 'owner'
+		LIMIT 1
+	`, threadIDStr).Scan(&agentID)
+	if err != nil {
+		// Fall back to in-memory state for legacy bindings
+		for _, uid := range b.state.AllUserIDs() {
+			if windowID, bound := b.state.GetWindowForThread(uid, threadIDStr); bound {
+				tmux.KillWindow(b.config.TmuxSessionName, windowID)
+				b.state.UnbindThread(uid, threadIDStr)
+				b.state.RemoveWindowState(windowID)
+				b.saveState()
+				if err := b.closeForumTopic(chatID, threadID); err != nil {
+					log.Printf("handleKillCommand: closeForumTopic: %v", err)
+				}
+				b.reply(chatID, threadID, "Agent stopped and topic closed.")
+				return
+			}
+		}
+		b.reply(chatID, threadID, "No agent bound to this topic.")
+		return
+	}
+
+	if _, err := pool.Exec(ctx, `
+		UPDATE agents SET status='archived', stop_requested=TRUE, last_seen=NOW()
+		WHERE id=$1
+	`, agentID); err != nil {
+		b.reply(chatID, threadID, "Failed to stop agent: "+err.Error())
+		return
+	}
+	if _, err := pool.Exec(ctx, `
+		DELETE FROM topic_agent_bindings WHERE agent_id=$1 AND binding_type='owner'
+	`, agentID); err != nil {
+		log.Printf("handleKillCommand: remove binding: %v", err)
+	}
+
+	if err := b.closeForumTopic(chatID, threadID); err != nil {
+		log.Printf("handleKillCommand: closeForumTopic: %v", err)
+	}
+
+	log.Printf("handleKillCommand: archived agent %s, closed topic %d", agentID, threadID)
+	b.reply(chatID, threadID, "Agent "+agentID+" stopped and topic closed.")
 }
 
 // SetMonitorState sets the monitor state reference (called by serve command).
