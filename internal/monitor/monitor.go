@@ -37,6 +37,21 @@ type OutboxEvent struct {
 // A nil writer disables the mailbox.outbound path.
 type OutboxWriter func(e OutboxEvent)
 
+// ToolEvent carries one tool_use or tool_result observation. The AgentID
+// field contains the raw tmux window id — implementations that need the
+// logical agent id must resolve it (e.g. via resolveAgentFromWindow).
+type ToolEvent struct {
+	AgentID   string // tmux window id (e.g. "@25") or logical agent id
+	Type      string // "tool_use" | "tool_result"
+	ToolName  string
+	ToolUseID string
+	IsError   bool
+}
+
+// ToolEventWriter is called once per tool_use/tool_result observation.
+// A nil writer disables live tool-call push to the dashboard.
+type ToolEventWriter func(e ToolEvent)
+
 // ObservingTopic represents a topic that is observing an agent's output.
 type ObservingTopic struct {
 	TopicID int64
@@ -57,6 +72,7 @@ type Monitor struct {
 	planBuffers       map[string]string // windowID → partial plan text
 	ObservationLookup ObservationLookup // optional: resolve window → observing topics
 	OutboxWriter      OutboxWriter      // optional: shadow-write captured responses to agent_outbox
+	ToolEventWriter   ToolEventWriter   // optional: push tool_use/tool_result events to dashboard
 	pollCount         int
 }
 
@@ -188,6 +204,24 @@ func (m *Monitor) poll() {
 						AgentID: sess.WindowID,
 						Role:    pe.Role,
 						Text:    text,
+					})
+				}
+			}
+
+			// Push tool_use / tool_result events to the dashboard live
+			// banner via pg_notify. Called once per entry regardless of
+			// Telegram binding so dashboard-only agents get coverage too.
+			if m.ToolEventWriter != nil {
+				for _, pe := range parsed {
+					if pe.ContentType != "tool_use" && pe.ContentType != "tool_result" {
+						continue
+					}
+					m.ToolEventWriter(ToolEvent{
+						AgentID:   sess.WindowID,
+						Type:      pe.ContentType,
+						ToolName:  pe.ToolName,
+						ToolUseID: pe.ToolUseID,
+						IsError:   pe.IsError,
 					})
 				}
 			}

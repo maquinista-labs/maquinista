@@ -12,6 +12,7 @@ import {
 
 import { ConversationView } from "@/components/dash/conversation-view";
 import { InboxList } from "@/components/dash/inbox-list";
+import { LiveToolCallBanner } from "@/components/dash/live-tool-call-banner";
 import { OutboxList } from "@/components/dash/outbox-list";
 import { WorkspacesCard } from "@/components/dash/workspaces-card";
 
@@ -55,6 +56,7 @@ export function AgentDetailTabs({ agentId }: { agentId: string }) {
         </TabsTrigger>
       </TabsList>
       <TabsContent value="conversation">
+        <LiveToolCallBanner agentId={agentId} />
         {conversationId ? (
           <ConversationView conversationId={conversationId} />
         ) : (

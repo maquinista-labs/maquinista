@@ -26,6 +26,7 @@ const CHANNELS = [
   "agent_outbox_new",
   "channel_delivery_new",
   "agent_stop",
+  "tool_event",
 ] as const;
 
 export async function GET(req: Request) {

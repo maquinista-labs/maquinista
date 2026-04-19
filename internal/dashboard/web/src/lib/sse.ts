@@ -13,8 +13,18 @@ type SSEEvent = {
     | "agent_outbox_new"
     | "channel_delivery_new"
     | "agent_stop"
+    | "tool_event"
     | "error";
   data: unknown;
+};
+
+// ToolEventPayload is the parsed JSON from a "tool_event" pg_notify payload.
+export type ToolEventPayload = {
+  agent_id: string;
+  type: "tool_use" | "tool_result";
+  tool_name: string;
+  tool_use_id: string;
+  is_error: boolean;
 };
 
 export type SSEStatus = "connecting" | "open" | "closed";
@@ -89,6 +99,20 @@ export function useDashStream() {
         bump("channel_delivery_new"),
       );
       source.addEventListener("agent_stop", bump("agent_stop"));
+
+      // tool_event: re-dispatch as a DOM CustomEvent so per-agent hooks can
+      // subscribe without opening a second SSE connection.
+      source.addEventListener("tool_event", (ev: MessageEvent) => {
+        try {
+          const frame = JSON.parse(ev.data) as { payload: string };
+          const detail = JSON.parse(frame.payload) as ToolEventPayload;
+          window.dispatchEvent(
+            new CustomEvent("maq:tool_event", { detail }),
+          );
+        } catch {
+          /* malformed payload — ignore */
+        }
+      });
 
       source.addEventListener("error", () => {
         setStatus("closed");

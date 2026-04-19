@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -26,6 +27,7 @@ export function AgentActions({ agentId }: { agentId: string }) {
     null,
   );
   const queryClient = useQueryClient();
+  const router = useRouter();
 
   async function fire(action: "interrupt" | "kill" | "respawn") {
     setBusy(action);
@@ -42,6 +44,7 @@ export function AgentActions({ agentId }: { agentId: string }) {
       toast.success(`${action}: ok`);
       queryClient.invalidateQueries({ queryKey: ["agents"] });
       setOpen(false);
+      if (isKill) router.push("/agents");
     } catch (err) {
       toast.error(
         `${action} failed: ${err instanceof Error ? err.message : String(err)}`,
