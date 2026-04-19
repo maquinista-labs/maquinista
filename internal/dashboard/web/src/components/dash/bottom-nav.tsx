@@ -6,6 +6,7 @@ import { usePathname } from "next/navigation";
 import type { ComponentType, SVGProps } from "react";
 
 import { cn } from "@/lib/utils";
+import { useInboxCount } from "@/lib/hooks";
 
 // Bottom nav: four touch targets, min-height 44 px to meet Apple's
 // HIG. Each tab's label is shown under the icon for discoverability
@@ -32,6 +33,7 @@ const tabs: Tab[] = [
 
 export function BottomNav() {
   const pathname = usePathname();
+  const { data: inboxCount = 0 } = useInboxCount();
 
   return (
     <nav
@@ -42,6 +44,7 @@ export function BottomNav() {
     >
       {tabs.map(({ href, label, Icon, testId }) => {
         const active = pathname === href || pathname.startsWith(`${href}/`);
+        const isInbox = href === "/inbox";
         return (
           <Link
             key={href}
@@ -55,7 +58,17 @@ export function BottomNav() {
                 : "text-muted-foreground hover:text-foreground",
             )}
           >
-            <Icon className="h-5 w-5" aria-hidden />
+            <span className="relative inline-flex">
+              <Icon className="h-5 w-5" aria-hidden />
+              {isInbox && inboxCount > 0 && (
+                <span
+                  data-testid="nav-inbox-badge"
+                  className="absolute -right-1.5 -top-1.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-red-500 px-0.5 text-[10px] font-bold leading-none text-white"
+                >
+                  {inboxCount > 99 ? "99+" : inboxCount}
+                </span>
+              )}
+            </span>
             <span className="leading-none">{label}</span>
           </Link>
         );
