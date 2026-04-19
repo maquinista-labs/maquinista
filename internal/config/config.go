@@ -255,13 +255,14 @@ func loadDashboardConfig() DashboardConfig {
 		cfg.Listen = "127.0.0.1:8900"
 	}
 	switch cfg.AuthMode {
-	case "", "none":
-		cfg.AuthMode = "none"
-	case "password", "telegram":
+	case "none":
+		// explicit opt-out
+	case "", "password":
+		cfg.AuthMode = "password"
+	case "telegram":
 		// pass through
 	default:
-		// Unknown values fall back to "none"; Phase 6 validates.
-		cfg.AuthMode = "none"
+		cfg.AuthMode = "password"
 	}
 	switch cfg.ThemeDefault {
 	case "", "system":
@@ -274,7 +275,12 @@ func loadDashboardConfig() DashboardConfig {
 	if cfg.NodeBin == "" {
 		cfg.NodeBin = "node"
 	}
-	cfg.AutoTunnel = parseBoolEnv(os.Getenv("MAQUINISTA_DASHBOARD_AUTO_TUNNEL"))
+	autoTunnelEnv := strings.TrimSpace(os.Getenv("MAQUINISTA_DASHBOARD_AUTO_TUNNEL"))
+	if autoTunnelEnv == "" {
+		cfg.AutoTunnel = true // on by default; set =0 to disable
+	} else {
+		cfg.AutoTunnel = parseBoolEnv(autoTunnelEnv)
+	}
 	return cfg
 }
 

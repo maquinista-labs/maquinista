@@ -167,12 +167,6 @@ func (b *Bot) StartPersistentTunnel(ctx context.Context) (string, error) {
 
 	log.Printf("auto-tunnel: dashboard ready → %s", url)
 
-	if b.config.Dashboard.AuthMode == "none" {
-		log.Printf("WARNING: MAQUINISTA_DASHBOARD_AUTO_TUNNEL=1 but MAQUINISTA_DASHBOARD_AUTH=none — " +
-			"the dashboard is publicly accessible without authentication. " +
-			"Set MAQUINISTA_DASHBOARD_AUTH=password to require login.")
-	}
-
 	// Notify every allowed user via DM (user ID == DM chat ID in Telegram).
 	for _, userID := range b.config.AllowedUsers {
 		b.replyWithURLButton(userID, 0, "🚀 Dashboard tunnel ready.", url)
