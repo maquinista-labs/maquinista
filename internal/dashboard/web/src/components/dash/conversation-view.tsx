@@ -3,6 +3,7 @@
 import { useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 import { cn } from "@/lib/utils";
 import { useAgentLive } from "@/lib/use-agent-live";
@@ -203,7 +204,7 @@ export function ConversationView(props: Props) {
                   : "bg-muted/50 text-foreground border border-border/60",
               )}
             >
-              <ReactMarkdown components={mdComponents}>
+              <ReactMarkdown components={mdComponents} remarkPlugins={[remarkGfm]}>
                 {it.excerpt ?? "*empty*"}
               </ReactMarkdown>
               <time
