@@ -61,9 +61,10 @@ edited since the last run, the new identity takes effect.
 shows the list. A template has the same fields as `agent_souls` plus an
 `id` and `name` for display.
 
-Built-in templates (seeded by `seedDefaultAgents`): coordinator, planner,
-coder. Custom templates can be added via `maquinista soul template` CLI
-or directly in the DB.
+Built-in templates (seeded by migration 028): coordinator, planner, coder.
+Custom templates can be added via `maquinista soul template` CLI or directly
+in the DB. No agent rows are pre-created from these templates; agents are
+spawned on demand.
 
 ## TODO
 

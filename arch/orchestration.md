@@ -1,17 +1,19 @@
 # Orchestration
 
-## The three-agent trio
+## Soul templates
 
-The default fleet seeded at startup (`seedDefaultAgents`) consists of:
+Agents are spawned on demand from soul templates, not pre-created at startup.
+Three built-in templates are seeded by migration 028:
 
-| Agent | Role | Responsibility |
-|-------|------|----------------|
-| `coordinator` | coordinator | Routes incoming requests, decides which agent to delegate to |
-| `planner` | planner | Decomposes goals into tasks, manages task graph |
-| `coder` | coder | Executes individual coding tasks |
+| Template | Role | Responsibility |
+|----------|------|----------------|
+| `coordinator` | Fleet router | Routes incoming requests, decides which agent to delegate to |
+| `planner` | Specification writer | Decomposes goals into tasks, manages task graph |
+| `coder` | Implementer | Executes individual coding tasks |
 
-These are regular user agents — same spawn path, same inbox/outbox — just
-with distinct souls that give them specialized behavior.
+Templates are catalog entries only. An agent row is created when a session is
+actually needed — via `/t_plan`, a scheduled job firing, or an explicit spawn
+from the dashboard. No persistent agents sit idle between uses.
 
 ## Tasks
 
