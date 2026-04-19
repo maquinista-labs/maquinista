@@ -348,7 +348,7 @@ export async function listConversation(
     id: r.id,
     agent_id: r.agent_id,
     from_kind: r.from_kind,
-    excerpt: excerptFromContent(r.content),
+    excerpt: excerptFromContent(r.content, 20000),
     at: r.at.toISOString ? r.at.toISOString() : String(r.at),
   }));
 }
@@ -514,7 +514,7 @@ export async function listAgentTimeline(
     id: r.id,
     agent_id: r.agent_id,
     from_kind: r.from_kind,
-    excerpt: excerptFromContent(r.content),
+    excerpt: excerptFromContent(r.content, 20000),
     at: r.at.toISOString ? r.at.toISOString() : String(r.at),
   }));
 }

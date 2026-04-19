@@ -33,6 +33,7 @@ export function ConversationView(props: Props) {
       if (!res.ok) throw new Error(`GET ${queryPath} ${res.status}`);
       return res.json() as Promise<{ items: ConversationItem[] }>;
     },
+    refetchInterval: 3000,
   });
 
   const bottomRef = useRef<HTMLDivElement | null>(null);

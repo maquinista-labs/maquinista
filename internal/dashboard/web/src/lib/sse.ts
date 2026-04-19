@@ -67,6 +67,7 @@ export function useDashStream() {
           case "agent_inbox_new":
             queryClient.invalidateQueries({ queryKey: ["agents"] });
             queryClient.invalidateQueries({ queryKey: ["inbox"] });
+            queryClient.invalidateQueries({ queryKey: ["conversation"] });
             break;
           case "agent_outbox_new":
             queryClient.invalidateQueries({ queryKey: ["agents"] });
