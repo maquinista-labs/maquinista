@@ -93,10 +93,10 @@ export function ConversationView(props: Props) {
           >
             <div
               className={cn(
-                "max-w-[80%] rounded-2xl px-3 py-2 text-sm shadow-sm",
+                "max-w-[80%] rounded-2xl px-3 py-2 text-sm",
                 right
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-card text-card-foreground",
+                  ? "bg-primary/12 text-foreground border border-primary/20"
+                  : "bg-muted/50 text-foreground border border-border/60",
               )}
             >
               <ReactMarkdown
@@ -105,10 +105,10 @@ export function ConversationView(props: Props) {
                   strong: ({ children }) => <strong className="font-semibold">{children}</strong>,
                   em: ({ children }) => <em className="italic">{children}</em>,
                   code: ({ children }) => (
-                    <code className="rounded bg-black/20 px-1 py-0.5 font-mono text-xs">{children}</code>
+                    <code className="rounded bg-foreground/10 px-1 py-0.5 font-mono text-xs">{children}</code>
                   ),
                   pre: ({ children }) => (
-                    <pre className="my-1 overflow-x-auto rounded bg-black/20 p-2 font-mono text-xs">{children}</pre>
+                    <pre className="my-1 overflow-x-auto rounded bg-foreground/8 border border-border/40 p-2 font-mono text-xs">{children}</pre>
                   ),
                   ul: ({ children }) => <ul className="my-1 ml-4 list-disc">{children}</ul>,
                   ol: ({ children }) => <ol className="my-1 ml-4 list-decimal">{children}</ol>,
@@ -136,7 +136,7 @@ export function ConversationView(props: Props) {
               </ReactMarkdown>
               <time
                 className={cn(
-                  "mt-1 block text-[10px] opacity-70",
+                  "mt-1 block text-[10px] text-muted-foreground",
                   right ? "text-right" : "text-left",
                 )}
               >
