@@ -27,7 +27,7 @@ func setupOutbox(t *testing.T) *pgxpool.Pool {
 
 func TestDBOutboxWriter_WritesAssistantText(t *testing.T) {
 	pool := setupOutbox(t)
-	w := NewDBOutboxWriter(pool)
+	w := NewDBOutboxWriter(pool, nil)
 
 	w(OutboxEvent{
 		AgentID:  "win-1",
@@ -57,7 +57,7 @@ func TestDBOutboxWriter_WritesAssistantText(t *testing.T) {
 
 func TestDBOutboxWriter_ANSIAndHugeTextPreserved(t *testing.T) {
 	pool := setupOutbox(t)
-	w := NewDBOutboxWriter(pool)
+	w := NewDBOutboxWriter(pool, nil)
 
 	ansi := "\x1b[31mred\x1b[0m \x1b[1mbold\x1b[0m"
 	huge := strings.Repeat("line with some words — ", 4096) // ~96 KiB
@@ -96,7 +96,7 @@ func TestDBOutboxWriter_ANSIAndHugeTextPreserved(t *testing.T) {
 
 func TestDBOutboxWriter_SkipsEmptyAndMissingAgent(t *testing.T) {
 	pool := setupOutbox(t)
-	w := NewDBOutboxWriter(pool)
+	w := NewDBOutboxWriter(pool, nil)
 
 	// empty text
 	w(OutboxEvent{AgentID: "win-1", Role: "assistant", Text: ""})

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
@@ -14,14 +15,17 @@ import (
 // NewDBOutboxWriter returns an OutboxWriter that mirrors each captured
 // assistant response into agent_outbox via the typed mailbox wrappers.
 // Writes are best-effort: a failed write is logged but does not interrupt
-// the legacy Telegram delivery path (the new path is passive under the
-// mailbox.outbound flag).
+// the legacy Telegram delivery path.
 //
 // OutboxEvent.AgentID arrives as the tmux window id (e.g. "@25") — the
 // monitor has no direct handle to the logical agent id. Resolve it to
 // the agents.id via tmux_window before writing; otherwise the insert
 // violates the FK.
-func NewDBOutboxWriter(pool *pgxpool.Pool) OutboxWriter {
+//
+// amap, when non-nil, provides the in_reply_to inbox row id per agent so
+// the relay can route responses to the origin Telegram topic for agents
+// without topic_agent_bindings.
+func NewDBOutboxWriter(pool *pgxpool.Pool, amap *mailbox.ActiveInboxMap) OutboxWriter {
 	return func(e OutboxEvent) {
 		if pool == nil || e.AgentID == "" || e.Text == "" {
 			return
@@ -48,6 +52,17 @@ func NewDBOutboxWriter(pool *pgxpool.Pool) OutboxWriter {
 			return
 		}
 
+		// Stamp in_reply_to from the active inbox map so the relay can route
+		// this response back to the origin Telegram topic.
+		var inReplyTo *uuid.UUID
+		if amap != nil {
+			if raw := amap.Get(agentID); raw != "" {
+				if id, parseErr := uuid.Parse(raw); parseErr == nil {
+					inReplyTo = &id
+				}
+			}
+		}
+
 		tx, err := pool.Begin(ctx)
 		if err != nil {
 			log.Printf("outbox writer: begin: %v", err)
@@ -56,8 +71,9 @@ func NewDBOutboxWriter(pool *pgxpool.Pool) OutboxWriter {
 		defer tx.Rollback(ctx)
 
 		if _, err := mailbox.AppendOutbox(ctx, tx, mailbox.OutboxMessage{
-			AgentID: agentID,
-			Content: content,
+			AgentID:   agentID,
+			InReplyTo: inReplyTo,
+			Content:   content,
 		}); err != nil {
 			log.Printf("outbox writer: append: %v", err)
 			return

@@ -15,6 +15,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/listener"
+	"github.com/maquinista-labs/maquinista/internal/mailbox"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
 	"github.com/maquinista-labs/maquinista/internal/queue"
@@ -210,22 +211,23 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	mon.AddSource(openclaudeSrc)
 	mon.PlanHandler = b.HandlePlanFromMonitor
 
-	// Feature flag mailbox.outbound: mirror every captured response into
-	// agent_outbox in parallel with the legacy Telegram path.
-	if cfg.MailboxOutbound {
-		if pool == nil && cfg.DatabaseURL != "" {
-			if p, dbErr := db.Connect(cfg.DatabaseURL); dbErr != nil {
-				log.Printf("mailbox.outbound: cannot connect DB: %v", dbErr)
-			} else {
-				pool = p
-			}
-		}
-		if pool != nil {
-			mon.OutboxWriter = monitor.NewDBOutboxWriter(pool)
-			log.Println("mailbox.outbound: shadow-writing responses to agent_outbox")
+	// Mirror every captured response into agent_outbox so the dashboard and
+	// relay can consume them. Previously guarded by MAILBOX_OUTBOUND; now
+	// unconditional when a DB pool is available — the outbox is the primary
+	// delivery path for dashboard agents.
+	if pool == nil && cfg.DatabaseURL != "" {
+		if p, dbErr := db.Connect(cfg.DatabaseURL); dbErr != nil {
+			log.Printf("mailbox.outbound: cannot connect DB: %v", dbErr)
 		} else {
-			log.Println("mailbox.outbound: flag set but no DB pool — ignoring")
+			pool = p
 		}
+	}
+	activeInboxMap := &mailbox.ActiveInboxMap{}
+	if pool != nil {
+		mon.OutboxWriter = monitor.NewDBOutboxWriter(pool, activeInboxMap)
+		log.Println("mailbox.outbound: writing responses to agent_outbox")
+	} else {
+		log.Println("mailbox.outbound: no DB pool — outbox writes disabled")
 	}
 
 	sp := bot.NewStatusPoller(b, q, mon)
@@ -248,7 +250,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	if pool != nil {
 		b.SetPool(pool)
 		workerID := fmt.Sprintf("consumer-%d", os.Getpid())
-		go runMailboxConsumer(ctx, pool, cfg.TmuxSessionName, workerID)
+		go runMailboxConsumer(ctx, pool, cfg.TmuxSessionName, workerID, activeInboxMap)
 		log.Printf("mailbox: inbox consumer running (worker=%s)", workerID)
 
 		// Declarative jobreg reconcile: upsert every YAML under
@@ -276,6 +278,11 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			go runDashboardAgentReconcile(ctx, cfg, pool, b.State(), cwd)
 			log.Println("dashboard: periodic agent reconcile started")
 		}
+
+		// Telegram topic provisioner: creates forum topics for user agents
+		// that were spawned via the dashboard and have no owner binding yet.
+		// Runs in the background; no-ops when AllowedGroups is empty.
+		go b.RunTopicProvisioner(ctx, pool)
 	} else {
 		log.Println("mailbox: DB pool unavailable — inbox routing will error")
 	}

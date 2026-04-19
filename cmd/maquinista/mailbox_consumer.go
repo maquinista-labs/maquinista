@@ -30,10 +30,14 @@ func isTmuxWindowMissing(err error) bool {
 // subscribes to NOTIFY agent_inbox_new with a 10 s poll fallback so empty
 // periods don't chew CPU.
 //
+// amap tracks the most-recently-driven inbox row per agent so the monitor's
+// outbox writer can stamp in_reply_to on outbox rows, enabling the relay to
+// route responses back to the origin Telegram topic.
+//
 // This function replaces the task-1.6 internal/inboxbridge package
 // (retired by task 1.9). The long-term plan is one sidecar goroutine per
 // agent (plans/reference/maquinista-v2.md §7); that wiring lives in a follow-up.
-func runMailboxConsumer(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID string) {
+func runMailboxConsumer(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID string, amap *mailbox.ActiveInboxMap) {
 	listener, err := pool.Acquire(ctx)
 	if err != nil {
 		log.Printf("mailbox consumer: acquire: %v", err)
@@ -46,7 +50,7 @@ func runMailboxConsumer(ctx context.Context, pool *pgxpool.Pool, tmuxSession, wo
 	}
 
 	for {
-		if err := drainAllAgents(ctx, pool, tmuxSession, workerID); err != nil {
+		if err := drainAllAgents(ctx, pool, tmuxSession, workerID, amap); err != nil {
 			log.Printf("mailbox consumer: drain: %v", err)
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -62,7 +66,7 @@ func runMailboxConsumer(ctx context.Context, pool *pgxpool.Pool, tmuxSession, wo
 	}
 }
 
-func drainAllAgents(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID string) error {
+func drainAllAgents(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID string, amap *mailbox.ActiveInboxMap) error {
 	rows, err := pool.Query(ctx, `
 		SELECT DISTINCT agent_id FROM agent_inbox
 		WHERE status='pending' OR (status='processing' AND lease_expires < NOW())
@@ -83,7 +87,7 @@ func drainAllAgents(ctx context.Context, pool *pgxpool.Pool, tmuxSession, worker
 
 	for _, agent := range agents {
 		for i := 0; i < 8; i++ {
-			processed, perr := consumeOne(ctx, pool, tmuxSession, workerID, agent)
+			processed, perr := consumeOne(ctx, pool, tmuxSession, workerID, agent, amap)
 			if perr != nil {
 				log.Printf("mailbox consumer %s: %v", agent, perr)
 				break
@@ -96,7 +100,7 @@ func drainAllAgents(ctx context.Context, pool *pgxpool.Pool, tmuxSession, worker
 	return nil
 }
 
-func consumeOne(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID, agentID string) (bool, error) {
+func consumeOne(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID, agentID string, amap *mailbox.ActiveInboxMap) (bool, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -115,6 +119,12 @@ func consumeOne(ctx context.Context, pool *pgxpool.Pool, tmuxSession, workerID, 
 	}
 	row := claimed[0]
 	text := extractInboxText(row.Content)
+
+	// Record the active inbox row before driving so that outbox rows
+	// appended by the monitor during this turn carry the correct in_reply_to.
+	if amap != nil {
+		amap.Set(row.AgentID, row.ID.String())
+	}
 
 	// Resolve the actual tmux window id for this agent. Using row.AgentID
 	// as the send-keys target only works when a window is *named* after
