@@ -214,7 +214,7 @@ export async function requestRespawn(
 ): Promise<boolean> {
   const { rowCount } = await pool.query(
     `UPDATE agents
-     SET tmux_window = '', stop_requested = FALSE
+     SET tmux_window = '', stop_requested = FALSE, session_id = ''
      WHERE id = $1`,
     [agentId],
   );

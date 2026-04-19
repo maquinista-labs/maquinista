@@ -197,6 +197,18 @@ func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, b
 	// lands on a live prompt. Same timeout we use in tier-3 spawn.
 	if err := waitForRunnerReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
 		log.Printf("reconcile: %s not ready within timeout: %v", agentID, err)
+		// If the pane is already gone and we were resuming a session, the
+		// session ID is stale. Kill the dead window, clear session_id and
+		// retry once with a fresh start so the agent comes up without
+		// blocking the whole reconcile loop.
+		if sessionID != "" && !tmuxWindowExists(cfg.TmuxSessionName, windowID) {
+			log.Printf("reconcile: %s resume failed (stale session %s), retrying fresh", agentID, sessionID)
+			tmux.KillWindow(cfg.TmuxSessionName, windowID)
+			clearCtx, clearCancel := context.WithTimeout(ctx, 3*time.Second)
+			_, _ = pool.Exec(clearCtx, `UPDATE agents SET session_id = '' WHERE id = $1`, agentID)
+			clearCancel()
+			return respawnAgent(ctx, cfg, pool, botState, defaultCWD, agentID, cwd, runnerType, "", workspaceScope, workspaceRepoRoot)
+		}
 	}
 
 	// Publish the new tmux_window. Database controls status; only update

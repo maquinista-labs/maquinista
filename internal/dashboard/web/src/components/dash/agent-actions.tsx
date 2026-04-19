@@ -30,9 +30,10 @@ export function AgentActions({ agentId }: { agentId: string }) {
   async function fire(action: "interrupt" | "kill" | "respawn") {
     setBusy(action);
     try {
+      const isKill = action === "kill";
       const res = await fetch(
-        `/api/agents/${encodeURIComponent(agentId)}/${action}`,
-        { method: "POST" },
+        `/api/agents/${encodeURIComponent(agentId)}/${isKill ? "delete" : action}`,
+        { method: isKill ? "DELETE" : "POST" },
       );
       if (!res.ok) {
         const body = (await res.json().catch(() => ({}))) as { error?: string };
@@ -65,9 +66,9 @@ export function AgentActions({ agentId }: { agentId: string }) {
         <SheetHeader>
           <SheetTitle>Agent actions — {agentId}</SheetTitle>
           <SheetDescription>
-            Interrupt sends Ctrl+C. Kill flips stop_requested and the
-            reconcile loop takes the pane down. Respawn clears
-            tmux_window so the next reconcile starts fresh.
+            Interrupt sends Ctrl+C. Kill terminates the tmux pane and
+            removes the agent permanently. Respawn clears tmux_window
+            and session_id so the next reconcile starts a fresh pane.
           </SheetDescription>
         </SheetHeader>
         <div className="flex flex-col gap-2 p-4">
