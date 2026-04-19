@@ -7,10 +7,34 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+var retryAfterRe = regexp.MustCompile(`retry after (\d+)`)
+
+// parseRetryAfter extracts the retry-after duration from a Telegram 429 error.
+// Returns 0 if the error is not a rate-limit error.
+func parseRetryAfter(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	s := err.Error()
+	if !strings.Contains(s, "Too Many Requests") && !strings.Contains(s, "429") {
+		return 0
+	}
+	if m := retryAfterRe.FindStringSubmatch(s); len(m) == 2 {
+		if secs, e := strconv.Atoi(m[1]); e == nil && secs > 0 {
+			return time.Duration(secs)*time.Second + time.Second
+		}
+	}
+	return 30 * time.Second
+}
 
 // ForumTopicClosed represents a service message about a forum topic closed.
 type ForumTopicClosed struct{}
@@ -167,9 +191,16 @@ func (b *Bot) sendMessageInThread(chatID int64, threadID int, text string) (tgbo
 
 	resp, err := b.api.MakeRequest("sendMessage", params)
 	if err != nil {
-		if b.msgQueue != nil {
-			b.msgQueue.HandleFloodError(chatID, err)
+		if wait := parseRetryAfter(err); wait > 0 {
+			if b.msgQueue != nil {
+				b.msgQueue.HandleFloodError(chatID, err)
+			}
+			log.Printf("sendMessageInThread: rate limited, retrying after %v", wait)
+			time.Sleep(wait)
+			resp, err = b.api.MakeRequest("sendMessage", params)
 		}
+	}
+	if err != nil {
 		return tgbotapi.Message{}, err
 	}
 
@@ -221,6 +252,16 @@ func (b *Bot) sendMessageWithKeyboard(chatID int64, threadID int, text string, k
 	params["reply_markup"] = string(kbJSON)
 
 	resp, err := b.api.MakeRequest("sendMessage", params)
+	if err != nil {
+		if wait := parseRetryAfter(err); wait > 0 {
+			if b.msgQueue != nil {
+				b.msgQueue.HandleFloodError(chatID, err)
+			}
+			log.Printf("sendMessageWithKeyboard: rate limited, retrying after %v", wait)
+			time.Sleep(wait)
+			resp, err = b.api.MakeRequest("sendMessage", params)
+		}
+	}
 	if err != nil {
 		return tgbotapi.Message{}, err
 	}
