@@ -44,58 +44,58 @@ type Props =
   | { conversationId: string; agentId?: undefined; liveAgentId?: string };
 
 const mdComponents = {
-  p: ({ children }: { children: React.ReactNode }) => (
+  p: ({ children }: { children?: React.ReactNode }) => (
     <p className="mb-1 last:mb-0 leading-snug">{children}</p>
   ),
-  strong: ({ children }: { children: React.ReactNode }) => (
+  strong: ({ children }: { children?: React.ReactNode }) => (
     <strong className="font-semibold">{children}</strong>
   ),
-  em: ({ children }: { children: React.ReactNode }) => (
+  em: ({ children }: { children?: React.ReactNode }) => (
     <em className="italic">{children}</em>
   ),
-  code: ({ children }: { children: React.ReactNode }) => (
+  code: ({ children }: { children?: React.ReactNode }) => (
     <code className="rounded bg-foreground/10 px-1 py-0.5 font-mono text-xs">
       {children}
     </code>
   ),
-  pre: ({ children }: { children: React.ReactNode }) => (
+  pre: ({ children }: { children?: React.ReactNode }) => (
     <pre className="my-1 overflow-x-auto rounded bg-foreground/8 border border-border/40 p-2 font-mono text-xs">
       {children}
     </pre>
   ),
-  ul: ({ children }: { children: React.ReactNode }) => (
+  ul: ({ children }: { children?: React.ReactNode }) => (
     <ul className="my-1 ml-4 list-disc">{children}</ul>
   ),
-  ol: ({ children }: { children: React.ReactNode }) => (
+  ol: ({ children }: { children?: React.ReactNode }) => (
     <ol className="my-1 ml-4 list-decimal">{children}</ol>
   ),
-  li: ({ children }: { children: React.ReactNode }) => (
+  li: ({ children }: { children?: React.ReactNode }) => (
     <li className="leading-snug">{children}</li>
   ),
-  h1: ({ children }: { children: React.ReactNode }) => (
+  h1: ({ children }: { children?: React.ReactNode }) => (
     <h1 className="mb-1 text-base font-bold">{children}</h1>
   ),
-  h2: ({ children }: { children: React.ReactNode }) => (
+  h2: ({ children }: { children?: React.ReactNode }) => (
     <h2 className="mb-1 text-sm font-bold">{children}</h2>
   ),
-  h3: ({ children }: { children: React.ReactNode }) => (
+  h3: ({ children }: { children?: React.ReactNode }) => (
     <h3 className="mb-1 text-sm font-semibold">{children}</h3>
   ),
-  table: ({ children }: { children: React.ReactNode }) => (
+  table: ({ children }: { children?: React.ReactNode }) => (
     <div className="my-1 overflow-x-auto">
       <table className="min-w-full text-xs border-collapse">{children}</table>
     </div>
   ),
-  thead: ({ children }: { children: React.ReactNode }) => (
+  thead: ({ children }: { children?: React.ReactNode }) => (
     <thead className="border-b border-current/20">{children}</thead>
   ),
-  th: ({ children }: { children: React.ReactNode }) => (
+  th: ({ children }: { children?: React.ReactNode }) => (
     <th className="px-2 py-1 text-left font-semibold">{children}</th>
   ),
-  td: ({ children }: { children: React.ReactNode }) => (
+  td: ({ children }: { children?: React.ReactNode }) => (
     <td className="px-2 py-1 border-t border-current/10">{children}</td>
   ),
-  a: ({ href, children }: { href?: string; children: React.ReactNode }) => (
+  a: ({ href, children }: { href?: string; children?: React.ReactNode }) => (
     <a
       href={href}
       className="underline underline-offset-2 opacity-80 hover:opacity-100"
@@ -105,7 +105,7 @@ const mdComponents = {
       {children}
     </a>
   ),
-  blockquote: ({ children }: { children: React.ReactNode }) => (
+  blockquote: ({ children }: { children?: React.ReactNode }) => (
     <blockquote className="my-1 border-l-2 border-current/40 pl-2 opacity-80">
       {children}
     </blockquote>
