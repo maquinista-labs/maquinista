@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -166,6 +168,13 @@ func (b *Bot) StartPersistentTunnel(ctx context.Context) (string, error) {
 	}
 
 	log.Printf("auto-tunnel: dashboard ready → %s", url)
+
+	// Write the URL to a state file so `maquinista start` (parent process)
+	// can read it and print it to the terminal before returning to the shell.
+	urlFile := filepath.Join(b.config.MaquinistaDir, "tunnel.url")
+	if err := os.WriteFile(urlFile, []byte(url+"\n"), 0o644); err != nil {
+		log.Printf("auto-tunnel: writing url file: %v", err)
+	}
 
 	// Notify every allowed user via DM (user ID == DM chat ID in Telegram).
 	for _, userID := range b.config.AllowedUsers {

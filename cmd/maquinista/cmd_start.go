@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -92,6 +93,30 @@ func runTopLevelStart(ctx context.Context) error {
 		}
 		return fmt.Errorf("dashboard: %w", err)
 	}
+
+	// If auto-tunnel is enabled, wait for the orchestrator daemon to start
+	// cloudflared and write the public URL to the state file, then print it
+	// so the operator sees it in the same terminal as the start banners.
+	autoTunnelEnv := os.Getenv("MAQUINISTA_DASHBOARD_AUTO_TUNNEL")
+	autoTunnel := autoTunnelEnv != "0" && autoTunnelEnv != "false" && autoTunnelEnv != "no"
+	if autoTunnel {
+		urlFile := filepath.Join(resolveDashboardDir(), "tunnel.url")
+		_ = os.Remove(urlFile) // clear any stale URL from a previous run
+		fmt.Print("dashboard tunnel: starting…")
+		deadline := time.Now().Add(25 * time.Second)
+		for time.Now().Before(deadline) {
+			if data, err := os.ReadFile(urlFile); err == nil {
+				fmt.Printf("\rdashboard tunnel: %s\n", strings.TrimSpace(string(data)))
+				break
+			}
+			fmt.Print(".")
+			time.Sleep(500 * time.Millisecond)
+		}
+		if _, err := os.Stat(urlFile); os.IsNotExist(err) {
+			fmt.Println("\rdashboard tunnel: timed out — check orchestrator logs")
+		}
+	}
+
 	return nil
 }
 
@@ -356,7 +381,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(4 * time.Second):
+			case <-time.After(1 * time.Second):
 			}
 			if url, tunnelErr := b.StartPersistentTunnel(ctx); tunnelErr != nil {
 				log.Printf("auto-tunnel: %v", tunnelErr)
