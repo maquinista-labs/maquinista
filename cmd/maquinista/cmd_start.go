@@ -216,6 +216,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	activeInboxMap := &mailbox.ActiveInboxMap{}
 	if pool != nil {
 		mon.OutboxWriter = monitor.NewDBOutboxWriter(pool, activeInboxMap)
+		mon.ToolEventWriter = monitor.NewDBToolEventNotifier(pool)
 		log.Println("mailbox.outbound: writing responses to agent_outbox")
 	} else {
 		log.Println("mailbox.outbound: no DB pool — outbox writes disabled")
@@ -345,6 +346,24 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				}
 			}
 		}
+	}
+
+	// Auto-start a persistent cloudflared tunnel if configured. We defer by
+	// a few seconds so the dashboard has time to bind its port before
+	// cloudflared attempts to proxy traffic.
+	if cfg.Dashboard.AutoTunnel {
+		go func() {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(4 * time.Second):
+			}
+			if url, tunnelErr := b.StartPersistentTunnel(ctx); tunnelErr != nil {
+				log.Printf("auto-tunnel: %v", tunnelErr)
+			} else {
+				log.Printf("auto-tunnel: %s", url)
+			}
+		}()
 	}
 
 	err = b.Run(ctx)

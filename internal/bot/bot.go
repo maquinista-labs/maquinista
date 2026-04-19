@@ -167,6 +167,7 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "ws", Description: "Manage agent workspaces (list/new/switch/archive)"},
 		tgbotapi.BotCommand{Command: "dashboard", Description: "Open a public tunnel to the dashboard [duration]"},
 		tgbotapi.BotCommand{Command: "dashboard_stop", Description: "Close the dashboard tunnel"},
+		tgbotapi.BotCommand{Command: "dashboard_user", Description: "Manage dashboard users: add <username> <password>"},
 	)
 	if _, err := b.api.Request(commands); err != nil {
 		log.Printf("Warning: failed to register bot commands: %v", err)

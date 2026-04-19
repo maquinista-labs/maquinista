@@ -128,6 +128,59 @@ func parseTunnelDuration(s string) (time.Duration, error) {
 	return time.ParseDuration(s)
 }
 
+// StartPersistentTunnel opens a no-TTL cloudflared tunnel to the dashboard and
+// logs the public URL to stdout. It also sends a Telegram message with an
+// [Open] button to each configured AllowedUser (treating user IDs as DM chat
+// IDs, which is correct for private chats). Idempotent: if the tunnel is
+// already running it returns the existing URL.
+//
+// Called by the orchestrator supervisor when
+// MAQUINISTA_DASHBOARD_AUTO_TUNNEL=1 is set.
+func (b *Bot) StartPersistentTunnel(ctx context.Context) (string, error) {
+	if b.tunnel == nil {
+		return "", fmt.Errorf("tunnel manager not initialised")
+	}
+
+	// Already running — return the existing URL.
+	if b.tunnel.IsRunning() {
+		url := b.tunnel.URL()
+		log.Printf("auto-tunnel: already running → %s", url)
+		return url, nil
+	}
+
+	listenAddr := b.config.Dashboard.Listen
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:8900"
+	}
+
+	if err := b.ensureDashboardRunning(); err != nil {
+		log.Printf("auto-tunnel: ensure dashboard: %v", err)
+		// Non-fatal — cloudflared can race the dashboard startup; the health
+		// endpoint will return 503 until the dashboard is ready.
+	}
+
+	// dur=0 means no TTL — tunnel lives for the entire process lifetime.
+	url, err := b.tunnel.Start(ctx, listenAddr, 0)
+	if err != nil {
+		return "", fmt.Errorf("starting tunnel: %w", err)
+	}
+
+	log.Printf("auto-tunnel: dashboard ready → %s", url)
+
+	if b.config.Dashboard.AuthMode == "none" {
+		log.Printf("WARNING: MAQUINISTA_DASHBOARD_AUTO_TUNNEL=1 but MAQUINISTA_DASHBOARD_AUTH=none — " +
+			"the dashboard is publicly accessible without authentication. " +
+			"Set MAQUINISTA_DASHBOARD_AUTH=password to require login.")
+	}
+
+	// Notify every allowed user via DM (user ID == DM chat ID in Telegram).
+	for _, userID := range b.config.AllowedUsers {
+		b.replyWithURLButton(userID, 0, "🚀 Dashboard tunnel ready.", url)
+	}
+
+	return url, nil
+}
+
 // ensureDashboardRunning starts the dashboard if it is not already running.
 // It shells out to `maquinista dashboard start` in a fire-and-forget fashion
 // and waits up to 5 s for the healthcheck to respond.

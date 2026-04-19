@@ -101,6 +101,10 @@ type DashboardConfig struct {
 	// MAQUINISTA_DASHBOARD_NODE_BIN for operators who keep Node
 	// outside $PATH (e.g. asdf / nvm shims).
 	NodeBin string
+	// AutoTunnel starts a cloudflared Quick Tunnel at orchestrator boot
+	// with no TTL. The URL is logged to stdout and sent as a Telegram
+	// message. Set MAQUINISTA_DASHBOARD_AUTO_TUNNEL=1 to enable.
+	AutoTunnel bool
 }
 
 // MailboxInboundEnabled reports whether the mailbox.inbound flag is active
@@ -270,6 +274,7 @@ func loadDashboardConfig() DashboardConfig {
 	if cfg.NodeBin == "" {
 		cfg.NodeBin = "node"
 	}
+	cfg.AutoTunnel = parseBoolEnv(os.Getenv("MAQUINISTA_DASHBOARD_AUTO_TUNNEL"))
 	return cfg
 }
 
