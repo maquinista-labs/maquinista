@@ -21,10 +21,8 @@ export default async function AuthPage({
         data-testid="auth-panel"
         className="w-full max-w-sm rounded-2xl border border-border/60 bg-card p-6 shadow-sm"
       >
-        <h1 className="mb-1 text-xl font-semibold">maquinista dashboard</h1>
-        <p className="mb-4 text-sm text-muted-foreground">
-          Sign in to continue. Mode: <code>{mode}</code>
-        </p>
+        <h1 className="mb-1 text-xl font-semibold">maquinista</h1>
+        <p className="mb-4 text-sm text-muted-foreground">Sign in to continue.</p>
         {mode === "telegram" ? (
           <div
             data-testid="auth-telegram-stub"
