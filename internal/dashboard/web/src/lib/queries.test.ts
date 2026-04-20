@@ -146,7 +146,7 @@ describe("listGlobalInbox", () => {
     expect(sql).toContain("LIMIT 200");
     expect(sql).toContain("JOIN agents");
     expect(sql).toContain("ORDER BY i.enqueued_at DESC");
-    expect(params[0]).toEqual(["pending", "processing"]);
+    expect(params[0]).toEqual(["pending", "processing", "failed", "dead"]);
   });
 
   it("accepts a custom status filter", async () => {

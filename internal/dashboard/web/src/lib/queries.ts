@@ -174,9 +174,13 @@ export type GlobalInboxOpts = {
   status?: InboxRow["status"][]; // defaults to ['pending','processing']
 };
 
-// listGlobalInbox: cross-agent feed of in-flight inbox rows. Joins
-// agents to carry the handle so the row can render a human label
-// without a second fetch.
+// listGlobalInbox: cross-agent feed of external signals entering the
+// system — Telegram messages, webhooks, scheduled jobs. Excludes:
+//   • operator dashboard messages (origin_channel='dashboard')
+//   • agent-to-agent messages (from_kind='agent')
+//   • internal system control messages (from_kind='system')
+// These three categories either belong in Chats or are plumbing the
+// operator has no reason to act on from the inbox view.
 export async function listGlobalInbox(
   pool: Pool,
   opts: GlobalInboxOpts = {},
@@ -185,7 +189,7 @@ export async function listGlobalInbox(
   const statuses =
     opts.status && opts.status.length > 0
       ? opts.status
-      : ["pending", "processing"];
+      : ["pending", "processing", "failed", "dead"];
   const { rows } = await pool.query(
     `
     SELECT i.id, i.agent_id, a.handle AS agent_handle,
@@ -195,6 +199,8 @@ export async function listGlobalInbox(
     FROM agent_inbox i
     JOIN agents a ON a.id = i.agent_id
     WHERE i.status = ANY($1::text[])
+      AND i.origin_channel IS DISTINCT FROM 'dashboard'
+      AND i.from_kind NOT IN ('agent', 'system')
     ORDER BY i.enqueued_at DESC
     LIMIT ${limit}
     `,

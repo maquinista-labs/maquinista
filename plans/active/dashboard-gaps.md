@@ -29,7 +29,7 @@ reference line under `### Triage backlog`.
 
 | Gap | Status | Notes |
 |---|---|---|
-| G.1 Global Inbox | **shipped** (5cde0ca) | `listGlobalInbox` + `/api/inbox` + `<GlobalInboxList>`, 3 Playwright specs. |
+| G.1 Global Inbox | **shipped** (5cde0ca, adjusted) | `listGlobalInbox` + `/api/inbox` + `<GlobalInboxList>`, 3 Playwright specs. Adjusted to exclude dashboard-originated and a2a/system rows; default statuses narrowed to pending+processing+failed+dead. |
 | G.2 Global Chats | **shipped** (5cde0ca) | `listConversations` CTE + `/api/conversations` + `<ConversationList>`. Pending-count badge folded in; AgentDetailTabs now respects `?tab=`+`?conversation=`. 3 Playwright specs. |
 | G.3 Rename agent | **shipped** (8e689a9) | `renameAgent` + `POST /api/agents/:id/rename` + Sheet affordance + `displayName(a)` helper. 5 Vitest + 8 Playwright. |
 | G.4 Seed default agents | **shipped** (6044d30) | Migration 028 adds coordinator/planner/coder templates; `seedDefaultAgents` runs before reconcile on every orchestrator start. `MAQUINISTA_SKIP_SEED_AGENTS=1` opts out. 4 Go integration tests + 2 Playwright. |

@@ -11,15 +11,16 @@ import (
 	"testing"
 )
 
-func TestStandalone_PlaceholderAtRest(t *testing.T) {
-	// The committed standalone.tgz is expected to be the placeholder
-	// until `make dashboard-web-package` runs. This ensures
-	// developers don't accidentally commit a real ~50 MiB bundle.
-	if !StandaloneIsPlaceholder() {
-		t.Fatalf("StandaloneIsPlaceholder = false; the committed tarball should be the NOT_BUILT placeholder")
+func TestStandalone_BundleIsReal(t *testing.T) {
+	// The committed standalone.tgz should be the real Next.js bundle
+	// (built via `make dashboard-web-package`), not the NOT_BUILT
+	// placeholder. The placeholder is only valid in a developer clone
+	// before the first build.
+	if StandaloneIsPlaceholder() {
+		t.Fatal("StandaloneIsPlaceholder = true; the committed tarball should be the real Next.js bundle, not the NOT_BUILT placeholder")
 	}
-	if StandaloneSize() > 2048 {
-		t.Fatalf("StandaloneSize = %d; placeholder should be tiny", StandaloneSize())
+	if StandaloneSize() == 0 {
+		t.Fatal("StandaloneSize = 0; the tarball appears empty")
 	}
 }
 
@@ -34,11 +35,32 @@ func TestStandaloneSHA256_Deterministic(t *testing.T) {
 	}
 }
 
-func TestExtractStandalone_RefusesPlaceholder(t *testing.T) {
+func TestExtractTarball_RefusesPlaceholderWhenGuarded(t *testing.T) {
+	// Build a synthetic placeholder tarball (mirrors what the NOT_BUILT
+	// placeholder actually contains: a single "NOT_BUILT.txt" entry).
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	const content = "placeholder"
+	hdr := &tar.Header{
+		Name:     "NOT_BUILT.txt",
+		Mode:     0o644,
+		Size:     int64(len(content)),
+		Typeflag: tar.TypeReg,
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatalf("WriteHeader: %v", err)
+	}
+	if _, err := tw.Write([]byte(content)); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	tw.Close()
+	gz.Close()
+
 	dest := t.TempDir()
-	_, err := ExtractStandalone(dest)
+	_, err := extractTarball(buf.Bytes(), dest, true /* placeholderGuard */)
 	if err == nil {
-		t.Fatal("ExtractStandalone with placeholder returned nil; want error")
+		t.Fatal("extractTarball with placeholder+guard returned nil; want error")
 	}
 	if !strings.Contains(err.Error(), "placeholder") {
 		t.Fatalf("error = %v; want 'placeholder'", err)

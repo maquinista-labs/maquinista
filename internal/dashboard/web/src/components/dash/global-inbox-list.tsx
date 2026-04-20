@@ -177,7 +177,7 @@ export function GlobalInboxList({
         data-testid="inbox-empty"
         className="p-4 text-sm text-muted-foreground"
       >
-        No messages yet.
+        No pending external messages. Agents are caught up.
       </Card>
     );
   }
