@@ -193,6 +193,8 @@ func (m *Monitor) poll() {
 				for _, pe := range parsed {
 					m.sink.Emit(buildAgentEvent(sess.WindowID, agentID, 0, 0, 0, pe))
 				}
+				// Flush buffers (e.g. OutboxSink) after all entries for this session.
+				m.sink.FlushSession(sess.WindowID)
 			}
 		}
 	}
