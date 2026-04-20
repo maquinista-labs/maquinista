@@ -28,8 +28,7 @@ export default async function InboxPage() {
     <section className="mx-auto max-w-screen-sm px-4 py-6">
       <h2 className="mb-1 text-xl font-semibold">Inbox</h2>
       <p className="mb-4 text-sm text-muted-foreground">
-        External messages arriving from Telegram, webhooks, and scheduled
-        jobs — pending, in-flight, or failed.
+        Webhook and scheduled job triggers — pending, in-flight, or failed.
       </p>
       {error ? (
         <p
