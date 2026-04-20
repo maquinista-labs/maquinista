@@ -24,6 +24,8 @@ export type ToolEventPayload = {
   type: "tool_use" | "tool_result";
   tool_name: string;
   tool_use_id: string;
+  tool_input?: string;  // present on tool_use
+  text?: string;        // present on tool_result (truncated result content)
   is_error: boolean;
 };
 
@@ -102,7 +104,9 @@ export function useDashStream() {
       source.addEventListener("agent_stop", bump("agent_stop"));
 
       // tool_event: re-dispatch as a DOM CustomEvent so per-agent hooks can
-      // subscribe without opening a second SSE connection.
+      // subscribe without opening a second SSE connection. Also invalidate
+      // the conversation query so new text messages appear without waiting
+      // for agent_outbox_new (both events arrive in the same monitor poll).
       source.addEventListener("tool_event", (ev: MessageEvent) => {
         try {
           const frame = JSON.parse(ev.data) as { payload: string };
@@ -110,6 +114,7 @@ export function useDashStream() {
           window.dispatchEvent(
             new CustomEvent("maq:tool_event", { detail }),
           );
+          queryClient.invalidateQueries({ queryKey: ["conversation"] });
         } catch {
           /* malformed payload — ignore */
         }

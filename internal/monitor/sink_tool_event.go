@@ -37,22 +37,31 @@ func (s *ToolEventSink) Handle(e AgentEvent) {
 
 	switch e.Kind {
 	case AgentEventToolPaired:
-		// Re-emit suppressed tool_use before tool_result so dashboard banner sees both.
-		s.notify(ctx, agentID, "tool_use", e.ToolName, e.ToolUseID, false)
-		s.notify(ctx, agentID, "tool_result", e.ToolName, e.ToolUseID, e.IsError)
+		// Re-emit suppressed tool_use before tool_result so dashboard sees both.
+		s.notify(ctx, agentID, "tool_use", e.ToolName, e.ToolUseID, e.ToolInput, "", false)
+		s.notify(ctx, agentID, "tool_result", e.ToolName, e.ToolUseID, "", e.Text, e.IsError)
 	case AgentEventToolUse:
-		s.notify(ctx, agentID, "tool_use", e.ToolName, e.ToolUseID, false)
+		s.notify(ctx, agentID, "tool_use", e.ToolName, e.ToolUseID, e.ToolInput, "", false)
 	case AgentEventToolResult:
-		s.notify(ctx, agentID, "tool_result", e.ToolName, e.ToolUseID, e.IsError)
+		s.notify(ctx, agentID, "tool_result", e.ToolName, e.ToolUseID, "", e.Text, e.IsError)
 	}
 }
 
-func (s *ToolEventSink) notify(ctx context.Context, agentID, typ, name, useID string, isError bool) {
+func (s *ToolEventSink) notify(ctx context.Context, agentID, typ, name, useID, input, text string, isError bool) {
+	// Truncate long content to avoid bloated pg_notify payloads.
+	if len(input) > 300 {
+		input = input[:300] + "…"
+	}
+	if len(text) > 500 {
+		text = text[:500] + "…"
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"agent_id":    agentID,
 		"type":        typ,
 		"tool_name":   name,
 		"tool_use_id": useID,
+		"tool_input":  input,
+		"text":        text,
 		"is_error":    isError,
 	})
 	if _, err := s.pool.Exec(ctx, "SELECT pg_notify($1, $2)", "tool_event", string(payload)); err != nil {

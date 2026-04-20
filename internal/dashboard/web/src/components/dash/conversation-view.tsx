@@ -31,12 +31,6 @@ function toolEmoji(name: string): string {
   return TOOL_EMOJI[name.toLowerCase()] ?? "🔮";
 }
 
-function formatElapsed(ms: number): string {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  return `${Math.floor(s / 60)}m ${s % 60}s`;
-}
-
 // Props: either agentId (timeline view) or conversationId (single thread).
 // liveAgentId enables inline tool-call display via SSE — pass the agent's id
 // in both cases so the live feed is always wired up.
@@ -136,13 +130,13 @@ export function ConversationView(props: Props) {
     refetchInterval: 3000,
   });
 
-  // Live tool calls from SSE — shown inline at the bottom while in-flight.
-  const liveCalls = useAgentLive(liveAgentId ?? "");
+  // Live tool events from SSE — appended inline below historical items.
+  const liveEvents = useAgentLive(liveAgentId ?? "");
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [q.data, liveCalls.length]);
+  }, [q.data, liveEvents.length]);
 
   if (q.isLoading) {
     return (
@@ -166,7 +160,7 @@ export function ConversationView(props: Props) {
   }
   const items = q.data?.items ?? [];
 
-  const isEmpty = items.length === 0 && liveCalls.length === 0;
+  const isEmpty = items.length === 0 && liveEvents.length === 0;
   if (isEmpty) {
     return (
       <p
@@ -220,29 +214,36 @@ export function ConversationView(props: Props) {
         );
       })}
 
-      {/* Live tool calls — inline at bottom, fade out when done */}
-      {liveCalls.map((c) => (
-        <div
-          key={c.callId}
-          data-testid={`conv-tool-${c.callId}`}
-          className={cn(
-            "flex w-full justify-start transition-opacity duration-500",
-            c.status === "done" ? "opacity-30" : "opacity-100",
-          )}
-        >
-          <div className="flex items-center gap-1.5 rounded-lg border border-border/50 bg-muted/30 px-2.5 py-1.5 font-mono text-xs text-muted-foreground">
-            <span className="text-base leading-none">{toolEmoji(c.toolName)}</span>
-            <span className="font-medium text-foreground">{c.toolName}</span>
-            <span className="opacity-60">{formatElapsed(c.elapsedMs)}</span>
-            {c.status === "done" && (
-              <span className="text-green-600 dark:text-green-400">✓</span>
-            )}
-            {c.status === "running" && (
-              <span className="animate-pulse opacity-70">…</span>
-            )}
+      {/* Live tool events — rendered as regular bubbles, never removed */}
+      {liveEvents.map((ev) => {
+        const label =
+          ev.kind === "tool_use"
+            ? `${toolEmoji(ev.toolName)} ${ev.toolName}${ev.toolInput ? `(${ev.toolInput})` : "()"}`
+            : `${ev.isError ? "✗" : "✓"} ${ev.toolName}${ev.text ? `: ${ev.text}` : ""}`;
+        return (
+          <div
+            key={ev.id}
+            data-testid={`conv-tool-${ev.id}`}
+            className="flex w-full justify-start"
+          >
+            <div
+              className={cn(
+                "max-w-[80%] rounded-2xl px-3 py-2 text-sm font-mono",
+                ev.kind === "tool_use"
+                  ? "bg-muted/50 text-foreground border border-border/60"
+                  : ev.isError
+                    ? "bg-destructive/10 text-foreground border border-destructive/30"
+                    : "bg-muted/30 text-muted-foreground border border-border/40",
+              )}
+            >
+              {label}
+              <time className="mt-1 block text-[10px] text-muted-foreground text-left">
+                {ev.at.toLocaleTimeString()}
+              </time>
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
 
       <div ref={bottomRef} />
     </div>
