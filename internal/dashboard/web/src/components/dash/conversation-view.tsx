@@ -8,6 +8,7 @@ import { AnimatePresence, motion } from "framer-motion";
 
 import { cn } from "@/lib/utils";
 import { useAgentLive, useAgentStatus, formatElapsed } from "@/lib/use-agent-live";
+import type { LiveToolCall } from "@/lib/use-agent-live";
 import type { ConversationItem } from "@/lib/types";
 
 const TOOL_EMOJI: Record<string, string> = {
@@ -187,6 +188,26 @@ export function ConversationView(props: Props) {
     );
   }
 
+  // Build a unified timeline: DB inbox/outbox items + live SSE tool events,
+  // sorted chronologically so tool calls appear between the messages they
+  // belong to rather than piling up at the bottom.
+  type DbEntry  = { kind: "db";   item: ConversationItem; at: number };
+  type ToolEntry = { kind: "tool"; call: LiveToolCall;      at: number };
+  type Entry = DbEntry | ToolEntry;
+
+  const timeline: Entry[] = [
+    ...items.map((item): DbEntry => ({
+      kind: "db",
+      item,
+      at: new Date(item.at).getTime(),
+    })),
+    ...liveEvents.map((call): ToolEntry => ({
+      kind: "tool",
+      call,
+      at: call.startedAt.getTime(),
+    })),
+  ].sort((a, b) => a.at - b.at);
+
   return (
     <div
       data-testid="conv-view"
@@ -195,101 +216,103 @@ export function ConversationView(props: Props) {
       className="flex flex-col gap-2 py-3"
     >
       <AnimatePresence>
-        {items.map((it, index) => {
-          const right = it.kind === "outbox"; // agent speaks → right
+        {timeline.map((entry, index) => {
+          if (entry.kind === "db") {
+            const it = entry.item;
+            const right = it.kind === "outbox";
+            return (
+              <motion.div
+                key={`db-${it.kind}-${it.id}`}
+                data-testid={`conv-bubble-${it.id}`}
+                className={cn("flex w-full", right ? "justify-end" : "justify-start")}
+                initial={{ opacity: 0, y: 12, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, scale: 0.95, y: -4 }}
+                transition={{ type: "spring", stiffness: 380, damping: 30, delay: Math.min(index * 0.04, 0.3) }}
+              >
+                <div
+                  className={cn(
+                    "max-w-[80%] rounded-2xl px-3 py-2 text-sm",
+                    right
+                      ? "bg-primary/12 text-foreground border border-primary/20"
+                      : "bg-muted/50 text-foreground border border-border/60",
+                  )}
+                >
+                  <ReactMarkdown components={mdComponents} remarkPlugins={[remarkGfm]}>
+                    {it.excerpt ?? "*empty*"}
+                  </ReactMarkdown>
+                  <time
+                    className={cn(
+                      "mt-1 block text-[10px] text-muted-foreground",
+                      right ? "text-right" : "text-left",
+                    )}
+                  >
+                    {new Date(it.at).toLocaleTimeString()}
+                  </time>
+                </div>
+              </motion.div>
+            );
+          }
+
+          // SSE tool event
+          const call = entry.call;
           return (
             <motion.div
-              key={`${it.kind}-${it.id}`}
-              data-testid={`conv-bubble-${it.id}`}
-              className={cn("flex w-full", right ? "justify-end" : "justify-start")}
-              initial={{ opacity: 0, y: 12, scale: 0.96 }}
+              key={`tool-${call.id}`}
+              data-testid={`conv-tool-${call.id}`}
+              className="flex w-full justify-start"
+              initial={{ opacity: 0, y: 10, scale: 0.97 }}
               animate={{ opacity: 1, y: 0, scale: 1 }}
               exit={{ opacity: 0, scale: 0.95, y: -4 }}
-              transition={{ type: "spring", stiffness: 380, damping: 30, delay: Math.min(index * 0.04, 0.3) }}
+              transition={{ type: "spring", stiffness: 380, damping: 30 }}
             >
               <div
                 className={cn(
-                  "max-w-[80%] rounded-2xl px-3 py-2 text-sm",
-                  right
-                    ? "bg-primary/12 text-foreground border border-primary/20"
-                    : "bg-muted/50 text-foreground border border-border/60",
+                  "flex items-center gap-2 rounded-2xl px-3 py-2 text-sm font-mono",
+                  call.status === "error"
+                    ? "bg-destructive/10 text-foreground border border-destructive/30"
+                    : call.status === "done"
+                      ? "bg-muted/30 text-muted-foreground border border-border/40"
+                      : "bg-muted/50 text-foreground border border-border/60",
                 )}
               >
-                <ReactMarkdown components={mdComponents} remarkPlugins={[remarkGfm]}>
-                  {it.excerpt ?? "*empty*"}
-                </ReactMarkdown>
-                <time
-                  className={cn(
-                    "mt-1 block text-[10px] text-muted-foreground",
-                    right ? "text-right" : "text-left",
-                  )}
+                <span className="text-base leading-none shrink-0">{toolEmoji(call.toolName)}</span>
+                <span className="font-medium text-foreground">{call.toolName}</span>
+                {call.toolInput && (
+                  <span className="opacity-50 truncate max-w-[160px]">({call.toolInput})</span>
+                )}
+                <span className="shrink-0 ml-1 tabular-nums text-[11px] opacity-60">
+                  {call.elapsedMs !== undefined ? formatElapsed(call.elapsedMs) : ""}
+                </span>
+                <motion.span
+                  className="shrink-0"
+                  initial={false}
+                  animate={call.status !== "running" ? { scale: 1, opacity: 1 } : { scale: 0, opacity: 0 }}
+                  transition={{ type: "spring", stiffness: 500, damping: 20 }}
                 >
-                  {new Date(it.at).toLocaleTimeString()}
-                </time>
+                  {call.status === "done" && (
+                    <span className="text-green-600 dark:text-green-400">✓</span>
+                  )}
+                  {call.status === "error" && (
+                    <span className="text-destructive">✗</span>
+                  )}
+                </motion.span>
+                {call.status === "running" && (
+                  <motion.span
+                    className="shrink-0 text-muted-foreground"
+                    animate={{ opacity: [1, 0.3, 1] }}
+                    transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+                  >
+                    ···
+                  </motion.span>
+                )}
               </div>
             </motion.div>
           );
         })}
       </AnimatePresence>
 
-      {/* Live tool calls — merged tool_use + tool_result, one bubble each */}
-      <AnimatePresence>
-        {liveEvents.map((call) => (
-          <motion.div
-            key={call.id}
-            data-testid={`conv-tool-${call.id}`}
-            className="flex w-full justify-start"
-            initial={{ opacity: 0, y: 10, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, scale: 0.95, y: -4 }}
-            transition={{ type: "spring", stiffness: 380, damping: 30 }}
-          >
-            <div
-              className={cn(
-                "flex items-center gap-2 rounded-2xl px-3 py-2 text-sm font-mono",
-                call.status === "error"
-                  ? "bg-destructive/10 text-foreground border border-destructive/30"
-                  : call.status === "done"
-                    ? "bg-muted/30 text-muted-foreground border border-border/40"
-                    : "bg-muted/50 text-foreground border border-border/60",
-              )}
-            >
-              <span className="text-base leading-none shrink-0">{toolEmoji(call.toolName)}</span>
-              <span className="font-medium text-foreground">{call.toolName}</span>
-              {call.toolInput && (
-                <span className="opacity-50 truncate max-w-[160px]">({call.toolInput})</span>
-              )}
-              <span className="shrink-0 ml-1 tabular-nums text-[11px] opacity-60">
-                {call.elapsedMs !== undefined ? formatElapsed(call.elapsedMs) : ""}
-              </span>
-              <motion.span
-                className="shrink-0"
-                initial={false}
-                animate={call.status !== "running" ? { scale: 1, opacity: 1 } : { scale: 0, opacity: 0 }}
-                transition={{ type: "spring", stiffness: 500, damping: 20 }}
-              >
-                {call.status === "done" && (
-                  <span className="text-green-600 dark:text-green-400">✓</span>
-                )}
-                {call.status === "error" && (
-                  <span className="text-destructive">✗</span>
-                )}
-              </motion.span>
-              {call.status === "running" && (
-                <motion.span
-                  className="shrink-0 text-muted-foreground"
-                  animate={{ opacity: [1, 0.3, 1] }}
-                  transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
-                >
-                  ···
-                </motion.span>
-              )}
-            </div>
-          </motion.div>
-        ))}
-      </AnimatePresence>
-
-      {/* Terminal spinner status — visible while agent is thinking between tool calls */}
+      {/* Agent status spinner — always at the bottom, shows current thinking state */}
       <AnimatePresence>
         {agentStatus && (
           <motion.div
