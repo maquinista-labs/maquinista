@@ -13,10 +13,12 @@ import (
 	"time"
 )
 
-// TestDashboardIntegration_NodeHealthcheckLifecycle is the Phase 0
-// Commit 0.3 gate: running `maquinista dashboard start` spawns a
-// Node child that responds on /healthz with JSON, and cancelling
-// the context cleans up the PID file and the child.
+// TestDashboardIntegration_NodeHealthcheckLifecycle gates that
+// `maquinista dashboard start` spawns the dashboard child (real
+// Next.js standalone when the embedded bundle is not a placeholder,
+// or the Phase 0 Node stub otherwise), that /api/healthz responds
+// with ok:true, and that cancelling the context cleans up the PID
+// file and the child.
 func TestDashboardIntegration_NodeHealthcheckLifecycle(t *testing.T) {
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skip("node not on PATH; skipping integration test")
@@ -58,9 +60,8 @@ func TestDashboardIntegration_NodeHealthcheckLifecycle(t *testing.T) {
 	}
 
 	var parsed struct {
-		OK   bool   `json:"ok"`
-		Path string `json:"path"`
-		Stub bool   `json:"stub"`
+		OK   bool `json:"ok"`
+		Stub bool `json:"stub"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		t.Fatalf("json.Unmarshal(%q): %v", body, err)
@@ -68,14 +69,9 @@ func TestDashboardIntegration_NodeHealthcheckLifecycle(t *testing.T) {
 	if !parsed.OK {
 		t.Fatalf("/healthz body = %q; want ok:true", body)
 	}
-	if parsed.Path != "/api/healthz" {
-		t.Fatalf("/healthz path = %q; want /api/healthz", parsed.Path)
-	}
-	if !parsed.Stub {
-		// Phase 0 explicitly shouts "stub" so we know we're on the
-		// placeholder server. Catch regressions if that drifts.
-		t.Fatalf("/healthz stub flag = false; Phase 0 expects true")
-	}
+	// stub:true → Phase 0 placeholder; stub:false → real Next.js server.
+	// Both are acceptable; the gate is that ok:true is returned.
+	t.Logf("/healthz: ok=true stub=%v", parsed.Stub)
 
 	// Confirm the PID file was written while we were running.
 	if pid, err := readDashboardPIDFile(); err != nil || pid != os.Getpid() {

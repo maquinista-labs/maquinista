@@ -230,8 +230,8 @@ func TestLoadDashboard_Defaults(t *testing.T) {
 	if cfg.Listen != "127.0.0.1:8900" {
 		t.Errorf("Listen = %q, want 127.0.0.1:8900", cfg.Listen)
 	}
-	if cfg.AuthMode != "none" {
-		t.Errorf("AuthMode = %q, want none", cfg.AuthMode)
+	if cfg.AuthMode != "password" {
+		t.Errorf("AuthMode = %q, want password (secure default)", cfg.AuthMode)
 	}
 	if cfg.ThemeDefault != "system" {
 		t.Errorf("ThemeDefault = %q, want system", cfg.ThemeDefault)
@@ -262,12 +262,12 @@ func TestLoadDashboard_Overrides(t *testing.T) {
 	}
 }
 
-func TestLoadDashboard_UnknownAuthFallsBackToNone(t *testing.T) {
+func TestLoadDashboard_UnknownAuthFallsBackToPassword(t *testing.T) {
 	clearEnv()
 	os.Setenv("MAQUINISTA_DASHBOARD_AUTH", "biometric")
 	cfg := loadDashboardConfig()
-	if cfg.AuthMode != "none" {
-		t.Errorf("AuthMode for unknown value = %q, want none", cfg.AuthMode)
+	if cfg.AuthMode != "password" {
+		t.Errorf("AuthMode for unknown value = %q, want password (secure fallback)", cfg.AuthMode)
 	}
 }
 

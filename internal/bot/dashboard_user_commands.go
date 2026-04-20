@@ -95,19 +95,27 @@ func createOperatorCredential(ctx context.Context, pool *pgxpool.Pool, username,
 	return id, nil
 }
 
-// hashDashboardPassword produces the same hash format as auth.ts hashPassword():
+// hashDashboardPassword produces a (pbkdf2_hash, salt) pair compatible with
+// auth.ts hashPassword() / verifyPassword():
 //
-//	pbkdf2:sha256:<iter>:<salt_hex>:<key_hex>
+//   - salt is a random 16-byte value hex-encoded (32 hex chars).
+//   - pbkdf2_hash is the hex-encoded 32-byte PBKDF2-SHA256 key derived using
+//     the hex-encoded salt string as the raw salt bytes — matching the Node
+//     pbkdf2Sync call in auth.ts which passes the hex string directly.
 //
-// This ensures passwords set via the Telegram command are accepted by the
-// Next.js login route without any conversion.
+// The two values are stored separately in operator_credentials (pbkdf2_hash,
+// salt columns) so verifyPassword can reconstruct the key without parsing a
+// combined format string.
 func hashDashboardPassword(password string) (hash, salt string, err error) {
 	saltBytes := make([]byte, dashUserPbkdf2SaltLen)
 	if _, err = rand.Read(saltBytes); err != nil {
 		return "", "", fmt.Errorf("generating salt: %w", err)
 	}
+	// Encode salt to hex. The hex string itself is used as the PBKDF2 salt
+	// (as UTF-8 bytes), matching Node's pbkdf2Sync which receives the hex
+	// string and treats it as raw bytes.
 	salt = hex.EncodeToString(saltBytes)
-	key := pbkdf2.Key([]byte(password), saltBytes, dashUserPbkdf2Iter, dashUserPbkdf2KeyLen, sha256.New)
-	hash = fmt.Sprintf("pbkdf2:sha256:%d:%s:%s", dashUserPbkdf2Iter, salt, hex.EncodeToString(key))
+	key := pbkdf2.Key([]byte(password), []byte(salt), dashUserPbkdf2Iter, dashUserPbkdf2KeyLen, sha256.New)
+	hash = hex.EncodeToString(key)
 	return hash, salt, nil
 }

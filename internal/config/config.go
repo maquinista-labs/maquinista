@@ -88,10 +88,9 @@ type DashboardConfig struct {
 	// "127.0.0.1:8900"; set MAQUINISTA_DASHBOARD_LISTEN to override.
 	Listen string
 	// AuthMode selects one of "none", "password", or "telegram".
-	// Phase 6 introduces the full matrix; until then "none" is the
-	// only supported value and binding to a non-loopback address
-	// implies operator opt-in. Default "none";
-	// MAQUINISTA_DASHBOARD_AUTH to override.
+	// Default "password" (requires login); set
+	// MAQUINISTA_DASHBOARD_AUTH=none to disable the auth gate for
+	// loopback-only deployments. Unknown values fall back to "password".
 	AuthMode string
 	// ThemeDefault is one of "system", "dark", "light". Default
 	// "system"; MAQUINISTA_DASHBOARD_THEME to override.

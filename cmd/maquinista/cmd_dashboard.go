@@ -283,8 +283,23 @@ func runDashboardStart(parentCtx context.Context) error {
 func superviseDashboard(ctx context.Context, listen string) error {
 	host, port := parseListen(listen)
 	nodeBin := resolveNodeBin()
-	// Config load is best-effort — see the original Phase 0 comment.
-	_, _ = config.Load()
+
+	// Resolve dashboard config so we can explicitly forward
+	// MAQUINISTA_DASHBOARD_AUTH to the Node child. The Go default
+	// ("password" when unset) differs from Next.js's default ("none"),
+	// so we must pin the resolved value rather than relying on
+	// inheritance. Config load is best-effort: Telegram / ALLOWED_USERS
+	// may not be set in some envs; fall back to the safe default.
+	authMode := "password"
+	if cfg, cfgErr := config.Load(); cfgErr == nil {
+		authMode = cfg.Dashboard.AuthMode
+		if cfg.Dashboard.AutoTunnel && authMode == "none" {
+			fmt.Fprintln(os.Stderr,
+				"WARNING: MAQUINISTA_DASHBOARD_AUTO_TUNNEL=1 but MAQUINISTA_DASHBOARD_AUTH=none. "+
+					"The dashboard is publicly accessible without authentication. "+
+					"Set MAQUINISTA_DASHBOARD_AUTH=password to require login.")
+		}
+	}
 
 	source, err := resolveDashboardChild(nodeBin)
 	if err != nil {
@@ -293,9 +308,16 @@ func superviseDashboard(ctx context.Context, listen string) error {
 
 	logPath := dashboardLogFilePath()
 	sup := dashboard.New(dashboard.Config{
-		Bin:            source.Bin,
-		Args:           source.Args,
-		Env:            append([]string{"PORT=" + port, "HOSTNAME=" + host}, source.Env...),
+		Bin:  source.Bin,
+		Args: source.Args,
+		Env: append([]string{
+			"PORT=" + port,
+			"HOSTNAME=" + host,
+			// Explicitly forward the resolved auth mode so the Next.js
+			// middleware always sees the Go-side default ("password")
+			// even when the operator hasn't set the env var explicitly.
+			"MAQUINISTA_DASHBOARD_AUTH=" + authMode,
+		}, source.Env...),
 		WorkDir:        source.WorkDir,
 		LogPath:        logPath,
 		MaxRestarts:    5,
