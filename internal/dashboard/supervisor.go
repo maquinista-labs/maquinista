@@ -39,6 +39,10 @@ type Config struct {
 	// empty, output is discarded. The file is opened with O_APPEND
 	// so multiple runs concatenate rather than overwrite.
 	LogPath string
+	// ListenPort is the TCP port the child will bind. When set, the
+	// supervisor kills any stale process holding the port before each
+	// spawn attempt to prevent EADDRINUSE restart loops.
+	ListenPort string
 	// MaxRestarts bounds the number of restarts allowed inside
 	// RestartWindow. Zero means the child is never restarted (one
 	// crash stops the supervisor).
@@ -122,6 +126,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return fmt.Errorf("supervisor: restart budget exhausted (%d restarts in %s)", s.cfg.MaxRestarts, s.cfg.RestartWindow)
 		}
 
+		if s.cfg.ListenPort != "" {
+			killPortOwner(s.cfg.ListenPort)
+		}
 		if err := s.spawnChild(); err != nil {
 			if s.cfg.OnChildExit != nil {
 				s.cfg.OnChildExit(err)

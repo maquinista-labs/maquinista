@@ -320,6 +320,7 @@ func superviseDashboard(ctx context.Context, listen string) error {
 		}, source.Env...),
 		WorkDir:        source.WorkDir,
 		LogPath:        logPath,
+		ListenPort:     port,
 		MaxRestarts:    5,
 		RestartWindow:  60 * time.Second,
 		RestartBackoff: 500 * time.Millisecond,
