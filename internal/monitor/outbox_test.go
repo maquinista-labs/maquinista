@@ -3,7 +3,6 @@ package monitor
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -113,44 +112,3 @@ func TestDBOutboxWriter_SkipsEmptyAndMissingAgent(t *testing.T) {
 	}
 }
 
-func TestMonitor_OutboxWriter_OnlyAssistantTextMirrored(t *testing.T) {
-	// Drive the monitor's enqueueEntry directly to confirm the gate:
-	// only role=assistant + contentType∈{text,thinking} triggers the writer.
-	var events []OutboxEvent
-	m := &Monitor{
-		OutboxWriter: func(e OutboxEvent) { events = append(events, e) },
-	}
-
-	cases := []struct {
-		name   string
-		entry  ParsedEntry
-		expect bool
-	}{
-		{"assistant text", ParsedEntry{Role: "assistant", ContentType: "text", Text: "hi"}, true},
-		{"assistant thinking", ParsedEntry{Role: "assistant", ContentType: "thinking", Text: "thinking"}, true},
-		{"user echo", ParsedEntry{Role: "user", ContentType: "text", Text: "hi"}, false},
-		{"tool_use", ParsedEntry{Role: "assistant", ContentType: "tool_use", Text: "bash x"}, false},
-		{"tool_result", ParsedEntry{Role: "assistant", ContentType: "tool_result", Text: "ok"}, false},
-	}
-
-	for _, tc := range cases {
-		events = events[:0]
-		// Inline the mirroring logic (enqueueEntry also pushes to queue which
-		// requires a real queue; we only exercise the writer gate here).
-		mirrored := false
-		text := renderText(tc.entry)
-		if m.OutboxWriter != nil && tc.entry.Role == "assistant" && (tc.entry.ContentType == "text" || tc.entry.ContentType == "thinking") {
-			m.OutboxWriter(OutboxEvent{
-				AgentID: "w", Role: tc.entry.Role, Text: text,
-			})
-			mirrored = len(events) == 1
-		}
-		if mirrored != tc.expect {
-			t.Errorf("%s: mirrored=%v, want %v", tc.name, mirrored, tc.expect)
-		}
-	}
-}
-
-func renderText(pe ParsedEntry) string { // minimal stand-in; the real render. package is already covered elsewhere.
-	return fmt.Sprintf("[%s] %s", pe.Role, pe.Text)
-}

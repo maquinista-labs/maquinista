@@ -38,7 +38,7 @@ func TestMonitorNew(t *testing.T) {
 	st := state.NewState()
 	ms := state.NewMonitorState()
 
-	m := New(cfg, st, ms, nil)
+	m := New(cfg, st, ms, nil, nil)
 	if m == nil {
 		t.Fatal("monitor should not be nil")
 	}

@@ -221,12 +221,6 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	openclaudeSrc := monitor.NewOpenClaudeSource(cfg, pool, b.State(), ms)
 	monitor.RegisterSource("openclaude", openclaudeSrc)
 
-	mon := monitor.New(cfg, b.State(), ms, q)
-	mon.AddSource(claudeSrc)
-	mon.AddSource(opencodeSrc)
-	mon.AddSource(openclaudeSrc)
-	mon.PlanHandler = b.HandlePlanFromMonitor
-
 	// Mirror every captured response into agent_outbox so the dashboard and
 	// relay can consume them. Previously guarded by MAILBOX_OUTBOUND; now
 	// unconditional when a DB pool is available — the outbox is the primary
@@ -239,13 +233,22 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		}
 	}
 	activeInboxMap := &mailbox.ActiveInboxMap{}
+
+	sink := monitor.NewMultiSink()
+	sink.Add(monitor.NewTelegramSink(q))
 	if pool != nil {
-		mon.OutboxWriter = monitor.NewDBOutboxWriter(pool, activeInboxMap)
-		mon.ToolEventWriter = monitor.NewDBToolEventNotifier(pool)
+		sink.Add(monitor.NewOutboxSink(pool, activeInboxMap))
+		sink.Add(monitor.NewToolEventSink(pool))
 		log.Println("mailbox.outbound: writing responses to agent_outbox")
 	} else {
 		log.Println("mailbox.outbound: no DB pool — outbox writes disabled")
 	}
+
+	mon := monitor.New(cfg, b.State(), ms, sink, pool)
+	mon.AddSource(claudeSrc)
+	mon.AddSource(opencodeSrc)
+	mon.AddSource(openclaudeSrc)
+	mon.PlanHandler = b.HandlePlanFromMonitor
 
 	sp := bot.NewStatusPoller(b, q, mon)
 

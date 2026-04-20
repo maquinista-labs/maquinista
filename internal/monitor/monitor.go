@@ -9,9 +9,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
-	"github.com/maquinista-labs/maquinista/internal/queue"
-	"github.com/maquinista-labs/maquinista/internal/render"
 	"github.com/maquinista-labs/maquinista/internal/state"
 )
 
@@ -21,35 +20,33 @@ import (
 type ObservationLookup func(windowID string) []ObservingTopic
 
 // OutboxEvent is one captured assistant response ready to be mirrored into
-// agent_outbox. Used by OutboxWriter; keeps the monitor package free of
-// direct DB access.
+// agent_outbox. Kept for outbox.go / outbox_test.go compatibility; removed in Phase 4.
 type OutboxEvent struct {
-	AgentID   string // equal to WindowID by convention
+	AgentID   string
 	UserID    int64
 	ThreadID  int
 	ChatID    int64
-	Role      string // 'assistant' | 'user' | 'thinking' | ...
-	Text      string // rendered payload (the same string handed to the queue)
-	InReplyTo string // optional: correlating inbox row id (currently unused — reserved for sidecar path)
+	Role      string
+	Text      string
+	InReplyTo string
 }
 
 // OutboxWriter mirrors every captured response into agent_outbox when set.
-// A nil writer disables the mailbox.outbound path.
+// Kept for outbox.go / outbox_test.go compatibility; removed in Phase 4.
 type OutboxWriter func(e OutboxEvent)
 
-// ToolEvent carries one tool_use or tool_result observation. The AgentID
-// field contains the raw tmux window id — implementations that need the
-// logical agent id must resolve it (e.g. via resolveAgentFromWindow).
+// ToolEvent carries one tool_use or tool_result observation.
+// Kept for tool_events.go / tool_events_test.go compatibility; removed in Phase 4.
 type ToolEvent struct {
-	AgentID   string // tmux window id (e.g. "@25") or logical agent id
-	Type      string // "tool_use" | "tool_result"
+	AgentID   string
+	Type      string
 	ToolName  string
 	ToolUseID string
 	IsError   bool
 }
 
 // ToolEventWriter is called once per tool_use/tool_result observation.
-// A nil writer disables live tool-call push to the dashboard.
+// Kept for tool_events.go compatibility; removed in Phase 4.
 type ToolEventWriter func(e ToolEvent)
 
 // ObservingTopic represents a topic that is observing an agent's output.
@@ -64,25 +61,25 @@ type Monitor struct {
 	config            *config.Config
 	state             *state.State
 	monitorState      *state.MonitorState
-	queue             *queue.Queue
+	sink              *MultiSink
+	pool              *pgxpool.Pool
 	sources           []TranscriptSource
 	pollInterval      time.Duration
 	turnStarts        sync.Map // windowID → time.Time
 	PlanHandler       func(userID int64, threadID int, chatID int64, planJSON string)
 	planBuffers       map[string]string // windowID → partial plan text
 	ObservationLookup ObservationLookup // optional: resolve window → observing topics
-	OutboxWriter      OutboxWriter      // optional: shadow-write captured responses to agent_outbox
-	ToolEventWriter   ToolEventWriter   // optional: push tool_use/tool_result events to dashboard
 	pollCount         int
 }
 
 // New creates a new Monitor.
-func New(cfg *config.Config, st *state.State, ms *state.MonitorState, q *queue.Queue) *Monitor {
+func New(cfg *config.Config, st *state.State, ms *state.MonitorState, sink *MultiSink, pool *pgxpool.Pool) *Monitor {
 	return &Monitor{
 		config:       cfg,
 		state:        st,
 		monitorState: ms,
-		queue:        q,
+		sink:         sink,
+		pool:         pool,
 		pollInterval: time.Duration(cfg.MonitorPollInterval * float64(time.Second)),
 		planBuffers:  make(map[string]string),
 	}
@@ -147,17 +144,24 @@ func (m *Monitor) poll() {
 				continue
 			}
 
-			// Route to directly bound users.
-			// Prefer the "active thread" — the single most recent (user, thread)
-			// to route a message to this window — when available. This avoids
-			// fanning out a reply to every topic that has ever bound to a shared
-			// agent window via the §8.1 tier-3 ladder (cross-topic leak).
+			// Resolve agentID once per window per poll cycle.
+			var agentID string
+			if m.pool != nil {
+				ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+				agentID, _ = resolveAgentFromWindow(ctx, m.pool, sess.WindowID)
+				cancel()
+			}
+
+			// Prefer active thread; fall back to all bound users.
 			var users []state.UserThread
 			if ut, ok := m.state.GetActiveThread(sess.WindowID); ok {
 				users = []state.UserThread{ut}
 			} else {
 				users = m.state.FindUsersForWindow(sess.WindowID)
 			}
+
+			// Pass 1: Telegram routing — one emit per (user/observer, entry).
+			// OutboxSink and ToolEventSink skip these (chatID != 0).
 			for _, ut := range users {
 				chatID, ok := m.state.GetGroupChatID(ut.UserID, ut.ThreadID)
 				if !ok {
@@ -167,80 +171,58 @@ func (m *Monitor) poll() {
 				userID, _ := strconv.ParseInt(ut.UserID, 10, 64)
 
 				for _, pe := range parsed {
-					m.enqueueEntry(userID, threadID, chatID, sess.WindowID, pe)
+					// Track turn start when we see a user entry
+					if pe.Role == "user" && pe.ContentType == "text" {
+						m.SetTurnStart(sess.WindowID)
+					}
+
+					// Plan detection (per-user; shared planBuffers means only fires once per window)
+					if pe.Role == "assistant" && pe.ContentType == "text" && m.PlanHandler != nil {
+						peText := pe.Text
+						if buf, ok := m.planBuffers[sess.WindowID]; ok {
+							peText = buf + peText
+							delete(m.planBuffers, sess.WindowID)
+						}
+						if planJSON, rest, found := extractPlanJSON(peText); found {
+							m.PlanHandler(userID, threadID, chatID, planJSON)
+							if rest == "" {
+								continue
+							}
+							pe.Text = rest
+						} else if strings.Contains(peText, "PLAN_JSON:") {
+							m.planBuffers[sess.WindowID] = peText
+							continue
+						}
+					}
+
+					if m.sink != nil {
+						m.sink.Emit(buildAgentEvent(sess.WindowID, agentID, userID, threadID, chatID, pe))
+					}
 				}
 			}
 
-			// Route to observing topics (agent observation model)
+			// Observation topics (also Telegram-bound)
 			if m.ObservationLookup != nil {
 				observers := m.ObservationLookup(sess.WindowID)
 				for _, obs := range observers {
 					for _, pe := range parsed {
-						m.enqueueEntry(obs.UserID, int(obs.TopicID), obs.ChatID, sess.WindowID, pe)
+						if m.sink != nil {
+							m.sink.Emit(buildAgentEvent(sess.WindowID, agentID, obs.UserID, int(obs.TopicID), obs.ChatID, pe))
+						}
 					}
 				}
 			}
 
-			// Write assistant responses to agent_outbox once per entry,
-			// regardless of Telegram user binding. Dashboard-spawned agents
-			// have no state binding (users == nil) so enqueueEntry is never
-			// called for them — this ensures their outbox rows are written.
-			if m.OutboxWriter != nil {
+			// Pass 2: DB-only — chatID=0. TelegramSink skips; OutboxSink and
+			// ToolEventSink fire once per entry per session regardless of binding.
+			if m.sink != nil {
 				for _, pe := range parsed {
-					if pe.Role != "assistant" {
-						continue
-					}
-					var text string
-					switch pe.ContentType {
-					case "text":
-						text = render.FormatText(pe.Text)
-					case "thinking":
-						text = render.FormatThinking(pe.Text)
-					}
-					if text == "" {
-						continue
-					}
-					m.OutboxWriter(OutboxEvent{
-						AgentID: sess.WindowID,
-						Role:    pe.Role,
-						Text:    text,
-					})
-				}
-			}
-
-			// Push tool_use / tool_result events to the dashboard live
-			// banner via pg_notify. Called once per entry regardless of
-			// Telegram binding so dashboard-only agents get coverage too.
-			if m.ToolEventWriter != nil {
-				for _, pe := range parsed {
-					if pe.ContentType != "tool_use" && pe.ContentType != "tool_result" {
-						continue
-					}
-					// When tool_use and tool_result arrive in the same poll batch,
-					// ParseEntries suppresses the tool_use entry to avoid duplicate
-					// Telegram messages. Re-emit it here so the dashboard live banner
-					// always receives tool_use before tool_result.
-					if pe.ContentType == "tool_result" && pe.ToolName != "" && pe.ToolName != "unknown" {
-						m.ToolEventWriter(ToolEvent{
-							AgentID:   sess.WindowID,
-							Type:      "tool_use",
-							ToolName:  pe.ToolName,
-							ToolUseID: pe.ToolUseID,
-						})
-					}
-					m.ToolEventWriter(ToolEvent{
-						AgentID:   sess.WindowID,
-						Type:      pe.ContentType,
-						ToolName:  pe.ToolName,
-						ToolUseID: pe.ToolUseID,
-						IsError:   pe.IsError,
-					})
+					m.sink.Emit(buildAgentEvent(sess.WindowID, agentID, 0, 0, 0, pe))
 				}
 			}
 		}
 	}
 
-	// Periodically save state
 	monitorStatePath := filepath.Join(m.config.MaquinistaDir, "monitor_state.json")
 	m.monitorState.SaveIfDirty(monitorStatePath)
 }
@@ -257,75 +239,6 @@ func (m *Monitor) GetAndClearTurnStart(windowID string) (time.Time, bool) {
 		return time.Time{}, false
 	}
 	return v.(time.Time), true
-}
-
-func (m *Monitor) enqueueEntry(userID int64, threadID int, chatID int64, windowID string, pe ParsedEntry) {
-	var text string
-	var contentType string
-
-	// Track turn start when we see a user entry
-	if pe.Role == "user" && pe.ContentType == "text" {
-		m.SetTurnStart(windowID)
-	}
-
-	// Detect PLAN_JSON: marker in assistant text
-	if pe.Role == "assistant" && pe.ContentType == "text" && m.PlanHandler != nil {
-		peText := pe.Text
-		// Prepend any buffered partial plan from previous entry
-		if buf, ok := m.planBuffers[windowID]; ok {
-			peText = buf + peText
-			delete(m.planBuffers, windowID)
-		}
-		if planJSON, rest, found := extractPlanJSON(peText); found {
-			m.PlanHandler(userID, threadID, chatID, planJSON)
-			if rest == "" {
-				return
-			}
-			pe.Text = rest
-		} else if strings.Contains(peText, "PLAN_JSON:") {
-			// Marker found but JSON incomplete — buffer for next entry
-			m.planBuffers[windowID] = peText
-			return
-		}
-	}
-
-	switch pe.ContentType {
-	case "text":
-		if pe.Role == "user" {
-			text = "\U0001F464 " + render.FormatText(pe.Text)
-		} else {
-			text = render.FormatText(pe.Text)
-		}
-		contentType = "content"
-	case "tool_use":
-		text = render.FormatToolUse(pe.ToolName, "")
-		if pe.Text != "" {
-			text = pe.Text // use the pre-formatted summary
-		}
-		contentType = "tool_use"
-	case "tool_result":
-		text = render.FormatToolResult(pe.ToolName, pe.ToolInput, pe.Text, pe.IsError)
-		contentType = "tool_result"
-	case "thinking":
-		text = render.FormatThinking(pe.Text)
-		contentType = "content"
-	default:
-		return
-	}
-
-	if text == "" {
-		return
-	}
-
-	m.queue.Enqueue(queue.MessageTask{
-		UserID:      userID,
-		ThreadID:    threadID,
-		ChatID:      chatID,
-		Parts:       []string{text},
-		ContentType: contentType,
-		ToolUseID:   pe.ToolUseID,
-		WindowID:    windowID,
-	})
 }
 
 // extractPlanJSON finds "PLAN_JSON:" marker followed by a JSON array,
