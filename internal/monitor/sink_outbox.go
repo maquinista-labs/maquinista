@@ -49,12 +49,13 @@ func (s *OutboxSink) Handle(e AgentEvent) {
 	}
 
 	// Buffer text per window — flush writes it as a single outbox row.
+	// Buffer by WindowID — must match the key used in FlushSession.
 	s.mu.Lock()
-	existing := s.buffers[e.AgentID]
+	existing := s.buffers[e.WindowID]
 	if existing == "" {
-		s.buffers[e.AgentID] = text
+		s.buffers[e.WindowID] = text
 	} else {
-		s.buffers[e.AgentID] = existing + "\n\n" + text
+		s.buffers[e.WindowID] = existing + "\n\n" + text
 	}
 	s.mu.Unlock()
 }
