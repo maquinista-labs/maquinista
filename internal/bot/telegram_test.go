@@ -96,3 +96,25 @@ func TestIsForumTopicClosed_NilMessage(t *testing.T) {
 		t.Error("nil message should return false")
 	}
 }
+
+func TestSlugifyTopicName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"inbox", "inbox"},
+		{"Inbox", "inbox"},
+		{"My Coder", "my-coder"},
+		{"🔥 fire agent", "fire-agent"},
+		{"  --spaces--  ", "spaces"},
+		{"t-800", "t-800"},   // t- prefix: SetHandle rejects it; slugify leaves as-is
+		{"a", ""},            // too short
+		{"", ""},
+		{"hello/world.bot", "hello-world-bot"},
+		{"-leading-dash", "leading-dash"},
+		{"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaXXX", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, // 32 chars
+	}
+	for _, c := range cases {
+		got := slugifyTopicName(c.in)
+		if got != c.want {
+			t.Errorf("slugifyTopicName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

@@ -131,6 +131,38 @@ func getTopicName(threadID int) string {
 	return topicNameCache[threadID]
 }
 
+// slugifyTopicName converts a Telegram topic name to a valid agent handle
+// (^[a-z0-9_-]{2,32}$). Returns "" if the result is too short to be valid.
+// Non-ASCII (emoji, accented chars) is dropped; spaces and separators become
+// dashes; consecutive dashes are collapsed.
+func slugifyTopicName(name string) string {
+	if name == "" {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '_':
+			b.WriteRune(r)
+		case r == ' ', r == '-', r == '/', r == '.':
+			b.WriteRune('-')
+		}
+		// emoji and other unicode are dropped
+	}
+	slug := b.String()
+	for strings.Contains(slug, "--") {
+		slug = strings.ReplaceAll(slug, "--", "-")
+	}
+	slug = strings.Trim(slug, "-")
+	if len(slug) > 32 {
+		slug = strings.TrimRight(slug[:32], "-")
+	}
+	if len(slug) < 2 {
+		return ""
+	}
+	return slug
+}
+
 // cleanupCache removes entries for old message IDs to prevent unbounded growth.
 // Note: topicNameCache is keyed by thread_id (not message_id) and is not cleaned
 // here since thread IDs are long-lived and the cache is small.

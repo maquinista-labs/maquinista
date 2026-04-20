@@ -70,6 +70,22 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 		return
 	}
 
+	// Tier-3 spawn: back-fill the Telegram topic name as the agent's handle.
+	// topicNameCache is populated from reply_to_message.forum_topic_created.name
+	// which Telegram includes on the first message the client sends into a
+	// fresh topic. Best-effort — a collision or short name just logs and skips.
+	if res.Tier == routing.TierSpawn {
+		if topicName := getTopicName(getThreadID(msg)); topicName != "" {
+			if slug := slugifyTopicName(topicName); slug != "" {
+				if herr := routing.SetHandle(ctx, pool, res.AgentID, slug); herr != nil {
+					log.Printf("topic handle set %s (%q→%q): %v", res.AgentID, topicName, slug, herr)
+				} else {
+					log.Printf("topic handle: %s → %q", res.AgentID, slug)
+				}
+			}
+		}
+	}
+
 	// Verify the resolved agent actually exists in agents before handing
 	// it to the inbox — prevents FK violations if a mention references a
 	// bogus id/handle.
