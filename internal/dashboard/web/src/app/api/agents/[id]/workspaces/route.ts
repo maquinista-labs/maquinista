@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 
 import { writeAudit } from "@/lib/audit";
 import { getPool } from "@/lib/db";
+import { requestRespawn } from "@/lib/actions";
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -78,18 +79,14 @@ export async function POST(
   if (!label || !LABEL_RE.test(label)) {
     return NextResponse.json({ error: "invalid_label" }, { status: 400 });
   }
-  const scope =
-    typeof body.scope === "string" ? body.scope : "shared";
-  if (!["shared", "agent", "task"].includes(scope)) {
-    return NextResponse.json({ error: "invalid_scope" }, { status: 400 });
-  }
+  // Workspace creation always uses agent scope — per-agent git isolation
+  // is the only meaningful choice from the dashboard. shared is the
+  // no-workspace default; task is only useful for automated /t_auto flows.
+  const scope = "agent";
   const repoRoot =
     typeof body.repo_root === "string" ? body.repo_root.trim() : "";
-  if ((scope === "agent" || scope === "task") && !repoRoot) {
-    return NextResponse.json(
-      { error: "repo_root_required", scope },
-      { status: 400 },
-    );
+  if (!repoRoot) {
+    return NextResponse.json({ error: "repo_root_required" }, { status: 400 });
   }
 
   const pool = getPool();
@@ -106,9 +103,8 @@ export async function POST(
   const wsId = `${id}@${label}`;
   // worktree_dir + branch must match ResolveLayout / migration-028
   // backfill SQL. Keep the three formulas in lockstep.
-  const worktreeDir =
-    scope === "shared" ? null : `${repoRoot}/.maquinista/worktrees/${scope}/${id}`;
-  const branch = scope === "shared" ? null : `maquinista/${scope}/${id}`;
+  const worktreeDir = `${repoRoot}/.maquinista/worktrees/${scope}/${id}`;
+  const branch = `maquinista/${scope}/${id}`;
 
   const client = await pool.connect();
   try {
@@ -146,6 +142,10 @@ export async function POST(
     ok: true,
     error: null,
   });
+
+  // Trigger immediate respawn so the reconciler picks up the new workspace
+  // and creates the git worktree on its next tick — no manual restart needed.
+  await requestRespawn(pool, id);
 
   return NextResponse.json(
     {

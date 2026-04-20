@@ -105,7 +105,7 @@ function WorkspaceRow({
         { method: "PATCH" },
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      toast.success(`Switched to ${ws.id}`);
+      toast.success(`Switched to ${ws.id} — agent respawning…`);
       onMutated();
     } catch (err) {
       toast.error(
@@ -124,7 +124,12 @@ function WorkspaceRow({
         { method: "DELETE" },
       );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      toast.success(`Archived ${ws.id}`);
+      const data = await res.json() as { was_active?: boolean };
+      if (data.was_active) {
+        toast.success(`Archived ${ws.id} — agent respawning without worktree`);
+      } else {
+        toast.success(`Archived ${ws.id}`);
+      }
       onMutated();
     } catch (err) {
       toast.error(
@@ -145,9 +150,6 @@ function WorkspaceRow({
         <div className="flex items-center gap-2 truncate font-mono text-sm">
           <span aria-hidden>{isActive ? "★" : "·"}</span>
           <span className="truncate">{ws.id}</span>
-          <span className="rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
-            {ws.scope}
-          </span>
         </div>
         <div className="truncate text-xs text-muted-foreground">
           {ws.repo_root || <em>(no repo)</em>}
@@ -168,7 +170,7 @@ function WorkspaceRow({
           data-testid="workspace-archive"
           size="sm"
           variant="ghost"
-          disabled={busy || isActive}
+          disabled={busy}
           onClick={archive}
         >
           Archive
@@ -186,12 +188,11 @@ function NewWorkspaceForm({
   onCreated: () => void;
 }) {
   const [label, setLabel] = useState("");
-  const [scope, setScope] = useState<"shared" | "agent" | "task">("agent");
   const [repoRoot, setRepoRoot] = useState("");
   const [busy, setBusy] = useState(false);
 
   const labelOk = /^[A-Za-z0-9._-]+$/.test(label);
-  const repoOk = scope === "shared" || repoRoot.trim().length > 0;
+  const repoOk = repoRoot.trim().length > 0;
   const canSubmit = !busy && labelOk && repoOk;
 
   async function submit() {
@@ -202,7 +203,7 @@ function NewWorkspaceForm({
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ label, scope, repo_root: repoRoot.trim() }),
+          body: JSON.stringify({ label, repo_root: repoRoot.trim() }),
         },
       );
       if (res.status === 409) {
@@ -216,6 +217,7 @@ function NewWorkspaceForm({
       toast.success(`Created + activated ${agentId}@${label}`);
       setLabel("");
       setRepoRoot("");
+      toast.info("Agent respawning in new worktree…");
       onCreated();
     } catch (err) {
       toast.error(
@@ -243,18 +245,6 @@ function NewWorkspaceForm({
         placeholder="label (e.g. project-b)"
         className="rounded-md border border-border bg-background px-2 py-1 text-sm"
       />
-      <select
-        data-testid="new-workspace-scope"
-        value={scope}
-        onChange={(e) =>
-          setScope(e.target.value as "shared" | "agent" | "task")
-        }
-        className="rounded-md border border-border bg-background px-2 py-1 text-sm"
-      >
-        <option value="shared">shared (no git isolation)</option>
-        <option value="agent">agent (per-agent worktree)</option>
-        <option value="task">task (per-task worktree)</option>
-      </select>
       <input
         data-testid="new-workspace-repo"
         value={repoRoot}
