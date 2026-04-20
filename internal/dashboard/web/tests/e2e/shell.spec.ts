@@ -1,12 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 /**
- * Phase 1 Commit 1.7 gate: the shell renders.
- *
- * Every subsequent phase adds feature-specific specs that inherit
- * the same global-setup harness. This one asserts only the chrome
- * (header + bottom nav + four placeholder routes + theme toggle)
- * so it's trivially stable.
+ * Shell smoke tests: header, bottom nav (3 tabs), routing, theme toggle.
  */
 
 test.describe("dashboard shell", () => {
@@ -22,15 +17,13 @@ test.describe("dashboard shell", () => {
     await expect(header).toContainText("maquinista");
   });
 
-  test("bottom nav has four tabs and active state", async ({ page }) => {
+  test("bottom nav has three tabs and active state", async ({ page }) => {
     await page.goto("/agents");
     const nav = page.getByTestId("bottom-nav");
     await expect(nav).toBeVisible();
 
-    // Each tab is present.
     await expect(page.getByTestId("nav-agents")).toBeVisible();
     await expect(page.getByTestId("nav-inbox")).toBeVisible();
-    await expect(page.getByTestId("nav-conversations")).toBeVisible();
     await expect(page.getByTestId("nav-jobs")).toBeVisible();
 
     // The agents tab is marked current.
@@ -57,13 +50,9 @@ test.describe("dashboard shell", () => {
   });
 
   test("every top-level route renders its heading", async ({ page }) => {
-    // /inbox + /conversations became live in G.1 / G.2 — all four
-    // nav destinations now render real headings, no placeholders
-    // remain.
     for (const [href, title] of [
       ["/agents", "Agents"],
       ["/inbox", "Inbox"],
-      ["/conversations", "Chats"],
       ["/jobs", "Jobs"],
     ] as const) {
       await page.goto(href);
