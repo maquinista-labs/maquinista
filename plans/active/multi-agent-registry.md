@@ -227,6 +227,19 @@ No new columns on `agent_settings`; it already has what Phase 2 needs.
    toggle. Resolved.
 5. **`agent_settings.roster`** — undocumented today. Does anyone know
    what it holds? Check before Phase 2 writes more settings.
+6. **Per-agent model threading into `LaunchCommand`** — deferred from
+   `dashboard-gaps.md` G.5. Migration 029 added `agents.model`; the
+   runner's `LaunchCommand(cfg)` needs a `cfg.Model` field so the
+   choice made in the spawn UI is actually passed to the process (e.g.
+   `claude --model=<model>` for Claude, env var for openclaude). Pick
+   this up when wiring the reconcile loop's spawn path in Phase 2.
+7. **Telegram forum-topic creation on dashboard spawn** — deferred from
+   `dashboard-gaps.md` G.5. `POST /api/agents` currently creates the DB
+   row but skips creating the Telegram forum topic (requires bot
+   cross-process exposure that doesn't exist yet). Once the bot and
+   dashboard share a coordination path (likely via Postgres notify or a
+   lightweight RPC), wire `bot.createForumTopic` into
+   `SpawnFromDashboard` so `@mention` routing works from minute one.
 
 ---
 
