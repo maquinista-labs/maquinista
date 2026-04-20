@@ -120,6 +120,7 @@ export function useAgentStatus(agentId: string): string {
     const handler = (e: Event) => {
       const detail = (e as CustomEvent<AgentStatusPayload>).detail;
       if (detail.agent_id !== agentId) return;
+      console.debug("[useAgentStatus] update", agentId, JSON.stringify(detail.text));
       setStatus(detail.text);
     };
 

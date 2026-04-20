@@ -74,16 +74,39 @@ func (sp *StatusPoller) Run(ctx context.Context) {
 	}
 }
 
-func (sp *StatusPoller) poll() {
-	// Get all bound window IDs
-	boundWindows := sp.bot.state.AllBoundWindowIDs()
-
-	for windowID := range boundWindows {
-		// Skip if queue is non-empty for all users of this window (avoid status noise during content delivery)
-		users := sp.bot.state.FindUsersForWindow(windowID)
-		if len(users) == 0 {
-			continue
+// allActiveWindows returns the union of Telegram-bound windows and all DB
+// agents with an active tmux_window (so dashboard-only agents are included).
+func (sp *StatusPoller) allActiveWindows() map[string]bool {
+	windows := sp.bot.state.AllBoundWindowIDs()
+	if sp.pool == nil {
+		return windows
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	rows, err := sp.pool.Query(ctx, `
+		SELECT tmux_window FROM agents
+		WHERE tmux_window <> '' AND status NOT IN ('archived','stopped')
+	`)
+	if err != nil {
+		log.Printf("status poller: allActiveWindows query error: %v", err)
+		return windows
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var w string
+		if err := rows.Scan(&w); err == nil && w != "" {
+			windows[w] = true
 		}
+	}
+	return windows
+}
+
+func (sp *StatusPoller) poll() {
+	windows := sp.allActiveWindows()
+	log.Printf("status poller: polling %d windows", len(windows))
+
+	for windowID := range windows {
+		users := sp.bot.state.FindUsersForWindow(windowID)
 
 		// Capture pane (plain text, no ANSI)
 		paneText, err := tmux.CapturePane(sp.bot.config.TmuxSessionName, windowID, false)
@@ -147,11 +170,14 @@ func (sp *StatusPoller) poll() {
 				sp.mu.Lock()
 				sp.missCount[windowID] = 0
 				sp.mu.Unlock()
+				log.Printf("status poller: window=%s hasStatus=true text=%q", windowID, statusText)
 			} else {
 				sp.mu.Lock()
 				sp.missCount[windowID]++
 				sp.mu.Unlock()
 			}
+		} else {
+			log.Printf("status poller: window=%s isInteractive=true — skipping status extract", windowID)
 		}
 
 		// Forward status to dashboard via pg_notify (deduped per window).
@@ -268,6 +294,7 @@ func (sp *StatusPoller) poll() {
 // status changes. effectiveText is "" when the status clears.
 func (sp *StatusPoller) notifyDashboardStatus(windowID, statusText string, hasStatus bool) {
 	if sp.pool == nil {
+		log.Printf("status poller: notifyDashboard window=%s skipped: no pool", windowID)
 		return
 	}
 
@@ -292,7 +319,12 @@ func (sp *StatusPoller) notifyDashboardStatus(windowID, statusText string, hasSt
 	defer cancel()
 
 	agentID, err := monitor.ResolveAgentFromWindow(ctx, sp.pool, windowID)
-	if err != nil || agentID == "" {
+	if err != nil {
+		log.Printf("status poller: notifyDashboard window=%s resolve error: %v", windowID, err)
+		return
+	}
+	if agentID == "" {
+		log.Printf("status poller: notifyDashboard window=%s no agent found", windowID)
 		return
 	}
 
@@ -305,6 +337,7 @@ func (sp *StatusPoller) notifyDashboardStatus(windowID, statusText string, hasSt
 		return
 	}
 
+	log.Printf("status poller: notified dashboard agent=%s text=%q", agentID, effective)
 	sp.mu.Lock()
 	sp.lastNotifiedStatus[windowID] = effective
 	sp.mu.Unlock()

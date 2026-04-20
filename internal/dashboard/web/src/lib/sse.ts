@@ -134,11 +134,12 @@ export function useDashStream() {
         try {
           const frame = JSON.parse(ev.data) as { payload: string };
           const detail = JSON.parse(frame.payload) as AgentStatusPayload;
+          console.debug("[sse] agent_status", detail);
           window.dispatchEvent(
             new CustomEvent("maq:agent_status", { detail }),
           );
-        } catch {
-          /* malformed payload — ignore */
+        } catch (err) {
+          console.warn("[sse] agent_status parse error", err, ev.data);
         }
       });
 
