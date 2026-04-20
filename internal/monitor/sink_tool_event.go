@@ -40,9 +40,12 @@ func (s *ToolEventSink) Handle(e AgentEvent) {
 
 	switch e.Kind {
 	case AgentEventToolPaired:
-		// Re-emit suppressed tool_use before tool_result so dashboard sees both.
-		s.notify(ctx, agentID, "tool_use", e.ToolName, e.ToolUseID, e.ToolInput, "", false)
-		s.notify(ctx, agentID, "tool_result", e.ToolName, e.ToolUseID, "", e.Text, e.IsError)
+		// Both tool_use + tool_result seen in the same poll cycle (already completed).
+		// Only emit tool_result (with tool_input included) so the frontend can either
+		// match a prior running entry from a cross-cycle tool_use, or create a new
+		// done entry directly. Emitting tool_use here would create a duplicate when
+		// a live tool_use was already emitted in the previous cycle.
+		s.notify(ctx, agentID, "tool_result", e.ToolName, e.ToolUseID, e.ToolInput, e.Text, e.IsError)
 	case AgentEventToolUse:
 		s.notify(ctx, agentID, "tool_use", e.ToolName, e.ToolUseID, e.ToolInput, "", false)
 	case AgentEventToolResult:

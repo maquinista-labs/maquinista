@@ -27,6 +27,7 @@ const CHANNELS = [
   "channel_delivery_new",
   "agent_stop",
   "tool_event",
+  "agent_status",
 ] as const;
 
 export async function GET(req: Request) {
@@ -92,6 +93,7 @@ export async function GET(req: Request) {
       );
 
       client.on("notification", (msg) => {
+        console.log(`[sse] notify channel=${msg.channel} payload=${msg.payload?.slice(0, 80)}`);
         push(msg.channel, { payload: msg.payload });
       });
       client.on("error", (err) => {

@@ -26,21 +26,61 @@ func NewOutboxSink(pool *pgxpool.Pool, amap *mailbox.ActiveInboxMap) *OutboxSink
 
 func (s *OutboxSink) Name() string { return "outbox" }
 
+func formatToolUseForOutbox(toolName, toolInput string) string {
+	if toolInput == "" {
+		return "🖥 **" + toolName + "**"
+	}
+	// Trim long inputs to keep rows readable.
+	preview := toolInput
+	if len(preview) > 200 {
+		preview = preview[:200] + "…"
+	}
+	return "🖥 **" + toolName + "**\n```\n" + preview + "\n```"
+}
+
+func formatToolResultForOutbox(toolName, text string, isError bool) string {
+	prefix := "✓"
+	if isError {
+		prefix = "✗"
+	}
+	preview := text
+	if len(preview) > 400 {
+		preview = preview[:400] + "…"
+	}
+	if preview == "" {
+		return prefix + " " + toolName
+	}
+	return prefix + " **" + toolName + "**\n```\n" + preview + "\n```"
+}
+
 func (s *OutboxSink) Handle(e AgentEvent) {
 	// Only fire on the DB-only pass (chatID=0).
 	if e.ChatID != 0 {
 		return
 	}
-	if s.pool == nil || e.AgentID == "" || e.Role != "assistant" {
+	if s.pool == nil || e.AgentID == "" {
 		return
 	}
 
 	var text string
 	switch e.Kind {
 	case AgentEventText:
+		if e.Role != "assistant" {
+			return
+		}
 		text = render.FormatText(e.Text)
 	case AgentEventThinking:
+		if e.Role != "assistant" {
+			return
+		}
 		text = render.FormatThinking(e.Text)
+	case AgentEventToolPaired:
+		// Only write when both tool_use and tool_result are available (paired).
+		// Standalone AgentEventToolUse is skipped to avoid a duplicate: when the
+		// paired event arrives in the next cycle, it would write the same tool call
+		// again, producing two outbox bubbles for a single tool invocation.
+		text = formatToolUseForOutbox(e.ToolName, e.ToolInput) +
+			"\n\n" + formatToolResultForOutbox(e.ToolName, e.Text, e.IsError)
 	default:
 		return
 	}
@@ -58,6 +98,7 @@ func (s *OutboxSink) Handle(e AgentEvent) {
 		s.buffers[e.WindowID] = existing + "\n\n" + text
 	}
 	s.mu.Unlock()
+	log.Printf("outbox sink: buffered kind=%s window=%s agent=%s len=%d", e.Kind, e.WindowID, e.AgentID, len(text))
 }
 
 // FlushSession writes all buffered text for the given window as a single
@@ -81,8 +122,10 @@ func (s *OutboxSink) FlushSession(windowID string) {
 		return
 	}
 	if agentID == "" {
+		log.Printf("outbox sink: flush window=%s no agent found — skipping", windowID)
 		return
 	}
+	log.Printf("outbox sink: flush window=%s agent=%s text_len=%d", windowID, agentID, len(text))
 
 	content, err := json.Marshal(struct {
 		Type string `json:"type"`
@@ -120,5 +163,7 @@ func (s *OutboxSink) FlushSession(windowID string) {
 	}
 	if err := tx.Commit(ctx); err != nil {
 		log.Printf("outbox sink: commit: %v", err)
+		return
 	}
+	log.Printf("outbox sink: wrote row agent=%s text_len=%d", agentID, len(text))
 }

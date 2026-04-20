@@ -7,7 +7,7 @@ import remarkGfm from "remark-gfm";
 import { AnimatePresence, motion } from "framer-motion";
 
 import { cn } from "@/lib/utils";
-import { useAgentLive } from "@/lib/use-agent-live";
+import { useAgentLive, useAgentStatus, formatElapsed } from "@/lib/use-agent-live";
 import type { ConversationItem } from "@/lib/types";
 
 const TOOL_EMOJI: Record<string, string> = {
@@ -133,6 +133,8 @@ export function ConversationView(props: Props) {
 
   // Live tool events from SSE — appended inline below historical items.
   const liveEvents = useAgentLive(liveAgentId ?? "");
+  // Terminal spinner status — shown as a "thinking" indicator between tool calls.
+  const agentStatus = useAgentStatus(liveAgentId ?? "");
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -230,41 +232,85 @@ export function ConversationView(props: Props) {
         })}
       </AnimatePresence>
 
-      {/* Live tool events — rendered as regular bubbles, never removed */}
+      {/* Live tool calls — merged tool_use + tool_result, one bubble each */}
       <AnimatePresence>
-        {liveEvents.map((ev) => {
-          const label =
-            ev.kind === "tool_use"
-              ? `${toolEmoji(ev.toolName)} ${ev.toolName}${ev.toolInput ? `(${ev.toolInput})` : "()"}`
-              : `${ev.isError ? "✗" : "✓"} ${ev.toolName}${ev.text ? `: ${ev.text}` : ""}`;
-          return (
-            <motion.div
-              key={ev.id}
-              data-testid={`conv-tool-${ev.id}`}
-              className="flex w-full justify-start"
-              initial={{ opacity: 0, y: 10, scale: 0.97 }}
-              animate={{ opacity: 1, y: 0, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95, y: -4 }}
-              transition={{ type: "spring", stiffness: 380, damping: 30 }}
+        {liveEvents.map((call) => (
+          <motion.div
+            key={call.id}
+            data-testid={`conv-tool-${call.id}`}
+            className="flex w-full justify-start"
+            initial={{ opacity: 0, y: 10, scale: 0.97 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, scale: 0.95, y: -4 }}
+            transition={{ type: "spring", stiffness: 380, damping: 30 }}
+          >
+            <div
+              className={cn(
+                "flex items-center gap-2 rounded-2xl px-3 py-2 text-sm font-mono",
+                call.status === "error"
+                  ? "bg-destructive/10 text-foreground border border-destructive/30"
+                  : call.status === "done"
+                    ? "bg-muted/30 text-muted-foreground border border-border/40"
+                    : "bg-muted/50 text-foreground border border-border/60",
+              )}
             >
-              <div
-                className={cn(
-                  "max-w-[80%] rounded-2xl px-3 py-2 text-sm font-mono",
-                  ev.kind === "tool_use"
-                    ? "bg-muted/50 text-foreground border border-border/60"
-                    : ev.isError
-                      ? "bg-destructive/10 text-foreground border border-destructive/30"
-                      : "bg-muted/30 text-muted-foreground border border-border/40",
-                )}
+              <span className="text-base leading-none shrink-0">{toolEmoji(call.toolName)}</span>
+              <span className="font-medium text-foreground">{call.toolName}</span>
+              {call.toolInput && (
+                <span className="opacity-50 truncate max-w-[160px]">({call.toolInput})</span>
+              )}
+              <span className="shrink-0 ml-1 tabular-nums text-[11px] opacity-60">
+                {call.elapsedMs !== undefined ? formatElapsed(call.elapsedMs) : ""}
+              </span>
+              <motion.span
+                className="shrink-0"
+                initial={false}
+                animate={call.status !== "running" ? { scale: 1, opacity: 1 } : { scale: 0, opacity: 0 }}
+                transition={{ type: "spring", stiffness: 500, damping: 20 }}
               >
-                {label}
-                <time className="mt-1 block text-[10px] text-muted-foreground text-left">
-                  {ev.at.toLocaleTimeString()}
-                </time>
-              </div>
-            </motion.div>
-          );
-        })}
+                {call.status === "done" && (
+                  <span className="text-green-600 dark:text-green-400">✓</span>
+                )}
+                {call.status === "error" && (
+                  <span className="text-destructive">✗</span>
+                )}
+              </motion.span>
+              {call.status === "running" && (
+                <motion.span
+                  className="shrink-0 text-muted-foreground"
+                  animate={{ opacity: [1, 0.3, 1] }}
+                  transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+                >
+                  ···
+                </motion.span>
+              )}
+            </div>
+          </motion.div>
+        ))}
+      </AnimatePresence>
+
+      {/* Terminal spinner status — visible while agent is thinking between tool calls */}
+      <AnimatePresence>
+        {agentStatus && (
+          <motion.div
+            key="agent-status"
+            className="flex w-full justify-start"
+            initial={{ opacity: 0, y: 8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            transition={{ type: "spring", stiffness: 380, damping: 30 }}
+          >
+            <div className="flex items-center gap-2 rounded-2xl px-3 py-2 text-sm font-mono bg-muted/50 text-muted-foreground border border-border/60">
+              <motion.span
+                animate={{ opacity: [1, 0.3, 1] }}
+                transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
+              >
+                ✻
+              </motion.span>
+              <span>{agentStatus}</span>
+            </div>
+          </motion.div>
+        )}
       </AnimatePresence>
 
       <div ref={bottomRef} />

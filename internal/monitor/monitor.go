@@ -115,6 +115,8 @@ func (m *Monitor) poll() {
 				continue
 			}
 
+			log.Printf("monitor: window=%s source=%s new_entries=%d", sess.WindowID, src.Name(), len(parsed))
+
 			// Resolve agentID once per window per poll cycle.
 			var agentID string
 			if m.pool != nil {
@@ -122,6 +124,7 @@ func (m *Monitor) poll() {
 				agentID, _ = resolveAgentFromWindow(ctx, m.pool, sess.WindowID)
 				cancel()
 			}
+			log.Printf("monitor: window=%s resolved_agent=%q", sess.WindowID, agentID)
 
 			// Capture turn costs and strip usage entries before routing.
 			parsed = m.captureAndStripUsage(parsed, agentID, sess.WindowID)
@@ -190,6 +193,7 @@ func (m *Monitor) poll() {
 			// Pass 2: DB-only — chatID=0. TelegramSink skips; OutboxSink and
 			// ToolEventSink fire once per entry per session regardless of binding.
 			if m.sink != nil {
+				log.Printf("monitor: pass2 window=%s entries=%d", sess.WindowID, len(parsed))
 				for _, pe := range parsed {
 					m.sink.Emit(buildAgentEvent(sess.WindowID, agentID, 0, 0, 0, pe))
 				}
@@ -230,9 +234,13 @@ func (m *Monitor) captureAndStripUsage(entries []ParsedEntry, agentID, windowID 
 			continue
 		}
 		u := pe.Usage
+		model := u.Model
+		if model == "<synthetic>" {
+			model = "orchestration"
+		}
 		tc := TurnCost{
 			AgentID:      agentID,
-			Model:        u.Model,
+			Model:        model,
 			InputTokens:  u.InputTokens,
 			OutputTokens: u.OutputTokens,
 			CacheRead:    u.CacheRead,

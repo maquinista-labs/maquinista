@@ -2,12 +2,14 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
 	"github.com/maquinista-labs/maquinista/internal/queue"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
@@ -24,14 +26,16 @@ var animFrames = []string{"☕", "⏳", "✨", "🔮"}
 
 // StatusPoller polls Claude's terminal for status line changes and sends updates.
 type StatusPoller struct {
-	bot          *Bot
-	queue        *queue.Queue
-	monitor      *monitor.Monitor
-	mu           sync.RWMutex
-	lastStatus   map[statusKey]string // last status text per user+thread
-	missCount    map[string]int       // windowID → consecutive miss count
-	animFrame    map[statusKey]int    // animation frame per user+thread
-	pollInterval time.Duration
+	bot                 *Bot
+	queue               *queue.Queue
+	monitor             *monitor.Monitor
+	pool                *pgxpool.Pool
+	mu                  sync.RWMutex
+	lastStatus          map[statusKey]string // last status text per user+thread
+	lastNotifiedStatus  map[string]string    // windowID → last pg_notify'd status
+	missCount           map[string]int       // windowID → consecutive miss count
+	animFrame           map[statusKey]int    // animation frame per user+thread
+	pollInterval        time.Duration
 }
 
 // missThreshold is how many consecutive polls must miss the status
@@ -39,15 +43,17 @@ type StatusPoller struct {
 const missThreshold = 3
 
 // NewStatusPoller creates a new StatusPoller.
-func NewStatusPoller(bot *Bot, q *queue.Queue, mon *monitor.Monitor) *StatusPoller {
+func NewStatusPoller(bot *Bot, q *queue.Queue, mon *monitor.Monitor, pool *pgxpool.Pool) *StatusPoller {
 	return &StatusPoller{
-		bot:          bot,
-		queue:        q,
-		monitor:      mon,
-		lastStatus:   make(map[statusKey]string),
-		missCount:    make(map[string]int),
-		animFrame:    make(map[statusKey]int),
-		pollInterval: 1 * time.Second,
+		bot:                bot,
+		queue:              q,
+		monitor:            mon,
+		pool:               pool,
+		lastStatus:         make(map[statusKey]string),
+		lastNotifiedStatus: make(map[string]string),
+		missCount:          make(map[string]int),
+		animFrame:          make(map[statusKey]int),
+		pollInterval:       1 * time.Second,
 	}
 }
 
@@ -147,6 +153,9 @@ func (sp *StatusPoller) poll() {
 				sp.mu.Unlock()
 			}
 		}
+
+		// Forward status to dashboard via pg_notify (deduped per window).
+		sp.notifyDashboardStatus(windowID, statusText, hasStatus)
 
 		// Update for each observing user
 		for _, ut := range users {
@@ -253,6 +262,52 @@ func (sp *StatusPoller) poll() {
 			}
 		}
 	}
+}
+
+// notifyDashboardStatus pg_notifies the agent_status channel when the window's
+// status changes. effectiveText is "" when the status clears.
+func (sp *StatusPoller) notifyDashboardStatus(windowID, statusText string, hasStatus bool) {
+	if sp.pool == nil {
+		return
+	}
+
+	sp.mu.RLock()
+	misses := sp.missCount[windowID]
+	last := sp.lastNotifiedStatus[windowID]
+	sp.mu.RUnlock()
+
+	var effective string
+	if hasStatus {
+		effective = statusText
+	} else if misses < missThreshold {
+		return // not yet confident the status is gone — don't notify
+	}
+	// effective == "" means status cleared
+
+	if effective == last {
+		return // no change
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	agentID, err := monitor.ResolveAgentFromWindow(ctx, sp.pool, windowID)
+	if err != nil || agentID == "" {
+		return
+	}
+
+	payload, _ := json.Marshal(map[string]string{
+		"agent_id": agentID,
+		"text":     effective,
+	})
+	if _, err := sp.pool.Exec(ctx, "SELECT pg_notify($1, $2)", "agent_status", string(payload)); err != nil {
+		log.Printf("status poller: pg_notify agent_status: %v", err)
+		return
+	}
+
+	sp.mu.Lock()
+	sp.lastNotifiedStatus[windowID] = effective
+	sp.mu.Unlock()
 }
 
 // formatDuration formats a duration as "Brewed for Xm Ys" or "Brewed for Ys".

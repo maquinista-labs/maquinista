@@ -1,9 +1,8 @@
 "use client";
 
 import { AnimatePresence, motion } from "framer-motion";
-import { useAgentLive } from "@/lib/use-agent-live";
+import { useAgentLive, formatElapsed } from "@/lib/use-agent-live";
 
-// Emoji assigned to common tool names.
 const TOOL_EMOJI: Record<string, string> = {
   bash: "🖥",
   computer: "🖥",
@@ -21,14 +20,12 @@ function toolEmoji(name: string): string {
   return TOOL_EMOJI[name.toLowerCase()] ?? "🔮";
 }
 
-// LiveToolCallBanner renders recent tool events above the conversation pane.
-// Events accumulate until page reload (no TTL).
 export function LiveToolCallBanner({ agentId }: { agentId: string }) {
-  const events = useAgentLive(agentId);
+  const calls = useAgentLive(agentId);
 
   return (
     <AnimatePresence initial={false}>
-      {events.length > 0 && (
+      {calls.length > 0 && (
         <motion.div
           data-testid="live-tool-banner"
           className="flex flex-col gap-1 rounded-lg border border-border bg-muted/50 px-3 py-2 text-xs font-mono text-muted-foreground overflow-hidden"
@@ -38,28 +35,45 @@ export function LiveToolCallBanner({ agentId }: { agentId: string }) {
           transition={{ type: "spring", stiffness: 400, damping: 32 }}
         >
           <AnimatePresence initial={false}>
-            {events.map((ev, i) => (
+            {calls.map((call, i) => (
               <motion.div
-                key={ev.id}
+                key={call.id}
                 className="flex items-center gap-2"
                 initial={{ opacity: 0, x: -8 }}
                 animate={{ opacity: 1, x: 0 }}
                 exit={{ opacity: 0, x: 8 }}
                 transition={{ type: "spring", stiffness: 400, damping: 32, delay: i * 0.03 }}
               >
-                <span>{toolEmoji(ev.toolName)}</span>
-                <span className="font-medium text-foreground">{ev.toolName}</span>
-                {ev.kind === "tool_use" && ev.toolInput && (
-                  <span className="opacity-60 truncate max-w-[200px]">{ev.toolInput}</span>
+                <span>{toolEmoji(call.toolName)}</span>
+                <span className="font-medium text-foreground">{call.toolName}</span>
+                {call.toolInput && (
+                  <span className="opacity-50 truncate max-w-[160px]">({call.toolInput})</span>
                 )}
-                {ev.kind === "tool_result" && (
+                {call.elapsedMs !== undefined && (
+                  <span className="tabular-nums opacity-60">{formatElapsed(call.elapsedMs)}</span>
+                )}
+
+                {/* status indicator */}
+                <motion.span
+                  initial={false}
+                  animate={call.status !== "running" ? { scale: 1, opacity: 1 } : { scale: 0, opacity: 0 }}
+                  transition={{ type: "spring", stiffness: 500, damping: 20 }}
+                >
+                  {call.status === "done" && (
+                    <span className="text-green-600 dark:text-green-400">✓</span>
+                  )}
+                  {call.status === "error" && (
+                    <span className="text-destructive">✗</span>
+                  )}
+                </motion.span>
+
+                {call.status === "running" && (
                   <motion.span
-                    className={ev.isError ? "text-destructive" : "text-green-600 dark:text-green-400"}
-                    initial={{ scale: 0.5, opacity: 0 }}
-                    animate={{ scale: 1, opacity: 1 }}
-                    transition={{ type: "spring", stiffness: 500, damping: 20 }}
+                    className="text-muted-foreground"
+                    animate={{ opacity: [1, 0.3, 1] }}
+                    transition={{ duration: 1.2, repeat: Infinity, ease: "easeInOut" }}
                   >
-                    {ev.isError ? "✗" : "✓"}
+                    ···
                   </motion.span>
                 )}
               </motion.div>

@@ -14,8 +14,16 @@ type SSEEvent = {
     | "channel_delivery_new"
     | "agent_stop"
     | "tool_event"
+    | "agent_status"
     | "error";
   data: unknown;
+};
+
+// AgentStatusPayload is the parsed JSON from an "agent_status" pg_notify payload.
+// text is the current spinner status (e.g. "Running Bash(...)"); empty string means idle.
+export type AgentStatusPayload = {
+  agent_id: string;
+  text: string;
 };
 
 // ToolEventPayload is the parsed JSON from a "tool_event" pg_notify payload.
@@ -24,7 +32,7 @@ export type ToolEventPayload = {
   type: "tool_use" | "tool_result";
   tool_name: string;
   tool_use_id: string;
-  tool_input?: string;  // present on tool_use
+  tool_input?: string;  // present on tool_use; also on tool_result for paired events
   text?: string;        // present on tool_result (truncated result content)
   is_error: boolean;
 };
@@ -115,6 +123,20 @@ export function useDashStream() {
             new CustomEvent("maq:tool_event", { detail }),
           );
           queryClient.invalidateQueries({ queryKey: ["conversation"] });
+        } catch {
+          /* malformed payload — ignore */
+        }
+      });
+
+      // agent_status: re-dispatch as a DOM CustomEvent so per-agent components
+      // can subscribe. No cache invalidation needed — this is ephemeral display only.
+      source.addEventListener("agent_status", (ev: MessageEvent) => {
+        try {
+          const frame = JSON.parse(ev.data) as { payload: string };
+          const detail = JSON.parse(frame.payload) as AgentStatusPayload;
+          window.dispatchEvent(
+            new CustomEvent("maq:agent_status", { detail }),
+          );
         } catch {
           /* malformed payload — ignore */
         }

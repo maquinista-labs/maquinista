@@ -66,9 +66,58 @@ port forwarding. The tunnel has a configurable TTL (default 15 min).
 
 ## Real-time updates
 
-Currently polling-based (dashboard UI polls `/api/agents/:id/outbox`
-on an interval). SSE infrastructure (`internal/dashboard/web/src/lib/sse.ts`)
-exists for push-based updates.
+The dashboard uses SSE (`/api/stream`) backed by Postgres `LISTEN/NOTIFY`.
+A single `EventSource` per browser tab listens to several pg channels and
+re-dispatches them as DOM `CustomEvent`s so multiple React components can
+subscribe without opening extra connections.
+
+### Two distinct real-time patterns
+
+#### 1. Persistent (outbox-backed)
+
+Used for content that has value after the fact and must survive a page
+reload or reconnect.
+
+**Flow:**
+
+```
+Go sink writes row → agent_outbox (DB)
+    → pg_notify("agent_outbox_new")
+    → SSE → React Query invalidate
+    → frontend re-fetches from DB
+```
+
+Data is durable in `agent_outbox`. The pg_notify is just a wake-up call;
+the real payload is always fetched from the DB. Examples:
+
+- Agent text responses
+- Thinking blocks
+- Completed tool call summaries (tool_use + tool_result paired)
+
+#### 2. Ephemeral (direct pg_notify only)
+
+Used for transient state that has no value once it's gone. **Nothing is
+written to any DB table.**
+
+**Flow:**
+
+```
+Go emitter calls pg_notify directly
+    → SSE → DOM CustomEvent → React state
+    → gone on disconnect / page reload
+```
+
+No DB read on the receive side. Examples:
+
+- `tool_event` — live tool call progress (`tool_use` / `tool_result`)
+  while a tool is actively running. After the session the paired summary
+  is in `agent_outbox` via the persistent pattern.
+- `agent_status` — terminal spinner text polled every second from the
+  tmux pane (e.g. "Running Bash(git status)"). Shown as a pulsing
+  "thinking" indicator; meaningless once the agent is idle.
+
+**Rule of thumb:** if a user reloading the page should still see it, use
+the outbox pattern. If it only matters right now, use direct pg_notify.
 
 ## Authentication
 
@@ -78,7 +127,7 @@ exists for push-based updates.
 
 ## TODO
 
-- [ ] SSE / push updates instead of polling
+- [x] SSE / push updates instead of polling
 - [ ] Telegram auth implementation (plans/active/dashboard-telegram-auth.md)
 - [ ] Cost tracking panel (plans/active/dashboard-cost-sse.md)
 - [ ] Rewind / action replay (plans/active/dashboard-rewind-actions.md)

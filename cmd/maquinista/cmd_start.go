@@ -250,7 +250,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	mon.AddSource(openclaudeSrc)
 	mon.PlanHandler = b.HandlePlanFromMonitor
 
-	sp := bot.NewStatusPoller(b, q, mon)
+	sp := bot.NewStatusPoller(b, q, mon, pool)
 
 	go mon.Run(ctx)
 	go sp.Run(ctx)
