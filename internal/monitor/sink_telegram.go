@@ -15,6 +15,9 @@ func (t *TelegramSink) Handle(e AgentEvent) {
 	if e.ChatID == 0 || t.queue == nil {
 		return
 	}
+	if e.IsStale {
+		return
+	}
 
 	task := queue.MessageTask{
 		UserID:   e.UserID,

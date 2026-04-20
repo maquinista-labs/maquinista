@@ -22,6 +22,9 @@ func (s *ToolEventSink) Handle(e AgentEvent) {
 	if s.pool == nil || e.AgentID == "" || e.ToolUseID == "" {
 		return
 	}
+	if e.IsStale {
+		return
+	}
 
 	ctx := context.Background()
 

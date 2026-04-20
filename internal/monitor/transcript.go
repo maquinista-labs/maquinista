@@ -20,10 +20,11 @@ type UsageData struct {
 
 // Entry represents a parsed JSONL transcript entry.
 type Entry struct {
-	Type    string         // "user", "assistant", "summary"
-	Blocks  []ContentBlock // parsed content blocks
-	RawData json.RawMessage
-	Usage   *UsageData     // non-nil for assistant entries that carry usage
+	Type      string         // "user", "assistant", "summary"
+	Blocks    []ContentBlock // parsed content blocks
+	RawData   json.RawMessage
+	Usage     *UsageData     // non-nil for assistant entries that carry usage
+	Timestamp time.Time      // from the JSONL "timestamp" field; zero if absent
 }
 
 // ContentBlock represents a single content block within an entry.
@@ -120,12 +121,24 @@ func parseMessageEntry(entryType string, raw map[string]json.RawMessage) (*Entry
 		}
 	}
 
+	// Parse entry-level timestamp for staleness detection in the monitor.
+	var entryTS time.Time
+	if tsBytes, ok := raw["timestamp"]; ok {
+		var tsStr string
+		if err := json.Unmarshal(tsBytes, &tsStr); err == nil {
+			if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
+				entryTS = t
+			}
+		}
+	}
+
 	rawData, _ := json.Marshal(raw)
 	return &Entry{
-		Type:    entryType,
-		Blocks:  blocks,
-		RawData: rawData,
-		Usage:   usage,
+		Type:      entryType,
+		Blocks:    blocks,
+		RawData:   rawData,
+		Usage:     usage,
+		Timestamp: entryTS,
 	}, nil
 }
 
@@ -308,6 +321,7 @@ func ParseEntries(entries []*Entry, pending map[string]PendingTool) []ParsedEntr
 						Role:        entry.Type,
 						ContentType: "text",
 						Text:        text,
+						Timestamp:   entry.Timestamp,
 					})
 				}
 
@@ -326,6 +340,7 @@ func ParseEntries(entries []*Entry, pending map[string]PendingTool) []ParsedEntr
 					Text:        summary,
 					ToolUseID:   block.ToolUseID,
 					ToolName:    block.ToolName,
+					Timestamp:   entry.Timestamp,
 				})
 				batchToolUseIdx[block.ToolUseID] = idx
 
@@ -334,6 +349,7 @@ func ParseEntries(entries []*Entry, pending map[string]PendingTool) []ParsedEntr
 					Role:        "user",
 					ContentType: "tool_result",
 					ToolUseID:   block.ToolUseID,
+					Timestamp:   entry.Timestamp,
 				}
 
 				if pt, ok := pending[block.ToolUseID]; ok {
@@ -363,6 +379,7 @@ func ParseEntries(entries []*Entry, pending map[string]PendingTool) []ParsedEntr
 						Role:        "assistant",
 						ContentType: "thinking",
 						Text:        block.Text,
+						Timestamp:   entry.Timestamp,
 					})
 				}
 			}
@@ -391,6 +408,7 @@ type ParsedEntry struct {
 	ToolInput   string     // tool input summary (for tool_result combined display)
 	IsError     bool
 	Usage       *UsageData // set when ContentType == "usage"
+	Timestamp   time.Time  // from the JSONL entry; zero if unavailable
 }
 
 // FormatToolUseSummary formats a tool_use into a summary line.

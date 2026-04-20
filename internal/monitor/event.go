@@ -1,5 +1,13 @@
 package monitor
 
+import "time"
+
+// staleThreshold is how old a JSONL entry can be (relative to when the monitor
+// reads it) before it is considered stale. Stale events skip Telegram and
+// dashboard tool_event routing to prevent flooding when the monitor catches up
+// on a large backlog, while still being written to the outbox DB.
+const staleThreshold = 15 * time.Second
+
 type AgentEventKind string
 
 const (
@@ -23,9 +31,14 @@ type AgentEvent struct {
 	ToolUseID string
 	ToolInput string
 	IsError   bool
+	// IsStale is true when the JSONL entry is older than the staleness threshold,
+	// meaning the monitor is catching up on backlog. Telegram and tool_event sinks
+	// skip stale events to prevent flooding; OutboxSink always writes regardless.
+	IsStale bool
 }
 
 func buildAgentEvent(windowID, agentID string, userID int64, threadID int, chatID int64, pe ParsedEntry) AgentEvent {
+	isStale := !pe.Timestamp.IsZero() && time.Since(pe.Timestamp) > staleThreshold
 	e := AgentEvent{
 		WindowID:  windowID,
 		AgentID:   agentID,
@@ -38,6 +51,7 @@ func buildAgentEvent(windowID, agentID string, userID int64, threadID int, chatI
 		ToolUseID: pe.ToolUseID,
 		ToolInput: pe.ToolInput,
 		IsError:   pe.IsError,
+		IsStale:   isStale,
 	}
 	switch pe.ContentType {
 	case "text":
