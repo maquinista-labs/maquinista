@@ -98,6 +98,10 @@ func (b *Bot) provisionMissingTopics(ctx context.Context, pool *pgxpool.Pool) er
 			log.Printf("topic provisioner: bind agent %s → topic %d: %v", a.id, threadID, err)
 			continue
 		}
+		// Populate user_thread_chats so the monitor's GetGroupChatID lookup
+		// succeeds immediately — without this the monitor skips Telegram
+		// delivery until the user sends a message from Telegram first.
+		b.State().SetGroupChatID(userID, threadIDStr, chatID)
 		log.Printf("topic provisioner: created topic %d (chat %d) for agent %s", threadID, chatID, a.id)
 	}
 	return nil
