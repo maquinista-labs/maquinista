@@ -179,12 +179,7 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		return nil
 	}
 
-	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		// ESRCH means the process already exited; treat as success.
-		if !errors.Is(err, os.ErrProcessDone) {
-			return fmt.Errorf("supervisor: SIGTERM: %w", err)
-		}
-	}
+	signalGroup(cmd, syscall.SIGTERM)
 
 	deadline := time.After(10 * time.Second)
 	ticker := time.NewTicker(100 * time.Millisecond)
@@ -196,7 +191,7 @@ func (s *Supervisor) Stop(ctx context.Context) error {
 		}
 		select {
 		case <-deadline:
-			_ = cmd.Process.Signal(syscall.SIGKILL)
+			signalGroup(cmd, syscall.SIGKILL)
 			// One more wait-cycle for the kernel to reap via our Wait.
 			waitCycle := time.After(2 * time.Second)
 			for s.pid.Load() != 0 {
@@ -270,6 +265,12 @@ func (s *Supervisor) spawnChild() error {
 	cmd.Dir = s.cfg.WorkDir
 	cmd.Stdout = logOut
 	cmd.Stderr = logOut
+	// Put the child in its own process group so that signals sent to
+	// cmd.Process.Pid reach the whole tree (node server.js + the
+	// next-server grandchild it forks internally). Without this,
+	// killing node server.js leaves next-server alive holding the port,
+	// causing EADDRINUSE on the next start.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
 		if s.logFile != nil {
@@ -300,12 +301,12 @@ func (s *Supervisor) waitChild(ctx context.Context) error {
 	select {
 	case waitErr = <-doneCh:
 	case <-ctx.Done():
-		_ = cmd.Process.Signal(syscall.SIGTERM)
-		// Give the child 10 s to exit on its own terms.
+		signalGroup(cmd, syscall.SIGTERM)
+		// Give the child tree 10 s to exit on its own terms.
 		select {
 		case waitErr = <-doneCh:
 		case <-time.After(10 * time.Second):
-			_ = cmd.Process.Signal(syscall.SIGKILL)
+			signalGroup(cmd, syscall.SIGKILL)
 			waitErr = <-doneCh
 		}
 	}
@@ -329,7 +330,7 @@ func (s *Supervisor) killChild() {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	_ = cmd.Process.Signal(syscall.SIGTERM)
+	signalGroup(cmd, syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() {
 		_, _ = cmd.Process.Wait()
@@ -338,9 +339,19 @@ func (s *Supervisor) killChild() {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		_ = cmd.Process.Signal(syscall.SIGKILL)
+		signalGroup(cmd, syscall.SIGKILL)
 		<-done
 	}
+}
+
+// signalGroup sends sig to the process group of cmd. Because spawnChild sets
+// Setpgid=true, the pgid equals cmd.Process.Pid, so -pid targets the whole
+// tree (node server.js + any next-server grandchildren).
+func signalGroup(cmd *exec.Cmd, sig syscall.Signal) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = syscall.Kill(-cmd.Process.Pid, sig)
 }
 
 func (s *Supervisor) pruneRestarts() {

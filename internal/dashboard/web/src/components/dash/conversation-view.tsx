@@ -4,6 +4,7 @@ import { useEffect, useRef } from "react";
 import { useQuery } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { AnimatePresence, motion } from "framer-motion";
 
 import { cn } from "@/lib/utils";
 import { useAgentLive } from "@/lib/use-agent-live";
@@ -135,7 +136,19 @@ export function ConversationView(props: Props) {
 
   const bottomRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    // Defer one frame so framer-motion has committed the new element's height
+    // before we measure scrollHeight. Target the outer scroll container directly
+    // (dash-main) rather than relying on scrollIntoView, which can be confused
+    // by absolutely-positioned children and layout shifts.
+    const raf = requestAnimationFrame(() => {
+      const main = document.querySelector(
+        '[data-testid="dash-main"]',
+      ) as HTMLElement | null;
+      if (main) {
+        main.scrollTo({ top: main.scrollHeight, behavior: "smooth" });
+      }
+    });
+    return () => cancelAnimationFrame(raf);
   }, [q.data, liveEvents.length]);
 
   if (q.isLoading) {
@@ -179,71 +192,80 @@ export function ConversationView(props: Props) {
       data-conversation-id={conversationId ?? ""}
       className="flex flex-col gap-2 py-3"
     >
-      {items.map((it) => {
-        const right = it.kind === "outbox"; // agent speaks → right
-        return (
-          <div
-            key={`${it.kind}-${it.id}`}
-            data-testid={`conv-bubble-${it.id}`}
-            className={cn(
-              "flex w-full",
-              right ? "justify-end" : "justify-start",
-            )}
-          >
-            <div
-              className={cn(
-                "max-w-[80%] rounded-2xl px-3 py-2 text-sm",
-                right
-                  ? "bg-primary/12 text-foreground border border-primary/20"
-                  : "bg-muted/50 text-foreground border border-border/60",
-              )}
+      <AnimatePresence>
+        {items.map((it, index) => {
+          const right = it.kind === "outbox"; // agent speaks → right
+          return (
+            <motion.div
+              key={`${it.kind}-${it.id}`}
+              data-testid={`conv-bubble-${it.id}`}
+              className={cn("flex w-full", right ? "justify-end" : "justify-start")}
+              initial={{ opacity: 0, y: 12, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95, y: -4 }}
+              transition={{ type: "spring", stiffness: 380, damping: 30, delay: Math.min(index * 0.04, 0.3) }}
             >
-              <ReactMarkdown components={mdComponents} remarkPlugins={[remarkGfm]}>
-                {it.excerpt ?? "*empty*"}
-              </ReactMarkdown>
-              <time
+              <div
                 className={cn(
-                  "mt-1 block text-[10px] text-muted-foreground",
-                  right ? "text-right" : "text-left",
+                  "max-w-[80%] rounded-2xl px-3 py-2 text-sm",
+                  right
+                    ? "bg-primary/12 text-foreground border border-primary/20"
+                    : "bg-muted/50 text-foreground border border-border/60",
                 )}
               >
-                {new Date(it.at).toLocaleTimeString()}
-              </time>
-            </div>
-          </div>
-        );
-      })}
+                <ReactMarkdown components={mdComponents} remarkPlugins={[remarkGfm]}>
+                  {it.excerpt ?? "*empty*"}
+                </ReactMarkdown>
+                <time
+                  className={cn(
+                    "mt-1 block text-[10px] text-muted-foreground",
+                    right ? "text-right" : "text-left",
+                  )}
+                >
+                  {new Date(it.at).toLocaleTimeString()}
+                </time>
+              </div>
+            </motion.div>
+          );
+        })}
+      </AnimatePresence>
 
       {/* Live tool events — rendered as regular bubbles, never removed */}
-      {liveEvents.map((ev) => {
-        const label =
-          ev.kind === "tool_use"
-            ? `${toolEmoji(ev.toolName)} ${ev.toolName}${ev.toolInput ? `(${ev.toolInput})` : "()"}`
-            : `${ev.isError ? "✗" : "✓"} ${ev.toolName}${ev.text ? `: ${ev.text}` : ""}`;
-        return (
-          <div
-            key={ev.id}
-            data-testid={`conv-tool-${ev.id}`}
-            className="flex w-full justify-start"
-          >
-            <div
-              className={cn(
-                "max-w-[80%] rounded-2xl px-3 py-2 text-sm font-mono",
-                ev.kind === "tool_use"
-                  ? "bg-muted/50 text-foreground border border-border/60"
-                  : ev.isError
-                    ? "bg-destructive/10 text-foreground border border-destructive/30"
-                    : "bg-muted/30 text-muted-foreground border border-border/40",
-              )}
+      <AnimatePresence>
+        {liveEvents.map((ev) => {
+          const label =
+            ev.kind === "tool_use"
+              ? `${toolEmoji(ev.toolName)} ${ev.toolName}${ev.toolInput ? `(${ev.toolInput})` : "()"}`
+              : `${ev.isError ? "✗" : "✓"} ${ev.toolName}${ev.text ? `: ${ev.text}` : ""}`;
+          return (
+            <motion.div
+              key={ev.id}
+              data-testid={`conv-tool-${ev.id}`}
+              className="flex w-full justify-start"
+              initial={{ opacity: 0, y: 10, scale: 0.97 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95, y: -4 }}
+              transition={{ type: "spring", stiffness: 380, damping: 30 }}
             >
-              {label}
-              <time className="mt-1 block text-[10px] text-muted-foreground text-left">
-                {ev.at.toLocaleTimeString()}
-              </time>
-            </div>
-          </div>
-        );
-      })}
+              <div
+                className={cn(
+                  "max-w-[80%] rounded-2xl px-3 py-2 text-sm font-mono",
+                  ev.kind === "tool_use"
+                    ? "bg-muted/50 text-foreground border border-border/60"
+                    : ev.isError
+                      ? "bg-destructive/10 text-foreground border border-destructive/30"
+                      : "bg-muted/30 text-muted-foreground border border-border/40",
+                )}
+              >
+                {label}
+                <time className="mt-1 block text-[10px] text-muted-foreground text-left">
+                  {ev.at.toLocaleTimeString()}
+                </time>
+              </div>
+            </motion.div>
+          );
+        })}
+      </AnimatePresence>
 
       <div ref={bottomRef} />
     </div>
