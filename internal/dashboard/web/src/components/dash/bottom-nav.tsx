@@ -1,6 +1,6 @@
 "use client";
 
-import { Bot, Inbox, MessageSquare, CalendarClock } from "lucide-react";
+import { Bot, Inbox, CalendarClock } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ComponentType, SVGProps } from "react";
@@ -22,12 +22,6 @@ type Tab = {
 const tabs: Tab[] = [
   { href: "/agents", label: "Agents", Icon: Bot, testId: "nav-agents" },
   { href: "/inbox", label: "Inbox", Icon: Inbox, testId: "nav-inbox" },
-  {
-    href: "/conversations",
-    label: "Chats",
-    Icon: MessageSquare,
-    testId: "nav-conversations",
-  },
   { href: "/jobs", label: "Jobs", Icon: CalendarClock, testId: "nav-jobs" },
 ];
 
@@ -39,7 +33,7 @@ export function BottomNav() {
     <nav
       data-testid="bottom-nav"
       aria-label="Primary"
-      className="sticky bottom-0 z-20 grid grid-cols-4 border-t border-border/60 bg-background/90 backdrop-blur supports-[backdrop-filter]:bg-background/70"
+      className="sticky bottom-0 z-20 grid grid-cols-3 border-t border-border/60 bg-background/90 backdrop-blur supports-[backdrop-filter]:bg-background/70"
       style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
     >
       {tabs.map(({ href, label, Icon, testId }) => {

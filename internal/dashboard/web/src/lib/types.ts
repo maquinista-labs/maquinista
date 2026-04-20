@@ -93,8 +93,7 @@ export type ConversationItem = {
 export type KPIs = {
   active_agents: number;
   total_agents: number;
-  inbox_in_flight: number;
-  outbox_pending: number;
+  messages: number;
   tokens_today: { input: number; output: number };
   cost_today_cents: number;
   cost_month_projected_cents: number;

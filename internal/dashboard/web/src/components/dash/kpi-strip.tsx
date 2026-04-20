@@ -34,14 +34,9 @@ export function KpiStrip({ initial }: { initial?: KPIs }) {
       testid: "kpi-active",
     },
     {
-      label: "Inbox",
-      value: `${k.inbox_in_flight}`,
-      testid: "kpi-inbox",
-    },
-    {
-      label: "Outbox",
-      value: `${k.outbox_pending}`,
-      testid: "kpi-outbox",
+      label: "Messages",
+      value: `${k.messages}`,
+      testid: "kpi-messages",
     },
     {
       label: "Tokens (in)",
@@ -66,13 +61,13 @@ export function KpiStrip({ initial }: { initial?: KPIs }) {
   ];
 
   return (
-    <div data-testid="kpi-strip" className="mb-3">
-      <div className="flex gap-2 overflow-x-auto scrollbar-hide pb-1">
+    <div data-testid="kpi-strip" className="mb-4">
+      <div className="grid grid-cols-3 gap-2 sm:grid-cols-6">
         {tiles.map((t) => (
           <Card
             key={t.testid}
             data-testid={t.testid}
-            className="min-w-[100px] shrink-0 p-2 text-center"
+            className="p-2 text-center"
           >
             <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
               {t.label}
@@ -106,8 +101,8 @@ function CostDonut({ slices }: { slices: DonutSlice[] }) {
   const palette = [
     "hsl(142 71% 45%)", // emerald
     "hsl(217 91% 60%)", // blue
-    "hsl(48 96% 53%)", // amber
-    "hsl(0 84% 60%)", // rose
+    "hsl(48 96% 53%)",  // amber
+    "hsl(0 84% 60%)",   // rose
     "hsl(262 83% 58%)", // violet
   ];
 

@@ -368,15 +368,12 @@ export async function computeKPIs(pool: Pool): Promise<KPIs> {
         FROM agents
         WHERE status <> 'archived' OR status IS NULL
       ),
-      inbox AS (
-        SELECT COUNT(*) AS in_flight
-        FROM agent_inbox
-        WHERE status IN ('pending','processing')
-      ),
-      outbox AS (
-        SELECT COUNT(*) AS pending
-        FROM agent_outbox
-        WHERE status = 'pending'
+      msgs AS (
+        SELECT
+          (SELECT COUNT(*) FROM agent_inbox  WHERE status IN ('pending','processing'))
+          +
+          (SELECT COUNT(*) FROM agent_outbox WHERE status = 'pending')
+          AS in_flight
       ),
       tc AS (
         SELECT
@@ -399,15 +396,14 @@ export async function computeKPIs(pool: Pool): Promise<KPIs> {
         GROUP BY model
       )
     SELECT
-      a.active, a.total, inbox.in_flight, outbox.pending,
+      a.active, a.total, msgs.in_flight,
       tc.input_today, tc.output_today, tc.cents_today,
       tc_month.cents_month,
       COALESCE((SELECT json_agg(row_to_json(donut)) FROM donut), '[]') AS by_model
-    FROM a, inbox, outbox, tc, tc_month
+    FROM a, msgs, tc, tc_month
   `);
   const r = rows[0];
   const now = new Date();
-  // Linear projection for the rest of the month based on cents_today.
   const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
   const daysElapsed = Math.max(
     1,
@@ -423,8 +419,7 @@ export async function computeKPIs(pool: Pool): Promise<KPIs> {
   return {
     active_agents: Number(r.active) || 0,
     total_agents: Number(r.total) || 0,
-    inbox_in_flight: Number(r.in_flight) || 0,
-    outbox_pending: Number(r.pending) || 0,
+    messages: Number(r.in_flight) || 0,
     tokens_today: {
       input: Number(r.input_today) || 0,
       output: Number(r.output_today) || 0,
