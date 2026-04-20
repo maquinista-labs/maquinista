@@ -18,6 +18,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/listener"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
+	"github.com/maquinista-labs/maquinista/internal/sidecar"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
 	"github.com/maquinista-labs/maquinista/internal/queue"
 	"github.com/maquinista-labs/maquinista/internal/runner"
@@ -255,11 +256,10 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	go mon.Run(ctx)
 	go sp.Run(ctx)
 
-	// Mailbox inbox consumer: claim agent_inbox rows and pipe content into
-	// the pty. Replaces the task-1.6 inboxbridge package. The plan's end
-	// state is one sidecar goroutine per live agent (§7); until that per-
-	// agent supervisor is wired, this single process consumer drains all
-	// agents serially via FOR UPDATE SKIP LOCKED.
+	// Per-agent sidecar manager: each live agent gets its own goroutine that
+	// claims inbox rows and drives them into the agent's PTY independently.
+	// Replaces the single runMailboxConsumer goroutine that drained all agents
+	// serially (plans/active/per-agent-sidecar.md Phase 1).
 	if pool == nil && cfg.DatabaseURL != "" {
 		if p, dbErr := db.Connect(cfg.DatabaseURL); dbErr != nil {
 			log.Printf("mailbox: cannot connect DB: %v", dbErr)
@@ -267,11 +267,15 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			pool = p
 		}
 	}
+	var sidecarMgr *sidecar.Manager
 	if pool != nil {
 		b.SetPool(pool)
-		workerID := fmt.Sprintf("consumer-%d", os.Getpid())
-		go runMailboxConsumer(ctx, pool, cfg.TmuxSessionName, workerID, activeInboxMap)
-		log.Printf("mailbox: inbox consumer running (worker=%s)", workerID)
+		sidecarMgr = sidecar.NewManager(pool, cfg.TmuxSessionName, activeInboxMap.Set)
+		if n, err := sidecarMgr.Boot(ctx); err != nil {
+			log.Printf("sidecar manager: boot error: %v", err)
+		} else {
+			log.Printf("sidecar manager: booted with %d agent sidecar(s)", n)
+		}
 
 		// Declarative jobreg reconcile: upsert every YAML under
 		// config/schedules + config/hooks, soft-disable rows whose
@@ -292,10 +296,10 @@ func runOrchestratorSupervised(ctx context.Context) error {
 
 		// Periodic dashboard agent reconcile: spawn panes for agents
 		// created via dashboard (status='stopped', tmux_window='').
-		// This bridges the gap between dashboard DB-only spawn and
-		// reconcile-only-once-at-startup logic.
+		// Also syncs the sidecar manager so newly-online agents get
+		// their own inbox goroutine within the next reconcile tick.
 		if cwd, cwdErr := resolveStartCWD(cfg); cwdErr == nil {
-			go runDashboardAgentReconcile(ctx, cfg, pool, b.State(), cwd)
+			go runDashboardAgentReconcile(ctx, cfg, pool, b.State(), cwd, sidecarMgr)
 			log.Println("dashboard: periodic agent reconcile started")
 		}
 
@@ -406,8 +410,10 @@ func runOrchestratorSupervised(ctx context.Context) error {
 
 // runDashboardAgentReconcile periodically scans for dashboard-spawned
 // agents (status='stopped', tmux_window='') and provisions their tmux
-// panes. Runs as a background goroutine; terminates on ctx cancel.
-func runDashboardAgentReconcile(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, botState *state.State, defaultCWD string) {
+// panes. After each reconcile pass it syncs the sidecar manager so that
+// newly-online agents get their own inbox goroutine within the same tick.
+// Runs as a background goroutine; terminates on ctx cancel.
+func runDashboardAgentReconcile(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, botState *state.State, defaultCWD string, mgr *sidecar.Manager) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
@@ -421,6 +427,12 @@ func runDashboardAgentReconcile(ctx context.Context, cfg *config.Config, pool *p
 				log.Printf("dashboard: reconcile error: %v", err)
 			} else if n > 0 {
 				log.Printf("dashboard: provisioned %d new agent pane(s)", n)
+			}
+			// Sync sidecars so newly-online agents get an inbox goroutine.
+			if mgr != nil {
+				if _, err := mgr.Sync(ctx); err != nil {
+					log.Printf("sidecar manager: sync error: %v", err)
+				}
 			}
 		}
 	}

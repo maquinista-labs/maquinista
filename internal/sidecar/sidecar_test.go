@@ -315,6 +315,63 @@ func TestSidecar_ParityWithShadowMonitor(t *testing.T) {
 	}
 }
 
+// TestSidecar_OnClaim_FiresBeforeDrive confirms that Config.OnClaim is invoked
+// with the correct agentID and inboxID before the PTY driver runs, so the
+// monitor's OutboxSink can read the mapping for in_reply_to stamping.
+func TestSidecar_OnClaim_FiresBeforeDrive(t *testing.T) {
+	pool := setup(t)
+	inboxID := enqueue(t, pool, "tg:claim", "hello")
+
+	var claimedAgent, claimedInbox string
+	var claimBeforeDrive bool
+	driveCalled := false
+
+	cfg := DefaultConfig("alpha")
+	cfg.Poll = 200 * time.Millisecond
+	cfg.OnClaim = func(agentID, inboxID string) {
+		claimedAgent = agentID
+		claimedInbox = inboxID
+		claimBeforeDrive = !driveCalled // should be true
+	}
+
+	drive := PtyDriverFunc(func(ctx context.Context, text string) error {
+		driveCalled = true
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	s := New(pool, cfg, drive, &fakeTailer{})
+	go func() { done <- s.Run(ctx) }()
+
+	// Wait until the inbox row is processed.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var status string
+		pool.QueryRow(context.Background(),
+			`SELECT status FROM agent_inbox WHERE id=$1`, inboxID).Scan(&status)
+		if status == "processed" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("inbox row never reached processed")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+	<-done
+
+	if claimedAgent != "alpha" {
+		t.Errorf("OnClaim agentID=%q, want alpha", claimedAgent)
+	}
+	if claimedInbox != inboxID.String() {
+		t.Errorf("OnClaim inboxID=%q, want %s", claimedInbox, inboxID)
+	}
+	if !claimBeforeDrive {
+		t.Error("OnClaim did not fire before Drive")
+	}
+}
+
 type fakeTailer struct{}
 
 func (fakeTailer) Tail(ctx context.Context, ch chan<- TranscriptEvent) error {

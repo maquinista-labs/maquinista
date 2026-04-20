@@ -69,10 +69,15 @@ type TranscriptTailer interface {
 
 // Config bundles sidecar knobs.
 type Config struct {
-	AgentID    string
-	WorkerID   string
-	Lease      time.Duration
-	Poll       time.Duration
+	AgentID  string
+	WorkerID string
+	Lease    time.Duration
+	Poll     time.Duration
+	// OnClaim is called just after an inbox row is claimed and before it is
+	// driven to the PTY. The monitor's OutboxSink reads this mapping to stamp
+	// in_reply_to on outbox rows so the relay can route responses back to
+	// the origin Telegram topic. Optional.
+	OnClaim func(agentID, inboxID string)
 }
 
 // DefaultConfig returns production defaults.
@@ -188,6 +193,13 @@ func (s *SidecarRunner) processOneInbox(ctx context.Context) (bool, error) {
 	id := row.ID
 	s.current.id = &id
 	s.current.mu.Unlock()
+
+	// Notify the caller (e.g. OutboxSink via activeInboxMap) which inbox row
+	// is now in flight. Must happen before Drive so any outbox rows written
+	// during the turn carry the correct in_reply_to.
+	if s.cfg.OnClaim != nil {
+		s.cfg.OnClaim(s.cfg.AgentID, row.ID.String())
+	}
 
 	text := extractInboxText(row.Content)
 	driveErr := s.driver.Drive(ctx, text)
