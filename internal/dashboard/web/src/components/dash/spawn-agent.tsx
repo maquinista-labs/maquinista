@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { PlusIcon } from "lucide-react";
+import { PlusIcon, RefreshCwIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -17,7 +17,7 @@ import {
   SheetTrigger,
 } from "@/components/ui/sheet";
 import type { ModelChoice, RunnerChoice } from "@/lib/catalog";
-import { HANDLE_REGEX, isValidHandle } from "@/lib/utils";
+import { HANDLE_REGEX, generateAgentName, isValidHandle } from "@/lib/utils";
 import { CreateTemplate } from "./create-template";
 
 type Catalog = {
@@ -58,6 +58,11 @@ export function SpawnAgent() {
     },
     enabled: open,
   });
+
+  // Seed a fun suggested handle each time the sheet opens.
+  useEffect(() => {
+    if (open) setHandle(generateAgentName());
+  }, [open]);
 
   // Default picklist seeds once the catalog lands.
   useEffect(() => {
@@ -202,14 +207,24 @@ export function SpawnAgent() {
         <div className="flex flex-col gap-3 p-4">
           <label className="text-sm text-muted-foreground">
             Handle
-            <input
-              data-testid="spawn-agent-handle"
-              autoFocus
-              value={handle}
-              onChange={(e) => setHandle(e.target.value)}
-              placeholder="e.g. coder"
-              className="mt-1 w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
-            />
+            <div className="mt-1 flex gap-1">
+              <input
+                data-testid="spawn-agent-handle"
+                autoFocus
+                value={handle}
+                onChange={(e) => setHandle(e.target.value)}
+                placeholder="e.g. fancy-robot-cloud"
+                className="w-full rounded-md border border-border bg-background px-2 py-1 text-sm"
+              />
+              <button
+                type="button"
+                title="Suggest another name"
+                onClick={() => setHandle(generateAgentName())}
+                className="flex items-center rounded-md border border-border bg-background px-2 py-1 text-muted-foreground hover:text-foreground"
+              >
+                <RefreshCwIcon className="h-3.5 w-3.5" aria-hidden />
+              </button>
+            </div>
           </label>
           <p className="text-xs text-muted-foreground">
             {HANDLE_REGEX.source} — 2 to 32 lowercase letters, digits,
