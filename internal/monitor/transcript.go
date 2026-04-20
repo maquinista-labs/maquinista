@@ -4,13 +4,26 @@ import (
 	"encoding/json"
 	"regexp"
 	"strings"
+	"time"
 )
+
+// UsageData holds token counts extracted from an assistant message.
+// Populated for claude / openclaude runner JSONL entries only.
+type UsageData struct {
+	Model        string
+	InputTokens  int
+	OutputTokens int
+	CacheRead    int
+	CacheWrite   int
+	Timestamp    time.Time
+}
 
 // Entry represents a parsed JSONL transcript entry.
 type Entry struct {
 	Type    string         // "user", "assistant", "summary"
 	Blocks  []ContentBlock // parsed content blocks
 	RawData json.RawMessage
+	Usage   *UsageData     // non-nil for assistant entries that carry usage
 }
 
 // ContentBlock represents a single content block within an entry.
@@ -72,6 +85,13 @@ func parseMessageEntry(entryType string, raw map[string]json.RawMessage) (*Entry
 
 	var msg struct {
 		Content json.RawMessage `json:"content"`
+		Model   string          `json:"model"`
+		Usage   *struct {
+			InputTokens              int `json:"input_tokens"`
+			OutputTokens             int `json:"output_tokens"`
+			CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+		} `json:"usage"`
 	}
 	if err := json.Unmarshal(msgBytes, &msg); err != nil {
 		return &Entry{Type: entryType}, nil
@@ -79,11 +99,33 @@ func parseMessageEntry(entryType string, raw map[string]json.RawMessage) (*Entry
 
 	blocks := parseContentBlocks(msg.Content)
 
+	var usage *UsageData
+	if entryType == "assistant" && msg.Usage != nil && msg.Model != "" {
+		ts := time.Now()
+		if tsBytes, ok := raw["timestamp"]; ok {
+			var tsStr string
+			if err := json.Unmarshal(tsBytes, &tsStr); err == nil {
+				if t, err := time.Parse(time.RFC3339, tsStr); err == nil {
+					ts = t
+				}
+			}
+		}
+		usage = &UsageData{
+			Model:        msg.Model,
+			InputTokens:  msg.Usage.InputTokens,
+			OutputTokens: msg.Usage.OutputTokens,
+			CacheRead:    msg.Usage.CacheReadInputTokens,
+			CacheWrite:   msg.Usage.CacheCreationInputTokens,
+			Timestamp:    ts,
+		}
+	}
+
 	rawData, _ := json.Marshal(raw)
 	return &Entry{
 		Type:    entryType,
 		Blocks:  blocks,
 		RawData: rawData,
+		Usage:   usage,
 	}, nil
 }
 
@@ -246,6 +288,17 @@ func ParseEntries(entries []*Entry, pending map[string]PendingTool) []ParsedEntr
 			continue
 		}
 
+		// Emit a synthetic usage entry so monitor.poll() can call CaptureTurn.
+		// Kept out of the block loop so it's always emitted exactly once per
+		// assistant message, regardless of content block count.
+		if entry.Usage != nil {
+			result = append(result, ParsedEntry{
+				Role:        "assistant",
+				ContentType: "usage",
+				Usage:       entry.Usage,
+			})
+		}
+
 		for _, block := range entry.Blocks {
 			switch block.Type {
 			case "text":
@@ -327,14 +380,17 @@ func ParseEntries(entries []*Entry, pending map[string]PendingTool) []ParsedEntr
 }
 
 // ParsedEntry is a display-ready parsed entry for the message queue.
+// ContentType "usage" is internal — monitor.poll() consumes it for cost
+// capture and strips it before Telegram / outbox routing.
 type ParsedEntry struct {
-	Role        string // "user", "assistant"
-	ContentType string // "text", "tool_use", "tool_result", "thinking"
+	Role        string     // "user", "assistant"
+	ContentType string     // "text", "tool_use", "tool_result", "thinking", "usage"
 	Text        string
 	ToolUseID   string
 	ToolName    string
-	ToolInput   string // tool input summary (for tool_result combined display)
+	ToolInput   string     // tool input summary (for tool_result combined display)
 	IsError     bool
+	Usage       *UsageData // set when ContentType == "usage"
 }
 
 // FormatToolUseSummary formats a tool_use into a summary line.

@@ -123,6 +123,9 @@ func (m *Monitor) poll() {
 				cancel()
 			}
 
+			// Capture turn costs and strip usage entries before routing.
+			parsed = m.captureAndStripUsage(parsed, agentID, sess.WindowID)
+
 			// Prefer active thread; fall back to all bound users.
 			var users []state.UserThread
 			if ut, ok := m.state.GetActiveThread(sess.WindowID); ok {
@@ -196,6 +199,56 @@ func (m *Monitor) poll() {
 
 	monitorStatePath := filepath.Join(m.config.MaquinistaDir, "monitor_state.json")
 	m.monitorState.SaveIfDirty(monitorStatePath)
+}
+
+// captureAndStripUsage processes usage-typed ParsedEntries, fires CaptureTurn
+// for each, and returns the slice with usage entries removed so the rest of
+// poll() only sees display-ready entries.
+func (m *Monitor) captureAndStripUsage(entries []ParsedEntry, agentID, windowID string) []ParsedEntry {
+	if m.pool == nil || agentID == "" {
+		// Still strip usage entries even if we can't capture costs.
+		filtered := entries[:0]
+		for _, pe := range entries {
+			if pe.ContentType != "usage" {
+				filtered = append(filtered, pe)
+			}
+		}
+		return filtered
+	}
+
+	startedAt, hasStart := m.GetAndClearTurnStart(windowID)
+
+	filtered := entries[:0]
+	for _, pe := range entries {
+		if pe.ContentType != "usage" {
+			filtered = append(filtered, pe)
+			continue
+		}
+		if pe.Usage == nil {
+			continue
+		}
+		u := pe.Usage
+		tc := TurnCost{
+			AgentID:      agentID,
+			Model:        u.Model,
+			InputTokens:  u.InputTokens,
+			OutputTokens: u.OutputTokens,
+			CacheRead:    u.CacheRead,
+			CacheWrite:   u.CacheWrite,
+			FinishedAt:   u.Timestamp,
+		}
+		if hasStart {
+			tc.StartedAt = startedAt
+		}
+		go func(t TurnCost) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := CaptureTurn(ctx, m.pool, t); err != nil {
+				log.Printf("monitor: CaptureTurn agent=%s model=%s: %v", t.AgentID, t.Model, err)
+			}
+		}(tc)
+	}
+	return filtered
 }
 
 // SetTurnStart records the start time of a user turn for a window.
