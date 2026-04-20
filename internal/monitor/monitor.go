@@ -19,35 +19,6 @@ import (
 // Implementations should look up the agent by window, then look up observing topics.
 type ObservationLookup func(windowID string) []ObservingTopic
 
-// OutboxEvent is one captured assistant response ready to be mirrored into
-// agent_outbox. Kept for outbox.go / outbox_test.go compatibility; removed in Phase 4.
-type OutboxEvent struct {
-	AgentID   string
-	UserID    int64
-	ThreadID  int
-	ChatID    int64
-	Role      string
-	Text      string
-	InReplyTo string
-}
-
-// OutboxWriter mirrors every captured response into agent_outbox when set.
-// Kept for outbox.go / outbox_test.go compatibility; removed in Phase 4.
-type OutboxWriter func(e OutboxEvent)
-
-// ToolEvent carries one tool_use or tool_result observation.
-// Kept for tool_events.go / tool_events_test.go compatibility; removed in Phase 4.
-type ToolEvent struct {
-	AgentID   string
-	Type      string
-	ToolName  string
-	ToolUseID string
-	IsError   bool
-}
-
-// ToolEventWriter is called once per tool_use/tool_result observation.
-// Kept for tool_events.go compatibility; removed in Phase 4.
-type ToolEventWriter func(e ToolEvent)
 
 // ObservingTopic represents a topic that is observing an agent's output.
 type ObservingTopic struct {
