@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 )
@@ -133,12 +134,15 @@ func (s *SidecarRunner) Run(ctx context.Context) error {
 }
 
 func (s *SidecarRunner) runInboxLoop(ctx context.Context) error {
-	listener, err := s.pool.Acquire(ctx)
+	// Use a dedicated raw connection for LISTEN so we don't consume a pool
+	// slot for the sidecar's lifetime. Pool connections are reserved for
+	// short-lived queries (claim, ack, fail, outbox).
+	listenerConn, err := pgx.ConnectConfig(ctx, s.pool.Config().ConnConfig)
 	if err != nil {
-		return fmt.Errorf("acquire: %w", err)
+		return fmt.Errorf("listener connect: %w", err)
 	}
-	defer listener.Release()
-	if _, err := listener.Exec(ctx, "LISTEN agent_inbox_new"); err != nil {
+	defer listenerConn.Close(context.Background())
+	if _, err := listenerConn.Exec(ctx, "LISTEN agent_inbox_new"); err != nil {
 		return fmt.Errorf("LISTEN: %w", err)
 	}
 
@@ -155,7 +159,7 @@ func (s *SidecarRunner) runInboxLoop(ctx context.Context) error {
 			}
 		}
 		waitCtx, cancel := context.WithTimeout(ctx, s.cfg.Poll)
-		_, nerr := listener.Conn().WaitForNotification(waitCtx)
+		_, nerr := listenerConn.WaitForNotification(waitCtx)
 		cancel()
 		if ctx.Err() != nil {
 			return ctx.Err()
