@@ -219,7 +219,7 @@ export function ConversationView(props: Props) {
         {timeline.map((entry, index) => {
           if (entry.kind === "db") {
             const it = entry.item;
-            if (it.kind === "outbox") return null;
+            if (it.kind === "inbox") return null;
             return (
               <motion.div
                 key={`db-${it.kind}-${it.id}`}
