@@ -17,7 +17,6 @@ export function JobsPageClient({ initial }: { initial: JobsList }) {
     },
     initialData: initial,
     staleTime: 30_000,
-    refetchInterval: 60_000,
   });
 
   const jobs = q.data ?? initial;
