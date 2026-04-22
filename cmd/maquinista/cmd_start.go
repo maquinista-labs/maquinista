@@ -14,6 +14,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/bot"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/agentspawn"
 	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/listener"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
@@ -22,6 +23,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
 	"github.com/maquinista-labs/maquinista/internal/queue"
 	"github.com/maquinista-labs/maquinista/internal/runner"
+	"github.com/maquinista-labs/maquinista/internal/scheduler"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
@@ -302,6 +304,23 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			go runDashboardAgentReconcile(ctx, cfg, pool, b.State(), cwd, sidecarMgr)
 			log.Println("dashboard: periodic agent reconcile started")
 		}
+
+		// Scheduler: fires scheduled_jobs, injecting into existing agents or
+		// spawning fresh agents based on soul_template_id.
+		go func() {
+			schedCfg := scheduler.DefaultConfig()
+			if cwd, cwdErr := resolveStartCWD(cfg); cwdErr == nil && sidecarMgr != nil {
+				finalCWD := cwd
+				var finalSidecar agentspawn.AgentSpawner = sidecarMgr
+				schedCfg.SpawnFunc = func(ctx context.Context, job scheduler.FiredJob) error {
+					return dispatchJobSpawn(ctx, pool, cfg, finalSidecar, finalCWD, job)
+				}
+			}
+			if err := scheduler.Run(ctx, pool, schedCfg); err != nil && ctx.Err() == nil {
+				log.Printf("scheduler: %v", err)
+			}
+		}()
+		log.Println("scheduler: started")
 
 		// Telegram topic provisioner: creates forum topics for user agents
 		// that were spawned via the dashboard and have no owner binding yet.

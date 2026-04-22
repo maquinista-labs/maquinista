@@ -4,6 +4,22 @@ import { getPool } from "@/lib/db";
 
 export const dynamic = "force-dynamic";
 
+// GET /api/soul-templates — list all soul templates (for job form selects)
+export async function GET() {
+  try {
+    const pool = getPool();
+    const { rows } = await pool.query(
+      `SELECT id, name, role, tagline FROM soul_templates ORDER BY name`,
+    );
+    return NextResponse.json(rows);
+  } catch (err) {
+    return NextResponse.json(
+      { error: err instanceof Error ? err.message : String(err) },
+      { status: 500 },
+    );
+  }
+}
+
 // POST /api/soul-templates — create a new soul template
 export async function POST(request: Request) {
   try {

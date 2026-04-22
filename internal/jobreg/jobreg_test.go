@@ -113,6 +113,78 @@ func TestHook_RejectsBadPath(t *testing.T) {
 	}
 }
 
+// TestAddSchedule_SoulTemplateID: valid schedule with soul_template_id instead
+// of agent_id passes validation and round-trips correctly.
+func TestAddSchedule_SoulTemplateID(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	// Insert a soul_template row required by the FK.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO soul_templates (id, name, role, goal)
+		VALUES ('tpl-test', 'Test', 'executor', 'do things')
+	`); err != nil {
+		t.Fatalf("seed soul_template: %v", err)
+	}
+
+	_, err := AddSchedule(ctx, pool, Schedule{
+		Name:           "soul-job",
+		Cron:           "0 8 * * *",
+		SoulTemplateID: "tpl-test",
+		Prompt:         map[string]any{"type": "text", "text": "run!"},
+	})
+	if err != nil {
+		t.Fatalf("AddSchedule: %v", err)
+	}
+
+	list, err := ListSchedules(ctx, pool)
+	if err != nil || len(list) != 1 {
+		t.Fatalf("list=%v err=%v", list, err)
+	}
+	if list[0].SoulTemplateID != "tpl-test" {
+		t.Errorf("SoulTemplateID=%q, want tpl-test", list[0].SoulTemplateID)
+	}
+	if list[0].SoulTemplateName != "Test" {
+		t.Errorf("SoulTemplateName=%q, want Test", list[0].SoulTemplateName)
+	}
+}
+
+// TestValidateSchedule_NeitherAgentNorTemplate: both empty → error.
+func TestValidateSchedule_NeitherAgentNorTemplate(t *testing.T) {
+	_, err := AddSchedule(context.Background(), nil, Schedule{
+		Name:   "bad",
+		Cron:   "0 8 * * *",
+		Prompt: map[string]any{"text": "x"},
+	})
+	if err == nil {
+		t.Fatal("expected error when neither agent_id nor soul_template_id set")
+	}
+}
+
+// TestValidateSchedule_BothSet: having both agent_id and soul_template_id is OK.
+func TestValidateSchedule_BothSet(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO soul_templates (id, name, role, goal)
+		VALUES ('tpl-both', 'Both', 'executor', 'go')
+	`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	_, err := AddSchedule(ctx, pool, Schedule{
+		Name:           "both-job",
+		Cron:           "0 8 * * *",
+		AgentID:        "alpha",
+		SoulTemplateID: "tpl-both",
+		Prompt:         map[string]any{"text": "x"},
+	})
+	if err != nil {
+		t.Fatalf("expected no error with both set: %v", err)
+	}
+}
+
 func TestReconcile_UpsertsAndSoftDisablesStale(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()

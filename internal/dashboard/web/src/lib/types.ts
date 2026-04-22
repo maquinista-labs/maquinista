@@ -106,10 +106,31 @@ export type ScheduledJob = {
   kind: "scheduled";
   cron_expr: string;
   timezone: string;
-  agent_id: string;
+  agent_id: string | null;
+  soul_template_id: string | null;
+  soul_template_name: string | null;
+  context_markdown: string;
+  agent_cwd: string;
   enabled: boolean;
   next_run_at: string;
   last_run_at: string | null;
+  run_count: number;
+};
+
+export type JobExecution = {
+  id: string;
+  agent_id: string | null;
+  started_at: string;
+  ended_at: string | null;
+  agent_status: string | null;
+  tmux_window: string | null;
+};
+
+export type SoulTemplate = {
+  id: string;
+  name: string;
+  role: string;
+  tagline: string | null;
 };
 
 export type WebhookHandler = {

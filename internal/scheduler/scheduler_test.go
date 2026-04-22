@@ -209,5 +209,111 @@ func TestParsePgInterval(t *testing.T) {
 	}
 }
 
+// TestFireOne_SoulTemplateID_CallsSpawnFunc: when a job has soul_template_id
+// set, SpawnFunc is called with correct FiredJob fields.
+func TestFireOne_SoulTemplateID_CallsSpawnFunc(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	// Insert a soul_template first (FK requirement).
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO soul_templates (id, name, role, goal)
+		VALUES ('tpl-1', 'Test Template', 'executor', 'do stuff')
+	`); err != nil {
+		t.Fatalf("seed soul_template: %v", err)
+	}
+
+	past := time.Now().Add(-5 * time.Minute).UTC()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO scheduled_jobs (name, cron_expr, soul_template_id, prompt, next_run_at)
+		VALUES ('fresh-job', '0 8 * * *', 'tpl-1', '{"type":"text","text":"hello"}'::jsonb, $1)
+	`, past); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+
+	var gotJob FiredJob
+	cfg := DefaultConfig()
+	cfg.SpawnFunc = func(ctx context.Context, job FiredJob) error {
+		gotJob = job
+		return nil
+	}
+
+	fired, err := FireOne(ctx, pool, cfg)
+	if err != nil || !fired {
+		t.Fatalf("fired=%v err=%v", fired, err)
+	}
+	if gotJob.SoulTemplateID != "tpl-1" {
+		t.Errorf("SoulTemplateID = %q, want tpl-1", gotJob.SoulTemplateID)
+	}
+	if gotJob.Name != "fresh-job" {
+		t.Errorf("Name = %q, want fresh-job", gotJob.Name)
+	}
+	// next_run_at should have advanced.
+	var next time.Time
+	pool.QueryRow(ctx, `SELECT next_run_at FROM scheduled_jobs WHERE name='fresh-job'`).Scan(&next)
+	if !next.After(time.Now()) {
+		t.Errorf("next_run_at=%s, want future", next)
+	}
+}
+
+// TestFireOne_SoulTemplateID_NoSpawnFunc_Skips: SpawnFunc=nil → no panic,
+// job advances next_run_at.
+func TestFireOne_SoulTemplateID_NoSpawnFunc_Skips(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO soul_templates (id, name, role, goal)
+		VALUES ('tpl-2', 'T2', 'executor', 'x')
+	`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	past := time.Now().Add(-5 * time.Minute).UTC()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO scheduled_jobs (name, cron_expr, soul_template_id, prompt, next_run_at)
+		VALUES ('skip-job', '0 8 * * *', 'tpl-2', '{"type":"text","text":"hi"}'::jsonb, $1)
+	`, past); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+
+	cfg := DefaultConfig() // SpawnFunc = nil
+	fired, err := FireOne(ctx, pool, cfg)
+	if err != nil || !fired {
+		t.Fatalf("fired=%v err=%v", fired, err)
+	}
+	// next_run_at should have advanced even though SpawnFunc was nil.
+	var next time.Time
+	pool.QueryRow(ctx, `SELECT next_run_at FROM scheduled_jobs WHERE name='skip-job'`).Scan(&next)
+	if !next.After(time.Now()) {
+		t.Errorf("next_run_at=%s, want future", next)
+	}
+}
+
+// TestFireOne_AgentID_Legacy_InboxInject: existing agent_id path still works.
+func TestFireOne_AgentID_Legacy_InboxInject(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	past := time.Now().Add(-5 * time.Minute).UTC()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO scheduled_jobs (name, cron_expr, agent_id, prompt, next_run_at)
+		VALUES ('legacy-job', '0 8 * * *', 'alpha', '{"type":"text","text":"go"}'::jsonb, $1)
+	`, past); err != nil {
+		t.Fatalf("seed job: %v", err)
+	}
+
+	cfg := DefaultConfig()
+	fired, err := FireOne(ctx, pool, cfg)
+	if err != nil || !fired {
+		t.Fatalf("fired=%v err=%v", fired, err)
+	}
+
+	var count int
+	pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE from_kind='scheduled'`).Scan(&count)
+	if count != 1 {
+		t.Errorf("inbox rows=%d, want 1", count)
+	}
+}
+
 // Compile-time shims to keep the mailbox import in use across refactors.
 var _ = fmt.Sprintf
