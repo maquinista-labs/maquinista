@@ -9,14 +9,20 @@ import { encodeSSE } from "@/lib/sse-encoder";
 // indefinitely would starve the pool). The Go daemon already emits
 // these channels from its migrations:
 //
-//   agent_inbox_new       payload = agent_id
-//   agent_outbox_new      payload = outbox_id
-//   channel_delivery_new  payload = delivery_id
-//   agent_stop            payload = agent_id
+//   agent_inbox_new         payload = agent_id
+//   agent_outbox_new        payload = outbox_id
+//   channel_delivery_new    payload = delivery_id
+//   agent_stop              payload = agent_id
+//   agent_turn_cost_new     payload = agent_id       (migration 030)
+//   scheduled_jobs_change   payload = row id         (migration 031)
+//   webhook_handlers_change payload = row id         (migration 031)
 //
 // The SSE stream emits one frame per NOTIFY, plus a periodic
 // keepalive comment every 15 s so aggressive proxies (Cloudflare
 // etc.) don't reap the connection.
+//
+// A dash.health_tick event fires every 5 s so the system-health
+// card can drop its polling refetchInterval and stay driven by SSE.
 
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
@@ -28,6 +34,9 @@ const CHANNELS = [
   "agent_stop",
   "tool_event",
   "agent_status",
+  "agent_turn_cost_new",
+  "scheduled_jobs_change",
+  "webhook_handlers_change",
 ] as const;
 
 export async function GET(req: Request) {
@@ -109,10 +118,18 @@ export async function GET(req: Request) {
         safeEnqueue(encoder.encode(`: keepalive\n\n`));
       }, 15_000);
 
+      // Health heartbeat every 5 s — replaces the refetchInterval on
+      // the system-health card so it stays driven by SSE rather than
+      // independent polling.
+      const healthTick = setInterval(() => {
+        push("dash.health_tick", { at: Date.now() });
+      }, 5_000);
+
       const cleanup = async () => {
         if (closed) return;
         closed = true;
         clearInterval(keepalive);
+        clearInterval(healthTick);
         try {
           for (const ch of CHANNELS) {
             await client.query(`UNLISTEN ${ch}`);

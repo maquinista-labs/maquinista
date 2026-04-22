@@ -15,6 +15,10 @@ type SSEEvent = {
     | "agent_stop"
     | "tool_event"
     | "agent_status"
+    | "agent_turn_cost_new"
+    | "scheduled_jobs_change"
+    | "webhook_handlers_change"
+    | "dash.health_tick"
     | "error";
   data: unknown;
 };
@@ -90,6 +94,16 @@ export function useDashStream() {
           case "agent_stop":
             queryClient.invalidateQueries({ queryKey: ["agents"] });
             break;
+          case "agent_turn_cost_new":
+            queryClient.invalidateQueries({ queryKey: ["kpis"] });
+            break;
+          case "scheduled_jobs_change":
+          case "webhook_handlers_change":
+            queryClient.invalidateQueries({ queryKey: ["jobs"] });
+            break;
+          case "dash.health_tick":
+            queryClient.invalidateQueries({ queryKey: ["health"] });
+            break;
         }
         // No-op for payload for now; kept for future targeted cache
         // writes (e.g. update a single row in-place).
@@ -110,6 +124,10 @@ export function useDashStream() {
         bump("channel_delivery_new"),
       );
       source.addEventListener("agent_stop", bump("agent_stop"));
+      source.addEventListener("agent_turn_cost_new", bump("agent_turn_cost_new"));
+      source.addEventListener("scheduled_jobs_change", bump("scheduled_jobs_change"));
+      source.addEventListener("webhook_handlers_change", bump("webhook_handlers_change"));
+      source.addEventListener("dash.health_tick", bump("dash.health_tick"));
 
       // tool_event: re-dispatch as a DOM CustomEvent so per-agent hooks can
       // subscribe without opening a second SSE connection. Also invalidate

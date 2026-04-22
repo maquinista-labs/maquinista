@@ -19,6 +19,27 @@ test.describe("KPIs on /agents", () => {
     await cleanTables();
   });
 
+  test("KPI cost tile updates within 2 s of a turn insertion via SSE", async ({ page }) => {
+    await insertAgent({ id: "cost-live" });
+    await page.goto("/agents");
+
+    // Confirm the tile starts at $0.
+    const tile = page.getByTestId("kpi-cost-today");
+    await expect(tile).toBeVisible();
+    await expect(tile).toContainText("$0");
+
+    // Insert a turn cost AFTER the page is open — SSE should push the invalidation.
+    await insertTurnCost({
+      agentId: "cost-live",
+      model: "claude-sonnet-4-6",
+      inputUsdCents: 100,
+      outputUsdCents: 200,
+    });
+
+    // $3.00 = (100 + 200) / 100 — tile should tick within 2 s via SSE.
+    await expect(tile).toContainText("$3", { timeout: 2000 });
+  });
+
   test("tiles reflect the seeded fleet + cost", async ({ page }) => {
     await insertAgent({ id: "alpha" });
     await insertAgent({ id: "beta" });
@@ -98,5 +119,18 @@ test.describe("jobs page", () => {
     await page.goto("/jobs");
     await expect(page.getByTestId("jobs-scheduled-empty")).toBeVisible();
     await expect(page.getByTestId("jobs-webhooks-empty")).toBeVisible();
+  });
+
+  test("jobs list updates within 2 s of a scheduled_jobs INSERT via SSE", async ({ page }) => {
+    await insertAgent({ id: "sse-jobs-agent" });
+    await page.goto("/jobs");
+
+    // Page starts with no scheduled jobs.
+    await expect(page.getByTestId("jobs-scheduled-empty")).toBeVisible();
+
+    // Insert a job while the page is open — SSE should push the invalidation.
+    await insertScheduledJob({ name: "sse-new-job", agentId: "sse-jobs-agent" });
+
+    await expect(page.getByTestId("scheduled-sse-new-job")).toBeVisible({ timeout: 2000 });
   });
 });

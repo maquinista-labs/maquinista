@@ -21,7 +21,6 @@ export function KpiStrip({ initial }: { initial?: KPIs }) {
     },
     initialData: initial,
     staleTime: 10_000,
-    refetchInterval: 30_000,
   });
 
   const k = q.data;

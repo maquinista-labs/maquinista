@@ -23,7 +23,7 @@ export function SystemHealthCard() {
       return (await res.json()) as SystemHealth;
     },
     staleTime: 5_000,
-    refetchInterval: 5_000,
+    refetchOnWindowFocus: true,
   });
 
   const h = q.data;

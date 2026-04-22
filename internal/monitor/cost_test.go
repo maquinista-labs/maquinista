@@ -10,6 +10,19 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/dbtest"
 )
 
+// seedAgent inserts a minimal agents row satisfying the FK on agent_turn_costs.
+func seedAgent(t *testing.T, pool *pgxpool.Pool, id string) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, status, runner_type, role)
+		VALUES ($1,'s','0:1','working','claude','executor')
+		ON CONFLICT DO NOTHING
+	`, id); err != nil {
+		t.Fatalf("seedAgent %q: %v", id, err)
+	}
+}
+
 func migratedPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	pool, _ := dbtest.PgContainer(t)
@@ -36,15 +49,7 @@ func TestCaptureTurn_InsertsRowWithComputedCents(t *testing.T) {
 		t.Fatalf("seed model_rates: %v", err)
 	}
 
-	// Insert a minimum agents row so the FK is satisfied.
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO agents (id, tmux_session, tmux_window, status,
-		                    runner_type, role)
-		VALUES ('cost-agent','s','0:1','working','claude','executor')
-		ON CONFLICT DO NOTHING
-	`); err != nil {
-		t.Fatalf("seed agent: %v", err)
-	}
+	seedAgent(t, pool, "cost-agent")
 
 	started := time.Now().Add(-time.Second)
 	finished := time.Now()
@@ -88,14 +93,7 @@ func TestCaptureTurn_UnknownModelStillInserts(t *testing.T) {
 	pool := migratedPool(t)
 	ctx := context.Background()
 
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO agents (id, tmux_session, tmux_window, status,
-		                    runner_type, role)
-		VALUES ('cost-agent-u','s','0:1','working','claude','executor')
-		ON CONFLICT DO NOTHING
-	`); err != nil {
-		t.Fatalf("seed agent: %v", err)
-	}
+	seedAgent(t, pool, "cost-agent-u")
 
 	now := time.Now()
 	id, err := CaptureTurn(ctx, pool, TurnCost{
@@ -130,4 +128,198 @@ func TestCaptureTurn_RequiresAgentAndModel(t *testing.T) {
 	if _, err := CaptureTurn(ctx, pool, TurnCost{AgentID: "a"}); err == nil {
 		t.Fatal("missing Model did not error")
 	}
+}
+
+// TestCaptureTurn_NotifyFires verifies migration 030: a pg_notify on
+// channel "agent_turn_cost_new" fires within 1 s of CaptureTurn.
+// The payload must equal the agent_id that was inserted.
+func TestCaptureTurn_NotifyFires(t *testing.T) {
+	_, dsn := dbtest.PgContainer(t)
+	// Apply migrations to the fresh container.
+	pool2, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool2.Close)
+	if _, err := db.RunMigrations(pool2); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+
+	ctx := context.Background()
+	seedAgent(t, pool2, "notify-agent")
+
+	// Open a dedicated LISTEN connection (can't reuse a pool connection
+	// for LISTEN — the conn must stay checked out for the duration).
+	conn, err := pool2.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire listen conn: %v", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "LISTEN agent_turn_cost_new"); err != nil {
+		t.Fatalf("LISTEN: %v", err)
+	}
+
+	// Fire the insert from the pool (a different connection).
+	go func() {
+		_, _ = CaptureTurn(context.Background(), pool2, TurnCost{
+			AgentID:      "notify-agent",
+			Model:        "test-notify-model",
+			InputTokens:  100,
+			OutputTokens: 50,
+			FinishedAt:   time.Now(),
+		})
+	}()
+
+	waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+
+	notif, err := conn.Conn().WaitForNotification(waitCtx)
+	if err != nil {
+		t.Fatalf("WaitForNotification: %v (trigger may be missing — run migration 030)", err)
+	}
+	if notif.Channel != "agent_turn_cost_new" {
+		t.Errorf("channel = %q; want agent_turn_cost_new", notif.Channel)
+	}
+	if notif.Payload != "notify-agent" {
+		t.Errorf("payload = %q; want notify-agent", notif.Payload)
+	}
+}
+
+// TestScheduledJobsNotify verifies migration 031: INSERT, UPDATE, and DELETE
+// on scheduled_jobs each emit a pg_notify on "scheduled_jobs_change".
+func TestScheduledJobsNotify(t *testing.T) {
+	_, dsn := dbtest.PgContainer(t)
+	pool2, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool2.Close)
+	if _, err := db.RunMigrations(pool2); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+
+	ctx := context.Background()
+	seedAgent(t, pool2, "jobs-notify-agent")
+
+	conn, err := pool2.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "LISTEN scheduled_jobs_change"); err != nil {
+		t.Fatalf("LISTEN: %v", err)
+	}
+
+	expectNotif := func(op string) {
+		t.Helper()
+		waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		notif, err := conn.Conn().WaitForNotification(waitCtx)
+		if err != nil {
+			t.Fatalf("%s: WaitForNotification: %v", op, err)
+		}
+		if notif.Channel != "scheduled_jobs_change" {
+			t.Errorf("%s: channel = %q; want scheduled_jobs_change", op, notif.Channel)
+		}
+		if notif.Payload == "" {
+			t.Errorf("%s: empty payload; expected row id", op)
+		}
+	}
+
+	// INSERT
+	var jobID string
+	if err := pool2.QueryRow(ctx, `
+		INSERT INTO scheduled_jobs
+			(name, cron_expr, agent_id, prompt, enabled, next_run_at)
+		VALUES ('test-job','0 * * * *','jobs-notify-agent','{}',true,now()+interval'1h')
+		RETURNING id
+	`).Scan(&jobID); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	expectNotif("INSERT")
+
+	// UPDATE
+	if _, err := pool2.Exec(ctx,
+		`UPDATE scheduled_jobs SET enabled=false WHERE id=$1`, jobID,
+	); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	expectNotif("UPDATE")
+
+	// DELETE
+	if _, err := pool2.Exec(ctx,
+		`DELETE FROM scheduled_jobs WHERE id=$1`, jobID,
+	); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	expectNotif("DELETE")
+}
+
+// TestWebhookHandlersNotify verifies migration 031 for webhook_handlers.
+func TestWebhookHandlersNotify(t *testing.T) {
+	_, dsn := dbtest.PgContainer(t)
+	pool2, err := pgxpool.New(context.Background(), dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool2.Close)
+	if _, err := db.RunMigrations(pool2); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+
+	ctx := context.Background()
+	seedAgent(t, pool2, "wh-notify-agent")
+
+	conn, err := pool2.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("acquire: %v", err)
+	}
+	defer conn.Release()
+
+	if _, err := conn.Exec(ctx, "LISTEN webhook_handlers_change"); err != nil {
+		t.Fatalf("LISTEN: %v", err)
+	}
+
+	expectNotif := func(op string) {
+		t.Helper()
+		waitCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		notif, err := conn.Conn().WaitForNotification(waitCtx)
+		if err != nil {
+			t.Fatalf("%s: WaitForNotification: %v", op, err)
+		}
+		if notif.Channel != "webhook_handlers_change" {
+			t.Errorf("%s: channel = %q; want webhook_handlers_change", op, notif.Channel)
+		}
+		if notif.Payload == "" {
+			t.Errorf("%s: empty payload; expected row id", op)
+		}
+	}
+
+	var whID string
+	if err := pool2.QueryRow(ctx, `
+		INSERT INTO webhook_handlers
+			(name, path, secret, agent_id, prompt_template, enabled)
+		VALUES ('test-wh','/hook/test','s','wh-notify-agent','{{ payload }}',true)
+		RETURNING id
+	`).Scan(&whID); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	expectNotif("INSERT")
+
+	if _, err := pool2.Exec(ctx,
+		`UPDATE webhook_handlers SET enabled=false WHERE id=$1`, whID,
+	); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	expectNotif("UPDATE")
+
+	if _, err := pool2.Exec(ctx,
+		`DELETE FROM webhook_handlers WHERE id=$1`, whID,
+	); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	expectNotif("DELETE")
 }
