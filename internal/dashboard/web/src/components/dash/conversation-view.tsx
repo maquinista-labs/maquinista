@@ -219,10 +219,32 @@ export function ConversationView(props: Props) {
         {timeline.map((entry, index) => {
           if (entry.kind === "db") {
             const it = entry.item;
-            if (it.kind === "inbox") return null;
+            if (it.kind === "inbox") {
+              // User message — compact, right-aligned, no bubble chrome
+              return (
+                <motion.div
+                  key={`db-inbox-${it.id}`}
+                  data-testid={`conv-bubble-${it.id}`}
+                  className="flex w-full justify-end"
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ type: "spring", stiffness: 380, damping: 30, delay: Math.min(index * 0.04, 0.3) }}
+                >
+                  <div className="max-w-[70%] text-right">
+                    <p className="text-sm text-muted-foreground/70 leading-snug">
+                      {it.excerpt ?? ""}
+                    </p>
+                    <time className="text-[10px] text-muted-foreground/40">
+                      {new Date(it.at).toLocaleTimeString()}
+                    </time>
+                  </div>
+                </motion.div>
+              );
+            }
             return (
               <motion.div
-                key={`db-${it.kind}-${it.id}`}
+                key={`db-outbox-${it.id}`}
                 data-testid={`conv-bubble-${it.id}`}
                 className="flex w-full justify-start"
                 initial={{ opacity: 0, y: 12, scale: 0.96 }}
