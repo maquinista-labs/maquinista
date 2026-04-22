@@ -438,10 +438,17 @@ export async function computeKPIs(pool: Pool): Promise<KPIs> {
 export async function listJobs(pool: Pool): Promise<JobsList> {
   const [{ rows: scheduled }, { rows: webhooks }] = await Promise.all([
     pool.query(`
-      SELECT id, name, cron_expr, timezone, agent_id, enabled,
-             next_run_at, last_run_at
-      FROM scheduled_jobs
-      ORDER BY enabled DESC, next_run_at ASC
+      SELECT sj.id, sj.name, sj.cron_expr, sj.timezone,
+             sj.agent_id, sj.soul_template_id, st.name AS soul_template_name,
+             COALESCE(sj.context_markdown, '') AS context_markdown,
+             COALESCE(sj.agent_cwd, '') AS agent_cwd,
+             sj.enabled, sj.next_run_at, sj.last_run_at,
+             COUNT(je.id)::int AS run_count
+      FROM scheduled_jobs sj
+      LEFT JOIN soul_templates st ON st.id = sj.soul_template_id
+      LEFT JOIN job_executions je ON je.job_id = sj.id
+      GROUP BY sj.id, st.name
+      ORDER BY sj.enabled DESC, sj.next_run_at ASC
     `),
     pool.query(`
       SELECT id, name, path, agent_id, enabled, rate_limit_per_min
@@ -457,6 +464,10 @@ export async function listJobs(pool: Pool): Promise<JobsList> {
       cron_expr: r.cron_expr,
       timezone: r.timezone,
       agent_id: r.agent_id,
+      soul_template_id: r.soul_template_id,
+      soul_template_name: r.soul_template_name,
+      context_markdown: r.context_markdown,
+      agent_cwd: r.agent_cwd,
       enabled: r.enabled,
       next_run_at: r.next_run_at.toISOString
         ? r.next_run_at.toISOString()
@@ -466,6 +477,7 @@ export async function listJobs(pool: Pool): Promise<JobsList> {
           ? r.last_run_at.toISOString()
           : String(r.last_run_at)
         : null,
+      run_count: Number(r.run_count) || 0,
     })),
     webhooks: webhooks.map((r) => ({
       id: r.id,

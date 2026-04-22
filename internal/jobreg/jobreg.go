@@ -23,7 +23,10 @@ type Schedule struct {
 	Name            string         `yaml:"name"`
 	Cron            string         `yaml:"cron"`
 	Timezone        string         `yaml:"timezone,omitempty"`
-	AgentID         string         `yaml:"agent_id"`
+	AgentID         string         `yaml:"agent_id,omitempty"`
+	SoulTemplateID  string         `yaml:"soul_template_id,omitempty"`
+	ContextMarkdown string         `yaml:"context_markdown,omitempty"`
+	AgentCWD        string         `yaml:"agent_cwd,omitempty"`
 	Prompt          map[string]any `yaml:"prompt"`
 	ReplyChannel    map[string]any `yaml:"reply_channel,omitempty"`
 	WarmSpawnBefore string         `yaml:"warm_spawn_before,omitempty"` // pg interval (e.g. "10 minutes")
@@ -74,23 +77,36 @@ func AddSchedule(ctx context.Context, pool *pgxpool.Pool, s Schedule) (string, e
 		warmPtr = &s.WarmSpawnBefore
 	}
 
+	var agentIDPtr *string
+	if s.AgentID != "" {
+		agentIDPtr = &s.AgentID
+	}
+	var soulTemplateIDPtr *string
+	if s.SoulTemplateID != "" {
+		soulTemplateIDPtr = &s.SoulTemplateID
+	}
+
 	var id string
 	err = pool.QueryRow(ctx, `
 		INSERT INTO scheduled_jobs
-			(name, cron_expr, timezone, agent_id, prompt, reply_channel,
-			 warm_spawn_before, enabled, next_run_at)
-		VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7::interval, $8, $9)
+			(name, cron_expr, timezone, agent_id, soul_template_id, context_markdown, agent_cwd,
+			 prompt, reply_channel, warm_spawn_before, enabled, next_run_at)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10::interval, $11, $12)
 		ON CONFLICT (name) DO UPDATE SET
-			cron_expr = EXCLUDED.cron_expr,
-			timezone = EXCLUDED.timezone,
-			agent_id = EXCLUDED.agent_id,
-			prompt = EXCLUDED.prompt,
-			reply_channel = EXCLUDED.reply_channel,
+			cron_expr        = EXCLUDED.cron_expr,
+			timezone         = EXCLUDED.timezone,
+			agent_id         = EXCLUDED.agent_id,
+			soul_template_id = EXCLUDED.soul_template_id,
+			context_markdown = EXCLUDED.context_markdown,
+			agent_cwd        = EXCLUDED.agent_cwd,
+			prompt           = EXCLUDED.prompt,
+			reply_channel    = EXCLUDED.reply_channel,
 			warm_spawn_before = EXCLUDED.warm_spawn_before,
-			enabled = EXCLUDED.enabled,
-			next_run_at = EXCLUDED.next_run_at
+			enabled          = EXCLUDED.enabled,
+			next_run_at      = EXCLUDED.next_run_at
 		RETURNING id::text
-	`, s.Name, s.Cron, tz, s.AgentID, promptJSON, replyJSON, warmPtr, enabled, next).Scan(&id)
+	`, s.Name, s.Cron, tz, agentIDPtr, soulTemplateIDPtr, s.ContextMarkdown, s.AgentCWD,
+		promptJSON, replyJSON, warmPtr, enabled, next).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("insert: %w", err)
 	}
@@ -100,10 +116,16 @@ func AddSchedule(ctx context.Context, pool *pgxpool.Pool, s Schedule) (string, e
 // ListSchedules returns every schedule row, ordered by name.
 func ListSchedules(ctx context.Context, pool *pgxpool.Pool) ([]ScheduleRow, error) {
 	rows, err := pool.Query(ctx, `
-		SELECT id::text, name, cron_expr, timezone, agent_id, enabled,
-		       next_run_at, COALESCE(last_run_at, 'epoch'::timestamptz)
-		FROM scheduled_jobs
-		ORDER BY name
+		SELECT sj.id::text, sj.name, sj.cron_expr, sj.timezone,
+		       COALESCE(sj.agent_id, ''), sj.enabled,
+		       sj.next_run_at, COALESCE(sj.last_run_at, 'epoch'::timestamptz),
+		       COALESCE(sj.soul_template_id, ''),
+		       COALESCE(sj.context_markdown, ''),
+		       COALESCE(sj.agent_cwd, ''),
+		       COALESCE(st.name, '') AS soul_template_name
+		FROM scheduled_jobs sj
+		LEFT JOIN soul_templates st ON st.id = sj.soul_template_id
+		ORDER BY sj.name
 	`)
 	if err != nil {
 		return nil, err
@@ -112,7 +134,9 @@ func ListSchedules(ctx context.Context, pool *pgxpool.Pool) ([]ScheduleRow, erro
 	var out []ScheduleRow
 	for rows.Next() {
 		var r ScheduleRow
-		if err := rows.Scan(&r.ID, &r.Name, &r.Cron, &r.Timezone, &r.AgentID, &r.Enabled, &r.NextRunAt, &r.LastRunAt); err != nil {
+		if err := rows.Scan(&r.ID, &r.Name, &r.Cron, &r.Timezone, &r.AgentID,
+			&r.Enabled, &r.NextRunAt, &r.LastRunAt,
+			&r.SoulTemplateID, &r.ContextMarkdown, &r.AgentCWD, &r.SoulTemplateName); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -122,14 +146,18 @@ func ListSchedules(ctx context.Context, pool *pgxpool.Pool) ([]ScheduleRow, erro
 
 // ScheduleRow is the list-view projection.
 type ScheduleRow struct {
-	ID        string
-	Name      string
-	Cron      string
-	Timezone  string
-	AgentID   string
-	Enabled   bool
-	NextRunAt time.Time
-	LastRunAt time.Time
+	ID               string
+	Name             string
+	Cron             string
+	Timezone         string
+	AgentID          string
+	SoulTemplateID   string
+	SoulTemplateName string
+	ContextMarkdown  string
+	AgentCWD         string
+	Enabled          bool
+	NextRunAt        time.Time
+	LastRunAt        time.Time
 }
 
 // RmSchedule deletes a schedule by name. Idempotent — missing names are not an error.
@@ -317,8 +345,8 @@ func validateSchedule(s Schedule) error {
 	if strings.TrimSpace(s.Name) == "" {
 		return errors.New("name required")
 	}
-	if strings.TrimSpace(s.AgentID) == "" {
-		return errors.New("agent_id required")
+	if strings.TrimSpace(s.AgentID) == "" && strings.TrimSpace(s.SoulTemplateID) == "" {
+		return errors.New("agent_id or soul_template_id required")
 	}
 	if _, err := cron.ParseStandard(s.Cron); err != nil {
 		return fmt.Errorf("invalid cron %q: %w", s.Cron, err)

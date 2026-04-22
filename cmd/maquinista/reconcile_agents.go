@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/agent"
+	"github.com/maquinista-labs/maquinista/internal/agentspawn"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/git"
 	"github.com/maquinista-labs/maquinista/internal/state"
@@ -181,7 +182,7 @@ func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, b
 		log.Printf("reconcile: soul check for %s: %v (continuing)", agentID, err)
 	}
 
-	runnerCmd, env := resolveRunnerCommand(cfg, agentID, cwd, hasSoul, sessionID)
+	runnerCmd, env := agentspawn.ResolveRunnerCmd(cfg, agentID, cwd, hasSoul, sessionID)
 	windowID, err := tmux.NewWindow(cfg.TmuxSessionName, agentID, cwd, runnerCmd, env)
 	if err != nil {
 		return fmt.Errorf("new tmux window: %w", err)
@@ -195,7 +196,7 @@ func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, b
 
 	// Wait for the runner TUI so the inbox consumer's first send-keys
 	// lands on a live prompt. Same timeout we use in tier-3 spawn.
-	if err := waitForRunnerReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
+	if err := agentspawn.WaitForReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
 		log.Printf("reconcile: %s not ready within timeout: %v", agentID, err)
 		// If the pane is already gone and we were resuming a session, the
 		// session ID is stale. Kill the dead window, clear session_id and

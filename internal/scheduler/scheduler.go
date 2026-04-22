@@ -25,11 +25,31 @@ import (
 // be nil (lazy spawn).
 type EnsureLive func(ctx context.Context, agentID string) error
 
+// FiredJob carries all fields of a due scheduled_job row when
+// soul_template_id is set (fresh-agent spawn path).
+type FiredJob struct {
+	ID              string
+	Name            string
+	CronExpr        string
+	Timezone        string
+	AgentID         string // may be empty if soul_template_id set
+	SoulTemplateID  string // may be empty if agent_id set
+	ContextMarkdown string
+	AgentCWD        string
+	Prompt          []byte
+	ReplyChannel    []byte
+	NextRunAt       time.Time
+}
+
 // Config bundles scheduler knobs.
 type Config struct {
 	PollInterval time.Duration
 	EnsureLive   EnsureLive
-	Now          func() time.Time // test hook
+	// SpawnFunc is called instead of inbox-inject when a job has
+	// soul_template_id set. If nil, fresh-spawn jobs are skipped with a
+	// warning.
+	SpawnFunc func(ctx context.Context, job FiredJob) error
+	Now       func() time.Time // test hook
 }
 
 // DefaultConfig returns production defaults.
@@ -81,21 +101,25 @@ func drain(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 	}
 }
 
-// FireOne claims at most one due job and enqueues its inbox row. Returns
-// (true, nil) when a job fired, (false, nil) when nothing was due.
+// FireOne claims at most one due job and either enqueues its inbox row (legacy
+// agent_id path) or calls cfg.SpawnFunc (soul_template_id fresh-spawn path).
+// Returns (true, nil) when a job fired, (false, nil) when nothing was due.
 func FireOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, error) {
 	now := cfg.Now()
 
 	type job struct {
-		id           uuid.UUID
-		name         string
-		cronExpr     string
-		timezone     string
-		agentID      string
-		prompt       []byte
-		replyChannel []byte
-		warmSpawn    *time.Duration
-		nextRunAt    time.Time
+		id              uuid.UUID
+		name            string
+		cronExpr        string
+		timezone        string
+		agentID         string
+		soulTemplateID  string
+		contextMarkdown string
+		agentCWD        string
+		prompt          []byte
+		replyChannel    []byte
+		warmSpawn       *time.Duration
+		nextRunAt       time.Time
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -107,15 +131,19 @@ func FireOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, error) 
 	var j job
 	var warmInterval *string
 	err = tx.QueryRow(ctx, `
-		SELECT id, name, cron_expr, timezone, agent_id, prompt, reply_channel,
+		SELECT id, name, cron_expr, timezone,
+		       COALESCE(agent_id, ''), COALESCE(soul_template_id, ''),
+		       COALESCE(context_markdown, ''), COALESCE(agent_cwd, ''),
+		       prompt, reply_channel,
 		       warm_spawn_before::text, next_run_at
 		FROM scheduled_jobs
 		WHERE enabled AND next_run_at <= $1
 		ORDER BY next_run_at
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`, now).Scan(&j.id, &j.name, &j.cronExpr, &j.timezone, &j.agentID, &j.prompt,
-		&j.replyChannel, &warmInterval, &j.nextRunAt)
+	`, now).Scan(&j.id, &j.name, &j.cronExpr, &j.timezone,
+		&j.agentID, &j.soulTemplateID, &j.contextMarkdown, &j.agentCWD,
+		&j.prompt, &j.replyChannel, &warmInterval, &j.nextRunAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
@@ -127,53 +155,86 @@ func FireOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, error) 
 		j.warmSpawn = &d
 	}
 
-	// Warm-spawn the agent if requested and we're within the window.
-	if cfg.EnsureLive != nil && j.warmSpawn != nil && now.Add(*j.warmSpawn).After(j.nextRunAt) {
-		if err := cfg.EnsureLive(ctx, j.agentID); err != nil {
-			log.Printf("scheduler %s: ensure_live: %v", j.name, err)
-		}
-	}
-
-	fireTS := j.nextRunAt.UTC().Format(time.RFC3339)
-	externalID := fmt.Sprintf("sched:%s:%s", j.id, fireTS)
-
-	// Pull reply_channel fields for inbox origin_* columns. When the job
-	// has no reply channel, fall back to a synthetic channel='scheduled'
-	// so the UNIQUE (origin_channel, external_msg_id) idempotency catches
-	// restart-duplicate fires — Postgres UNIQUE treats NULLs as distinct.
-	channel, userID, threadID, chatID := unpackReplyChannel(j.replyChannel)
-	if channel == "" {
-		channel = "scheduled"
-	}
-
-	inboxMsg := mailbox.InboxMessage{
-		AgentID:        j.agentID,
-		FromKind:       "scheduled",
-		FromID:         j.id.String(),
-		OriginChannel:  channel,
-		OriginUserID:   userID,
-		OriginThreadID: threadID,
-		OriginChatID:   chatID,
-		ExternalMsgID:  externalID,
-		Content:        j.prompt,
-	}
-	inboxID, inserted, err := mailbox.EnqueueInbox(ctx, tx, inboxMsg)
-	if err != nil {
-		return false, fmt.Errorf("enqueue inbox: %w", err)
-	}
-	_ = inserted // duplicate fire (scheduler crash-restart) is benign: caller stats only
-
-	// Advance next_run_at via robfig/cron in the configured TZ.
+	// Advance next_run_at via robfig/cron in the configured TZ (computed
+	// before the inbox enqueue so we can commit in one shot regardless of path).
 	next, err := nextAfter(j.cronExpr, j.timezone, now)
 	if err != nil {
 		return false, fmt.Errorf("cron next: %w", err)
 	}
 
+	var inboxID uuid.UUID // zero value → nil in last_inbox_id for spawn path
+
+	if j.soulTemplateID != "" {
+		// Fresh-agent spawn path: delegate to SpawnFunc (wired in cmd_start).
+		if cfg.SpawnFunc == nil {
+			log.Printf("scheduler %s: soul_template_id set but no SpawnFunc configured; skipping", j.name)
+		} else {
+			fj := FiredJob{
+				ID:              j.id.String(),
+				Name:            j.name,
+				CronExpr:        j.cronExpr,
+				Timezone:        j.timezone,
+				AgentID:         j.agentID,
+				SoulTemplateID:  j.soulTemplateID,
+				ContextMarkdown: j.contextMarkdown,
+				AgentCWD:        j.agentCWD,
+				Prompt:          j.prompt,
+				ReplyChannel:    j.replyChannel,
+				NextRunAt:       j.nextRunAt,
+			}
+			if err := cfg.SpawnFunc(ctx, fj); err != nil {
+				return false, fmt.Errorf("spawn job %s: %w", j.name, err)
+			}
+		}
+	} else {
+		// Legacy inbox-inject path.
+
+		// Warm-spawn the agent if requested and we're within the window.
+		if cfg.EnsureLive != nil && j.warmSpawn != nil && now.Add(*j.warmSpawn).After(j.nextRunAt) {
+			if err := cfg.EnsureLive(ctx, j.agentID); err != nil {
+				log.Printf("scheduler %s: ensure_live: %v", j.name, err)
+			}
+		}
+
+		fireTS := j.nextRunAt.UTC().Format(time.RFC3339)
+		externalID := fmt.Sprintf("sched:%s:%s", j.id, fireTS)
+
+		// Pull reply_channel fields for inbox origin_* columns.
+		channel, userID, threadID, chatID := unpackReplyChannel(j.replyChannel)
+		if channel == "" {
+			channel = "scheduled"
+		}
+
+		inboxMsg := mailbox.InboxMessage{
+			AgentID:        j.agentID,
+			FromKind:       "scheduled",
+			FromID:         j.id.String(),
+			OriginChannel:  channel,
+			OriginUserID:   userID,
+			OriginThreadID: threadID,
+			OriginChatID:   chatID,
+			ExternalMsgID:  externalID,
+			Content:        j.prompt,
+		}
+		var inserted bool
+		inboxID, inserted, err = mailbox.EnqueueInbox(ctx, tx, inboxMsg)
+		if err != nil {
+			return false, fmt.Errorf("enqueue inbox: %w", err)
+		}
+		_ = inserted // duplicate fire is benign
+	}
+
+	// For the fresh-spawn path (soulTemplateID set), inboxID remains the zero
+	// UUID — pass nil so last_inbox_id stays NULL (avoids FK violation).
+	var inboxIDArg interface{}
+	if inboxID != (uuid.UUID{}) {
+		inboxIDArg = inboxID
+	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE scheduled_jobs
 		SET next_run_at = $2, last_run_at = $3, last_inbox_id = $4
 		WHERE id = $1
-	`, j.id, next, now, inboxID); err != nil {
+	`, j.id, next, now, inboxIDArg); err != nil {
 		return false, fmt.Errorf("advance job: %w", err)
 	}
 

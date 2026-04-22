@@ -12,9 +12,9 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maquinista-labs/maquinista/internal/agentspawn"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/memory"
-	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
@@ -157,7 +157,7 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			agentID,
 		).Scan(&resumeSessionID)
 
-		runnerCmd, env := resolveRunnerCommand(cfg, agentID, cwd, hasSoul, resumeSessionID)
+		runnerCmd, env := agentspawn.ResolveRunnerCmd(cfg, agentID, cwd, hasSoul, resumeSessionID)
 
 		windowID, err := tmux.NewWindow(cfg.TmuxSessionName, agentID, cwd, runnerCmd, env)
 		if err != nil {
@@ -167,7 +167,7 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			agentID, cfg.TmuxSessionName, windowID, cwd, runnerCmd, hasSoul)
 
 		// Block until the runner's TUI is ready to accept keystrokes.
-		if err := waitForRunnerReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
+		if err := agentspawn.WaitForReady(cfg.TmuxSessionName, windowID, 15*time.Second); err != nil {
 			log.Printf("spawn_topic_agent: %s not ready within timeout: %v (first message may need manual Enter)",
 				agentID, err)
 		}
@@ -190,53 +190,6 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		}
 		return agentID, nil
 	}
-}
-
-// waitForRunnerReady polls the tmux pane until the interactive runner is
-// ready to accept input, or the timeout elapses. Detects the Claude TUI
-// prompt (`❯` chevron) and OpenCode's build-status bar; falls back to a
-// short settle delay for unknown runners. Tuned for the first-message
-// race where send-keys arrives before the TUI has drawn its prompt.
-func waitForRunnerReady(session, windowID string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		text, err := tmux.CapturePane(session, windowID, false)
-		if err == nil && runnerReady(text) {
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	// One last capture for the error message.
-	text, _ := tmux.CapturePane(session, windowID, false)
-	return fmt.Errorf("runner did not become ready in %s; last pane snippet: %q",
-		timeout, lastLine(text))
-}
-
-// runnerReady returns true when the pane text carries a known
-// "accepting input" marker. Keep the matches loose so minor TUI version
-// bumps don't break startup — readiness detection is best-effort; the
-// caller logs and continues on timeout anyway.
-func runnerReady(paneText string) bool {
-	switch {
-	// Claude Code prompt — "❯" chevron at the start of a line, plus the
-	// permissions footer that only renders once the TUI is live.
-	case strings.Contains(paneText, "\n❯") || strings.HasPrefix(paneText, "❯"):
-		return true
-	case strings.Contains(paneText, "bypass permissions on"):
-		return true
-	// OpenCode — the "Build" status bar appears once the TUI is up.
-	case strings.Contains(paneText, "Build "):
-		return true
-	}
-	return false
-}
-
-func lastLine(s string) string {
-	s = strings.TrimRight(s, "\n")
-	if i := strings.LastIndex(s, "\n"); i >= 0 {
-		return s[i+1:]
-	}
-	return s
 }
 
 // isLiveStatus matches an agent status against the "pane should be up"
@@ -267,60 +220,3 @@ func tmuxWindowExists(session, windowID string) bool {
 	return false
 }
 
-// resolveRunnerCommand picks the shell command line for the configured
-// runner.
-//
-//  - hasSoul=true and fresh start (resumeSessionID=="") → append
-//    `--system-prompt "$(maquinista soul render <id>)"` for Claude-family
-//    runners. DB is source of truth for identity.
-//  - resumeSessionID != "" → append the runner's "resume this session"
-//    flag (claude/openclaude: --resume <sid>; opencode: --session <sid>)
-//    and SKIP --system-prompt because the resumed session already has
-//    the original system prompt in its history.
-func resolveRunnerCommand(cfg *config.Config, agentID, cwd string, hasSoul bool, resumeSessionID string) (string, map[string]string) {
-	env := map[string]string{
-		"AGENT_ID":    agentID,
-		"RUNNER_TYPE": cfg.DefaultRunner,
-	}
-	if cfg.DatabaseURL != "" {
-		env["DATABASE_URL"] = cfg.DatabaseURL
-	}
-	r, rerr := runner.Get(cfg.DefaultRunner)
-	if rerr != nil {
-		cmd := cfg.ClaudeCommand
-		if cmd == "" {
-			cmd = "claude"
-		}
-		return cmd, env
-	}
-	for k, v := range r.EnvOverrides() {
-		env[k] = v
-	}
-
-	cmd := r.LaunchCommand(runner.Config{WorkDir: cwd, Env: env})
-
-	// Resume path: runner-native flag, no soul injection (the stored
-	// session already has it).
-	if resumeSessionID != "" {
-		switch r.Name() {
-		case "claude", "openclaude":
-			return fmt.Sprintf("%s --resume %s", cmd, resumeSessionID), env
-		case "opencode":
-			return fmt.Sprintf("%s --session %s", cmd, resumeSessionID), env
-		}
-		// Unknown runner — fall through to fresh-launch path.
-	}
-
-	if !hasSoul {
-		return cmd, env
-	}
-	switch r.Name() {
-	case "claude", "openclaude":
-		maquinistaBin := cfg.MaquinistaBin
-		if maquinistaBin == "" {
-			maquinistaBin = "maquinista"
-		}
-		cmd = fmt.Sprintf(`%s --system-prompt "$(%s soul render %s)"`, cmd, maquinistaBin, agentID)
-	}
-	return cmd, env
-}
