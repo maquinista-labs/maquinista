@@ -219,34 +219,22 @@ export function ConversationView(props: Props) {
         {timeline.map((entry, index) => {
           if (entry.kind === "db") {
             const it = entry.item;
-            const right = it.kind === "outbox";
+            if (it.kind === "outbox") return null;
             return (
               <motion.div
                 key={`db-${it.kind}-${it.id}`}
                 data-testid={`conv-bubble-${it.id}`}
-                className={cn("flex w-full", right ? "justify-end" : "justify-start")}
+                className="flex w-full justify-start"
                 initial={{ opacity: 0, y: 12, scale: 0.96 }}
                 animate={{ opacity: 1, y: 0, scale: 1 }}
                 exit={{ opacity: 0, scale: 0.95, y: -4 }}
                 transition={{ type: "spring", stiffness: 380, damping: 30, delay: Math.min(index * 0.04, 0.3) }}
               >
-                <div
-                  className={cn(
-                    "max-w-[80%] rounded-2xl px-3 py-2 text-sm",
-                    right
-                      ? "bg-primary/12 text-foreground border border-primary/20"
-                      : "bg-muted/50 text-foreground border border-border/60",
-                  )}
-                >
+                <div className="max-w-[80%] rounded-2xl px-3 py-2 text-sm bg-muted/50 text-foreground border border-border/60">
                   <ReactMarkdown components={mdComponents} remarkPlugins={[remarkGfm]}>
                     {it.excerpt ?? "*empty*"}
                   </ReactMarkdown>
-                  <time
-                    className={cn(
-                      "mt-1 block text-[10px] text-muted-foreground",
-                      right ? "text-right" : "text-left",
-                    )}
-                  >
+                  <time className="mt-1 block text-[10px] text-muted-foreground text-left">
                     {new Date(it.at).toLocaleTimeString()}
                   </time>
                 </div>

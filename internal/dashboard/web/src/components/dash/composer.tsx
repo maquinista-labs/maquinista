@@ -19,7 +19,7 @@ export function Composer({
   const [text, setText] = useState("");
   const [busy, setBusy] = useState(false);
   const queryClient = useQueryClient();
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
 
   async function submit(payload: string) {
     if (!payload.trim() || busy) return;
@@ -38,6 +38,9 @@ export function Composer({
         throw new Error(body.error ?? `HTTP ${res.status}`);
       }
       setText("");
+      if (inputRef.current) {
+        inputRef.current.style.height = "auto";
+      }
       toast.success("sent");
       // Optimistic: invalidate relevant queries so the row shows up
       // even if SSE is slow to fire (local fallback).
@@ -82,20 +85,30 @@ export function Composer({
         </div>
       )}
       <form
-        className="flex items-center gap-2 p-2"
+        className="flex items-end gap-2 p-2"
         onSubmit={(e) => {
           e.preventDefault();
           void submit(text);
         }}
       >
-        <input
+        <textarea
           ref={inputRef}
           data-testid="composer-input"
-          className="flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
+          className="flex-1 resize-none overflow-hidden rounded-md border border-input bg-background px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-ring"
           placeholder={`Message ${agentId}`}
           value={text}
-          onChange={(e) => setText(e.target.value)}
-          enterKeyHint="send"
+          rows={1}
+          onChange={(e) => {
+            setText(e.target.value);
+            e.target.style.height = "auto";
+            e.target.style.height = `${e.target.scrollHeight}px`;
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              void submit(text);
+            }
+          }}
           autoComplete="off"
           disabled={busy}
         />
