@@ -224,9 +224,6 @@ func (b *Bot) sendMessageInThread(chatID int64, threadID int, text string) (tgbo
 	resp, err := b.api.MakeRequest("sendMessage", params)
 	if err != nil {
 		if wait := parseRetryAfter(err); wait > 0 {
-			if b.msgQueue != nil {
-				b.msgQueue.HandleFloodError(chatID, err)
-			}
 			log.Printf("sendMessageInThread: rate limited, retrying after %v", wait)
 			time.Sleep(wait)
 			resp, err = b.api.MakeRequest("sendMessage", params)
@@ -286,9 +283,6 @@ func (b *Bot) sendMessageWithKeyboard(chatID int64, threadID int, text string, k
 	resp, err := b.api.MakeRequest("sendMessage", params)
 	if err != nil {
 		if wait := parseRetryAfter(err); wait > 0 {
-			if b.msgQueue != nil {
-				b.msgQueue.HandleFloodError(chatID, err)
-			}
 			log.Printf("sendMessageWithKeyboard: rate limited, retrying after %v", wait)
 			time.Sleep(wait)
 			resp, err = b.api.MakeRequest("sendMessage", params)

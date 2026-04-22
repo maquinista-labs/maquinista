@@ -11,6 +11,51 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 )
 
+// enqueueInboxText enqueues text to agent_inbox for callback-query flows (directory
+// picker, window picker, dead-window recovery) where no *tgbotapi.Message is available.
+// extMsgID must be a stable caller-supplied idempotency key. Returns false when the DB
+// path is unavailable so the caller can fall back to tmux.SendKeysWithDelay.
+func (b *Bot) enqueueInboxText(agentID string, chatID int64, userIDInt int64, threadID int, extMsgID, text string) bool {
+	pool := b.getPool()
+	if pool == nil {
+		return false
+	}
+	userIDStr := strconv.FormatInt(userIDInt, 10)
+	threadIDStr := strconv.Itoa(threadID)
+	content, err := json.Marshal(map[string]string{"type": "text", "text": text})
+	if err != nil {
+		log.Printf("mailbox.inbound: marshal: %v", err)
+		return false
+	}
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		log.Printf("mailbox.inbound: begin: %v", err)
+		return false
+	}
+	defer tx.Rollback(ctx)
+	_, _, err = mailbox.EnqueueInbox(ctx, tx, mailbox.InboxMessage{
+		AgentID:        agentID,
+		FromKind:       "user",
+		FromID:         userIDStr,
+		OriginChannel:  "telegram",
+		OriginUserID:   userIDStr,
+		OriginThreadID: threadIDStr,
+		OriginChatID:   &chatID,
+		ExternalMsgID:  extMsgID,
+		Content:        content,
+	})
+	if err != nil {
+		log.Printf("mailbox.inbound: enqueue: %v", err)
+		return false
+	}
+	if err := tx.Commit(ctx); err != nil {
+		log.Printf("mailbox.inbound: commit: %v", err)
+		return false
+	}
+	return true
+}
+
 // routeTextViaInbox writes msg to agent_inbox as an idempotent row keyed by
 // (origin_channel='telegram', external_msg_id=update_id). Returns true when
 // the row was enqueued or collapsed to an existing row (idempotent replay);

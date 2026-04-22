@@ -149,10 +149,14 @@ func (b *Bot) handleWinBind(cq *tgbotapi.CallbackQuery, wps *windowPickerState, 
 	// Update picker message
 	b.editMessageText(chatID, messageID, fmt.Sprintf("Bound to: %s", displayName))
 
-	// Send pending text
+	// Send pending text through the inbox so the per-agent sidecar delivers it
+	// with the same guarantees as a normal user turn.
 	if pendingText != "" {
-		if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, window.ID, pendingText, 500); err != nil {
-			log.Printf("Error sending pending text: %v", err)
+		extMsgID := fmt.Sprintf("winbind:%d:%d", chatID, messageID)
+		if !b.enqueueInboxText(window.ID, int64(chatID), userID, threadID, extMsgID, pendingText) {
+			if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, window.ID, pendingText, 500); err != nil {
+				log.Printf("Error sending pending text: %v", err)
+			}
 		}
 	}
 }

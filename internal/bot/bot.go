@@ -11,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/bridge"
 	"github.com/maquinista-labs/maquinista/internal/config"
-	"github.com/maquinista-labs/maquinista/internal/queue"
 	"github.com/maquinista-labs/maquinista/internal/routing"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/state"
@@ -48,8 +47,6 @@ type Bot struct {
 	monitorState *state.MonitorState
 	// Minuano CLI bridge
 	minuanoBridge *bridge.Bridge
-	// Message queue (set after construction via SetQueue)
-	msgQueue *queue.Queue
 	// DB pool (optional, connected lazily on first use)
 	pool   *pgxpool.Pool
 	poolMu sync.Mutex
@@ -325,11 +322,6 @@ func (b *Bot) State() *state.State {
 // Config returns the bot's config.
 func (b *Bot) Config() *config.Config {
 	return b.config
-}
-
-// SetQueue sets the message queue reference for flood control checks.
-func (b *Bot) SetQueue(q *queue.Queue) {
-	b.msgQueue = q
 }
 
 // SetDefaultRunner sets the default runner for agent spawning.

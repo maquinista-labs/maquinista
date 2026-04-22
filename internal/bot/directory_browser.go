@@ -402,10 +402,15 @@ func (b *Bot) handleDirConfirm(cq *tgbotapi.CallbackQuery, bs *BrowseState, user
 	// Update the browser message
 	b.editMessageText(chatID, bs.MessageID, fmt.Sprintf("Bound to: %s", result.WindowName))
 
-	// Send pending text
+	// Send pending text through the inbox so the per-agent sidecar delivers it
+	// with the same guarantees as a normal user turn. Fall back to direct pty
+	// write when no DB pool is available.
 	if pendingText != "" {
-		if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, result.WindowID, pendingText, 500); err != nil {
-			log.Printf("Error sending pending text: %v", err)
+		extMsgID := fmt.Sprintf("dirbrowse:%d:%d", bs.ChatID, bs.MessageID)
+		if !b.enqueueInboxText(result.WindowID, bs.ChatID, userID, bs.ThreadID, extMsgID, pendingText) {
+			if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, result.WindowID, pendingText, 500); err != nil {
+				log.Printf("Error sending pending text: %v", err)
+			}
 		}
 	}
 }
