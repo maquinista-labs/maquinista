@@ -41,7 +41,6 @@ export function Composer({
       if (inputRef.current) {
         inputRef.current.style.height = "auto";
       }
-      toast.success("sent");
       // Optimistic: invalidate relevant queries so the row shows up
       // even if SSE is slow to fire (local fallback).
       queryClient.invalidateQueries({ queryKey: ["inbox", agentId] });
