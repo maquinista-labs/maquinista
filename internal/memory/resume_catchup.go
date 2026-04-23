@@ -53,6 +53,15 @@ func BuildCatchup(ctx context.Context, q Querier, agentID string, since time.Tim
 		sections = append(sections, sb.String())
 	}
 
+	// Soul edits (core_truths, boundaries, vibe, continuity).
+	soulSection, err := soulSince(ctx, q, agentID, since)
+	if err != nil {
+		return nil, fmt.Errorf("catchup soul: %w", err)
+	}
+	if soulSection != "" {
+		sections = append(sections, soulSection)
+	}
+
 	if len(sections) == 0 {
 		return &CatchupPayload{HasDelta: false}, nil
 	}
@@ -105,6 +114,45 @@ func blocksSince(ctx context.Context, q Querier, agentID string, since time.Time
 		out = append(out, b)
 	}
 	return out, rows.Err()
+}
+
+// soulSince returns a "## Soul updated" section if the agent_souls row was
+// modified after since, listing only the non-empty narrative fields that
+// changed. Returns "" when the soul is absent or untouched.
+func soulSince(ctx context.Context, q Querier, agentID string, since time.Time) (string, error) {
+	var updatedAt time.Time
+	var coreTruths, boundaries, vibe, continuity string
+	err := q.QueryRow(ctx, `
+		SELECT updated_at,
+		       COALESCE(core_truths,''), COALESCE(boundaries,''),
+		       COALESCE(vibe,''), COALESCE(continuity,'')
+		FROM agent_souls WHERE agent_id = $1 AND updated_at > $2
+	`, agentID, since).Scan(&updatedAt, &coreTruths, &boundaries, &vibe, &continuity)
+	if err != nil {
+		// ErrNoRows means soul untouched or absent — not an error.
+		return "", nil
+	}
+
+	type field struct{ name, value string }
+	fields := []field{
+		{"core_truths", coreTruths},
+		{"boundaries", boundaries},
+		{"vibe", vibe},
+		{"continuity", continuity},
+	}
+	var sb strings.Builder
+	sb.WriteString("## Soul updated\n")
+	any := false
+	for _, f := range fields {
+		if f.value != "" {
+			sb.WriteString(fmt.Sprintf("- %s: %s\n", f.name, truncate(f.value, 200)))
+			any = true
+		}
+	}
+	if !any {
+		return "", nil
+	}
+	return sb.String(), nil
 }
 
 func truncate(s string, limit int) string {
