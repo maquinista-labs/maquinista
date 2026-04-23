@@ -1,5 +1,7 @@
 # Resume-side memory refresh
 
+> **Phase 1 shipped** (2026-04-22): `injectResumeCatchup` in `reconcile_agents.go` + `internal/memory/resume_catchup.go`. Phase 2 (continuous drift) not started.
+
 > This plan adheres to §0 of `reference/maquinista-v2.md`: **Postgres is the system of record**. No markdown files, no JSON on disk, no dotfiles for persistent state.
 
 ## Context
