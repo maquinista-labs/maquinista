@@ -218,6 +218,80 @@ src/components/dash/agent-detail-tabs.tsx                   S.1, M.1
   id=...` returns `true`.
 - Forget a passage → row disappears from the list.
 
+## Reference: openclaw dreaming / consolidation status architecture
+
+Captured here for future borrowing when the dreaming UI becomes relevant
+(see `plans/postponed/memory-dreaming-sweep.md`).
+
+### Pipeline overview
+
+openclaw runs a **three-phase nightly sweep** triggered by a managed
+`scheduled_jobs`-style cron at 3 AM:
+
+| Phase | What it does | Writes? |
+|-------|-------------|---------|
+| **Light** | Ingests daily notes + session transcripts into the short-term recall store; dedupes by Jaccard similarity (threshold 0.88) | No |
+| **Deep** | Scores candidates via 6-weighted signals; promotes entries that clear all three gates | Yes → MEMORY.md |
+| **REM** | Extracts concept tags and thematic patterns; reinforces phase-signal boosts for next cycle | No |
+
+### Scoring model (6 components)
+
+```
+frequency    0.24  count of short-term signals
+relevance    0.30  average retrieval quality score
+diversity    0.15  distinct query + day contexts
+recency      0.15  time-decayed freshness (14-day half-life)
+consolidation 0.10 multi-day recurrence spacing
+conceptual   0.06  concept-tag density
+```
+
+Promotion gates (all three must pass):
+- `score >= 0.75` (default)
+- `recallCount >= 3`
+- `uniqueQueries >= 2`
+
+Phase boosts applied on top: light phase +6% max, REM phase +9% max,
+both decaying exponentially with 14-day half-life.
+
+### Storage (file-based, maquinista equivalent in parens)
+
+| openclaw file | Contents | Maquinista equivalent |
+|---|---|---|
+| `memory/.dreams/short-term-recall.json` | Per-entry signal counts, scores, dates, query hashes, concept tags, promotion state | `agent_memories` with `tier='signal'` |
+| `memory/.dreams/phase-signals.json` | Light/REM hit counts + decay timestamps per entry | `score` float on `agent_memories` |
+| `memory/.dreams/daily-ingestion.json` | File fingerprints to detect deltas | not needed (DB writes are atomic) |
+| `memory/.dreams/session-ingestion.json` | Message dedup hashes per session scope | `agent_inbox` dedup via `external_msg_id` |
+| `DREAMS.md` | Dream diary — poetic first-person narratives from a sub-agent | no equivalent yet |
+| `MEMORY.md` | Promoted long-term memory | `agent_memories` with `tier='long_term'` |
+
+### Dashboard UI (openclaw's Dreaming tab)
+
+The UI exposes five sub-tabs:
+
+1. **Scene** — current cycle status: phase (light/deep/REM/idle), promoted-today count, next scheduled run, lock state
+2. **Diary** — date-navigable DREAMS.md entries rendered as prose
+3. **Advanced** — staged candidates, short-term waiting entries, promoted entries with per-entry score breakdowns
+4. **Memory Palace** — wiki-style compiled knowledge vault (separate plan: `dashboard-memory-palace.md`)
+5. **Imported Insights** — clustered entries imported from external sources (ChatGPT exports etc.) with risk levels
+
+### What to borrow for maquinista
+
+When dreaming ships (Option B or C from `postponed/memory-dreaming-sweep.md`):
+
+- **Score breakdown per passage** in the archival list — show the 6-component
+  weights so operators can understand why a signal row did/didn't promote.
+  Maquinista has a single `score` float; would need component columns added to
+  `agent_memories` to match.
+- **Next scheduled run** indicator — surface the `scheduled_jobs.next_run_at`
+  for the agent's autoflush/dream job in the Memory tab footer.
+- **Promotion log** — openclaw's `agent_memory_events` equivalent (audit table
+  from the dreaming plan) rendered as a collapsible feed: "promoted X → long_term",
+  "discarded Y (score 0.61 < 0.75)".
+- **Dream narrative** — the poetic diary is a nice UX touch but non-essential;
+  lower priority than the score breakdown and promotion log.
+
+---
+
 ## Open questions
 
 1. **SSE invalidation scope.** The existing `useDashStream` hook handles
