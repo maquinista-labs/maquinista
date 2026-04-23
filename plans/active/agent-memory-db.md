@@ -42,7 +42,7 @@ key, value)` as a stub — this plan supersedes it.
 | W1 — SeedDefaultBlocks wiring | ✅ shipped | `runAgentAdd` + `SpawnFresh` both call `SeedDefaultBlocks` |
 | W2 — Autoflush wiring | ✅ shipped | Per-agent `scheduled_jobs` row (every 6h) at agent-add time; `maquinista memory autoflush` for manual trigger |
 | 4 — Auto-flush pattern | ✅ wired | `autoflush.go` already connected via `internal/bot/handlers.go:108` |
-| 4 — Dreaming sweep | ❌ not started | |
+| 4 — Dreaming sweep | ❌ not started | see `plans/active/memory-dreaming-sweep.md` |
 | Phase 1 resume-memory-refresh | ✅ shipped | `injectResumeCatchup` in `reconcile_agents.go`; `internal/memory/resume_catchup.go` |
 | 5 — Shared archives | ✅ shipped | `032_agent_archives.sql`; `internal/memory/archive.go` |
 
@@ -50,7 +50,7 @@ key, value)` as a stub — this plan supersedes it.
 
 ## Scope
 
-Remaining work: dreaming sweep (Phase 4 remainder).
+Remaining work: dreaming sweep — tracked in `plans/active/memory-dreaming-sweep.md`.
 
 ### Phase 0 — Three-layer memory model (Letta-inspired)
 
