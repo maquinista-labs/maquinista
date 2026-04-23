@@ -9,41 +9,8 @@ func TestTelegramSink_Name(t *testing.T) {
 	}
 }
 
-func TestTelegramSink_SkipsWhenChatIDZero(t *testing.T) {
-	// chatID=0 should return early without touching the queue.
-	// A nil queue means any real enqueue attempt would panic — so if we
-	// reach the Enqueue call, the test panics, which counts as failure.
+func TestTelegramSink_HandleIsNoop(t *testing.T) {
 	s := NewTelegramSink(nil)
-	e := AgentEvent{
-		Kind:   AgentEventText,
-		ChatID: 0, // skip condition
-		Text:   "hello",
-		Role:   "assistant",
-	}
-	// Should not panic.
-	s.Handle(e)
-}
-
-func TestTelegramSink_SkipsWhenQueueNil(t *testing.T) {
-	s := NewTelegramSink(nil)
-	e := AgentEvent{
-		Kind:   AgentEventText,
-		ChatID: 12345, // non-zero
-		Text:   "hello",
-		Role:   "assistant",
-	}
-	// Should not panic when queue is nil.
-	s.Handle(e)
-}
-
-func TestTelegramSink_SkipsUnknownKind(t *testing.T) {
-	// An event with a zero Kind (unrecognized) should be skipped.
-	s := NewTelegramSink(nil)
-	e := AgentEvent{
-		Kind:   AgentEventKind(""), // zero value — no case matches
-		ChatID: 12345,
-		Text:   "something",
-	}
-	// Should not panic.
-	s.Handle(e)
+	// Handle must be a no-op and must not panic regardless of input.
+	s.Handle(AgentEvent{Kind: AgentEventText, ChatID: 12345, Text: "hello"})
 }

@@ -156,6 +156,8 @@ func (b *Bot) plannerReopen(msg *tgbotapi.Message, chatID int64, threadID int, t
 			plannerCmd = fmt.Sprintf("claude --dangerously-skip-permissions --system-prompt \"$(cat %s)\"",
 				b.config.PlannerPromptPath)
 		}
+		// Intentionally bypasses the inbox: plannerCmd is a shell command that
+		// relaunches the runner binary, not a user turn message.
 		if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, windowID, plannerCmd, 500); err != nil {
 			if tmux.IsWindowDead(err) {
 				// Window is dead, fall through to create new one

@@ -21,7 +21,6 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/monitor"
 	"github.com/maquinista-labs/maquinista/internal/sidecar"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
-	"github.com/maquinista-labs/maquinista/internal/queue"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/scheduler"
 	"github.com/maquinista-labs/maquinista/internal/state"
@@ -177,9 +176,6 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	liveBindings := b.ReconcileState()
 	log.Printf("Startup: %d live bindings recovered", liveBindings)
 
-	q := queue.New(b.API())
-	b.SetQueue(q)
-
 	// Ensure a DB pool is available before constructing monitor sources — the
 	// Phase A DB-backed session discovery requires it. Sources tolerate a
 	// nil pool (no sessions discovered until the pool lands).
@@ -238,7 +234,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	activeInboxMap := &mailbox.ActiveInboxMap{}
 
 	sink := monitor.NewMultiSink()
-	sink.Add(monitor.NewTelegramSink(q))
+	sink.Add(monitor.NewTelegramSink(nil))
 	if pool != nil {
 		sink.Add(monitor.NewOutboxSink(pool, activeInboxMap))
 		sink.Add(monitor.NewToolEventSink(pool))
@@ -253,7 +249,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	mon.AddSource(openclaudeSrc)
 	mon.PlanHandler = b.HandlePlanFromMonitor
 
-	sp := bot.NewStatusPoller(b, q, mon, pool)
+	sp := bot.NewStatusPoller(b, mon, pool)
 
 	go mon.Run(ctx)
 	go sp.Run(ctx)

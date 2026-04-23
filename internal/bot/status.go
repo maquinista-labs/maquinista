@@ -11,7 +11,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
-	"github.com/maquinista-labs/maquinista/internal/queue"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
 
@@ -26,16 +25,15 @@ var animFrames = []string{"☕", "⏳", "✨", "🔮"}
 
 // StatusPoller polls Claude's terminal for status line changes and sends updates.
 type StatusPoller struct {
-	bot                 *Bot
-	queue               *queue.Queue
-	monitor             *monitor.Monitor
-	pool                *pgxpool.Pool
-	mu                  sync.RWMutex
-	lastStatus          map[statusKey]string // last status text per user+thread
-	lastNotifiedStatus  map[string]string    // windowID → last pg_notify'd status
-	missCount           map[string]int       // windowID → consecutive miss count
-	animFrame           map[statusKey]int    // animation frame per user+thread
-	pollInterval        time.Duration
+	bot                *Bot
+	monitor            *monitor.Monitor
+	pool               *pgxpool.Pool
+	mu                 sync.RWMutex
+	lastStatus         map[statusKey]string // last status text per user+thread
+	lastNotifiedStatus map[string]string    // windowID → last pg_notify'd status
+	missCount          map[string]int       // windowID → consecutive miss count
+	animFrame          map[statusKey]int    // animation frame per user+thread
+	pollInterval       time.Duration
 }
 
 // missThreshold is how many consecutive polls must miss the status
@@ -43,10 +41,9 @@ type StatusPoller struct {
 const missThreshold = 3
 
 // NewStatusPoller creates a new StatusPoller.
-func NewStatusPoller(bot *Bot, q *queue.Queue, mon *monitor.Monitor, pool *pgxpool.Pool) *StatusPoller {
+func NewStatusPoller(bot *Bot, mon *monitor.Monitor, pool *pgxpool.Pool) *StatusPoller {
 	return &StatusPoller{
 		bot:                bot,
-		queue:              q,
 		monitor:            mon,
 		pool:               pool,
 		lastStatus:         make(map[statusKey]string),
@@ -227,11 +224,6 @@ func (sp *StatusPoller) poll() {
 					continue
 				}
 
-				// Skip status updates when queue has pending messages — content takes priority
-				if sp.queue != nil && sp.queue.QueueLen(userID) > 0 {
-					continue
-				}
-
 				sp.mu.Lock()
 				sp.lastStatus[key] = statusText
 				frame := sp.animFrame[key]
@@ -239,16 +231,7 @@ func (sp *StatusPoller) poll() {
 				sp.mu.Unlock()
 
 				displayText := animFrames[frame] + " " + statusText
-				if sp.queue != nil {
-					sp.queue.Enqueue(queue.MessageTask{
-						UserID:      userID,
-						ThreadID:    threadID,
-						ChatID:      chatID,
-						Parts:       []string{displayText},
-						ContentType: "status_update",
-						WindowID:    windowID,
-					})
-				}
+				sp.bot.reply(chatID, threadID, displayText)
 			} else if lastText != "" && misses >= missThreshold {
 				// Status cleared — only after consecutive misses to avoid flicker
 				sp.mu.Lock()
@@ -256,34 +239,10 @@ func (sp *StatusPoller) poll() {
 				delete(sp.animFrame, key)
 				sp.mu.Unlock()
 
-				// Check for turn timing
-				var timingText string
 				if sp.monitor != nil {
 					if start, ok := sp.monitor.GetAndClearTurnStart(windowID); ok {
-						elapsed := time.Since(start)
-						timingText = formatDuration(elapsed)
+						sp.bot.reply(chatID, threadID, formatDuration(time.Since(start)))
 					}
-				}
-
-				if sp.queue != nil {
-					if timingText != "" {
-						// Send timing as content before clearing status
-						sp.queue.Enqueue(queue.MessageTask{
-							UserID:      userID,
-							ThreadID:    threadID,
-							ChatID:      chatID,
-							Parts:       []string{timingText},
-							ContentType: "content",
-							WindowID:    windowID,
-						})
-					}
-					sp.queue.Enqueue(queue.MessageTask{
-						UserID:      userID,
-						ThreadID:    threadID,
-						ChatID:      chatID,
-						ContentType: "status_clear",
-						WindowID:    windowID,
-					})
 				}
 			}
 		}

@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"path/filepath"
 	"strconv"
@@ -215,10 +216,14 @@ func (b *Bot) handleDeadWindow(msg *tgbotapi.Message, windowID, pendingText stri
 		b.saveState()
 	}
 
-	// Send pending text to new session
+	// Send pending text through the inbox so the per-agent sidecar delivers it
+	// with the same guarantees as a normal user turn.
 	if pendingText != "" {
-		if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, result.WindowID, pendingText, 500); err != nil {
-			log.Printf("Error sending pending text after recovery: %v", err)
+		extMsgID := fmt.Sprintf("%d:%d", msg.Chat.ID, msg.MessageID)
+		if !b.enqueueInboxText(result.WindowID, chatID, msg.From.ID, threadIDInt, extMsgID, pendingText) {
+			if err := tmux.SendKeysWithDelay(b.config.TmuxSessionName, result.WindowID, pendingText, 500); err != nil {
+				log.Printf("Error sending pending text after recovery: %v", err)
+			}
 		}
 	}
 
