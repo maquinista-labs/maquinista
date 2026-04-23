@@ -31,13 +31,53 @@ injection.
 Related: `multi-agent-registry.md` §Phase 4 sketches `agent_memory(agent_id,
 key, value)` as a stub — this plan supersedes it.
 
+## Shipped status (as of 2026-04-23)
+
+| Phase | Status | Notes |
+|-------|--------|-------|
+| 0 — agent_blocks (core) | ✅ shipped | `017_agent_memory.sql`, `internal/memory/memory.go` |
+| 1 — agent_memories (archival) + CLI | ✅ shipped | CRUD, FTS search, pin, `maquinista memory` commands |
+| 2 — Vector search | ✅ migration shipped | `020_memory_vector_optional.sql`; gated by config |
+| 3 — Spawn-time injection | ✅ shipped | `soul.ComposeForAgent` reads blocks + archival; called by `maquinista soul render` which is subshell'd at spawn |
+| 4 — Auto-flush | ✅ `autoflush.go` written | **Not wired** — see gap §W2 below |
+| 4 — Dreaming sweep | ❌ not started | |
+| 5 — Shared archives | ❌ not started | |
+
+### Wiring gaps (must fix before memory is fully live)
+
+**W1 — `SeedDefaultBlocks` not called from `maquinista agent add`**
+
+`SeedDefaultBlocks` is called only in `cmd/maquinista/spawn_topic_agent.go`
+(the per-topic tier-3 path). Persistent agents created via `maquinista agent
+add` never get their default `persona` / `human` / `task-note` blocks seeded,
+so `ComposeForAgent` returns empty blocks for them.
+
+Fix: call `memory.SeedDefaultBlocks(ctx, pool, agentID, seedPersona)` from
+`runAgentAdd` in `cmd/maquinista/cmd_agent.go` after the soul is created,
+passing the soul's `core_truths` as `seedPersona`. Also call it from
+`agentspawn.SpawnFresh` (job-spawned agents) for the same reason.
+
+**W2 — `autoflush.go` not triggered**
+
+`internal/memory/autoflush.go` defines the flush logic but nothing calls it.
+It needs to be wired to one of:
+
+- The sidecar: after each inbox row is acked, check if the session has exceeded
+  `cfg.Memory.FlushAfterTokens`; if so, inject a flush turn via the inbox.
+- A scheduled job: a `scheduled_jobs` row per agent (every 2 h) that calls
+  `maquinista memory autoflush <agentID>`. Simpler, avoids token counting.
+
+Recommended path: scheduled job, since token counting requires parsing the
+transcript and the scheduler already handles cron. Add a
+`cmd/maquinista/cmd_memory.go autoflush` subcommand that shells out to the
+`autoflush.Run` function and wire a per-agent job row at `agent add` time.
+
+---
+
 ## Scope
 
-Five phases. Phase 0 introduces a two-tier storage split (core
-blocks + archival passages) inspired by Letta — too load-bearing not
-to adopt. Phase 1 is the minimum viable archival surface; 2–4 add
-search, auto-flush, and the dreaming sweep; 5 enables cross-agent
-memory sharing via archives.
+Phases 0–3 are shipped. Remaining work: wiring gaps W1/W2, dreaming sweep
+(Phase 4 remainder), and shared archives (Phase 5).
 
 ### Phase 0 — Three-layer memory model (Letta-inspired)
 
@@ -458,57 +498,51 @@ deletes via CLI are audited in `agent_memory_events`.
 
 ## Files
 
-New:
+Shipped:
 
-- `internal/db/migrations/015a_agent_blocks.sql` (Phase 0)
-- `internal/db/migrations/015_agent_memories.sql` (Phase 1)
-- `internal/db/migrations/016_agent_memories_vector.sql` (Phase 2 optional)
-- `internal/db/migrations/017_agent_archives.sql` (Phase 5)
-- `internal/memory/blocks.go` — `Block`, `Append`, `Replace`, `Read`,
-  char-limit enforcement (Phase 0).
-- `internal/memory/memory.go` — archival passage CRUD.
-- `internal/memory/inject.go` — `FetchForInjection` + `Render` (blocks
-  rendered as `<memory_blocks>` XML, archival summary appended).
-- `internal/memory/archive.go` — shared archives (Phase 5).
-- `internal/memory/flush.go` — auto-flush driver (Phase 4).
-- `internal/memory/dreaming.go` — promotion sweep (Phase 4).
-- `internal/memory/provider.go` — pluggable external-provider interface.
-- `cmd/maquinista/cmd_memory.go` — cobra group.
+- `internal/db/migrations/017_agent_memory.sql` — agent_blocks + agent_memories tables
+- `internal/db/migrations/019_memory_cross_agent.sql` — cross-agent sharing groundwork
+- `internal/db/migrations/020_memory_vector_optional.sql` — pgvector index (optional)
+- `internal/memory/memory.go` — Block + Memory CRUD, FetchForInjection, Search
+- `internal/memory/autoflush.go` — auto-flush logic (written, not wired)
+- `internal/soul/compose.go` — ComposeForAgent (soul + blocks + archival → system prompt)
 
-Modified:
+Still needed:
 
-- `cmd/maquinista/cmd_start_reconcile.go` — renders blocks + archival
-  summary into the system prompt tempfile.
-- `internal/config/config.go` — `Memory` config section.
-- `internal/agent/soul.go` — agent creation seeds default blocks
-  (`persona`, `human`, `task-note`) alongside soul.
+- `internal/db/migrations/NNN_agent_archives.sql` — agent_archives + archive_members (Phase 5)
+- `internal/memory/archive.go` — shared archive CRUD + search expansion (Phase 5)
+- `internal/memory/dreaming.go` — signal-tier promotion sweep (Phase 4 remainder)
+- `cmd/maquinista/cmd_memory.go` — add `autoflush` subcommand (gap W2)
+
+Modified (still needed):
+
+- `cmd/maquinista/cmd_agent.go` — call `SeedDefaultBlocks` in `runAgentAdd` (gap W1)
+- `internal/agentspawn/agentspawn.go` — call `SeedDefaultBlocks` in `SpawnFresh` (gap W1)
+- `internal/scheduler/scheduler.go` or `cmd_start.go` — register per-agent autoflush
+  scheduled job at agent-add time (gap W2)
 
 ## Verification per phase
 
-- **Phase 0** — `./maquinista agent add alice` → three rows in
-  `agent_blocks` with labels persona/human/task-note. Send agent a
-  message: "remember I prefer pt-BR". Check that a `core_memory_append`
-  tool call lands, `agent_blocks.value` for `label='human'` gains the
-  fact, and respawning the agent surfaces it in the rendered prompt.
-- **Phase 1** — `maquinista memory remember maquinista --tier long_term
-  --category feedback --title "be terse" --body "no trailing summaries"`
-  then `memory list maquinista` → row visible.
-- **Phase 2** — `maquinista memory search maquinista "terse"` returns
-  the row with a snippet. Re-insert the same body → embedding_cache
-  hit (log line or metric).
-- **Phase 3** — pin the row; `./maquinista start` → tmux pane's system
-  prompt tempfile contains a `## Memory / ### Pinned` section with the
-  row, plus `<memory_blocks>` XML with persona/human blocks. Sending
-  "what's your tone preference?" on Telegram → reply cites the memory.
-- **Phase 4** — burn through 30 K tokens in a session → next turn ends
-  with a silent tool call inserting a new memory row (`source='auto_flush'`).
-  Flip the dreaming cron on for the test agent, wait one tick → signal
-  rows with score above threshold either promoted or kept, and
-  `agent_memory_events` has one row per decision.
-- **Phase 5** — `maquinista archive create team-notes maquinista` →
-  archive row. `maquinista archive grant team-notes alice --role reader`
-  → junction row. Alice's `memory_search` now returns rows maquinista
-  inserted with `archive='team-notes'`.
+- **W1 (block seeding)** — `maquinista agent add alice` → three rows in
+  `agent_blocks` (persona/human/task-note). `maquinista soul render alice`
+  includes a `<memory_blocks>` section. Currently broken — blocks are only
+  seeded on tier-3 topic-agent spawn, not `agent add`.
+- **W2 (autoflush wiring)** — per-agent scheduled job row appears in
+  `scheduled_jobs` after `maquinista agent add`. Running
+  `maquinista memory autoflush <id>` produces `memory_remember` tool calls
+  and inserts rows with `source='auto_flush'`.
+- **Phase 3 (inject check)** — `maquinista memory remember maquinista
+  --tier long_term --category feedback --title "be terse" --body "…" --pin`;
+  `./maquinista start` → `maquinista soul render maquinista` output contains
+  the pinned row under `## Memory`. Telegram message "what's your tone?" →
+  reply cites it.
+- **Phase 4 dreaming** — insert signal-tier rows; run dreaming cron; rows
+  above score threshold promoted to long_term; `agent_memory_events` has one
+  row per decision.
+- **Phase 5** — `maquinista archive create team-notes maquinista` → archive
+  row. `maquinista archive grant team-notes alice --role reader` → junction
+  row. Alice's `memory_search` returns rows maquinista inserted with
+  `archive='team-notes'`.
 
 ## Open questions
 
