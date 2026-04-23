@@ -259,6 +259,46 @@ var memBlocksCmd = &cobra.Command{
 	},
 }
 
+// memRefreshCmd is the Phase 2 tool from resume-memory-refresh.md.
+// The agent calls `maquinista memory refresh $AGENT_ID` mid-session when its
+// context feels stale. It prints the catch-up diff since agents.started_at
+// (same payload as the resume inject) and then advances started_at so the
+// window slides forward. If nothing changed it exits silently with code 0.
+var memRefreshCmd = &cobra.Command{
+	Use:   "refresh <agent-id>",
+	Short: "Print memory/soul deltas since last spawn (agent calls this mid-session)",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		agentID := args[0]
+		if err := connectDB(); err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		var startedAt time.Time
+		if err := pool.QueryRow(ctx, `SELECT started_at FROM agents WHERE id=$1`, agentID).Scan(&startedAt); err != nil {
+			return fmt.Errorf("agent not found: %w", err)
+		}
+
+		payload, err := memory.BuildCatchup(ctx, pool, agentID, startedAt)
+		if err != nil {
+			return fmt.Errorf("build catchup: %w", err)
+		}
+		if !payload.HasDelta {
+			fmt.Println("No updates since last spawn.")
+			return nil
+		}
+
+		fmt.Println(payload.Text)
+
+		// Advance started_at so repeated refresh calls don't re-report the
+		// same deltas.
+		_, err = pool.Exec(ctx, `UPDATE agents SET started_at=NOW() WHERE id=$1`, agentID)
+		return err
+	},
+}
+
 func init() {
 	memRememberCmd.Flags().StringVar(&memRememberTier, "tier", "long_term", "tier: long_term | daily | signal")
 	memRememberCmd.Flags().StringVar(&memRememberCategory, "category", "fact", "category: feedback | project | reference | fact | preference | other")
@@ -284,6 +324,7 @@ func init() {
 		memUnpinCmd,
 		memBlocksCmd,
 		memAutoflushCmd,
+		memRefreshCmd,
 	)
 	rootCmd.AddCommand(memoryCmd)
 }
