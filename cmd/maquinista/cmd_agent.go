@@ -18,10 +18,9 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Phase 3 of plans/active/multi-agent-registry.md — manage persistent
-// agent rows (role='user') from the CLI. Task-scoped agents (task_id
-// != NULL) are owned by the orchestrator; these subcommands don't
-// touch them.
+// Manage persistent agent rows (role='user') from the CLI. Task-scoped
+// agents (task_id != NULL) are owned by the orchestrator; these
+// subcommands don't touch them.
 
 var agentCmd = &cobra.Command{
 	Use:   "agent",
@@ -34,7 +33,6 @@ var (
 	agentAddCWD          string
 	agentAddHandle       string
 	agentAddSoulTemplate string
-	agentAddSystemPrompt string
 	agentAddPersona      string
 	agentAddScope        string
 	agentAddRepoRoot     string
@@ -69,7 +67,7 @@ var agentKillCmd = &cobra.Command{
 
 var agentEditCmd = &cobra.Command{
 	Use:   "edit <agent-id>",
-	Short: "Update agent-level settings (persona / system prompt / runner / cwd)",
+	Short: "Update agent-level settings (persona / runner / cwd / scope)",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runAgentEdit(args[0])
@@ -125,15 +123,13 @@ func init() {
 	agentAddCmd.Flags().StringVar(&agentAddCWD, "cwd", "", "agent working directory")
 	agentAddCmd.Flags().StringVar(&agentAddHandle, "handle", "", "friendly @-handle (unique, lowercase a-z0-9_-)")
 	agentAddCmd.Flags().StringVar(&agentAddSoulTemplate, "soul-template", "", "soul template id (default: 'default')")
-	agentAddCmd.Flags().StringVar(&agentAddSystemPrompt, "system-prompt", "", "file to load into agent_settings.system_prompt")
-	agentAddCmd.Flags().StringVar(&agentAddPersona, "persona", "", "agent_settings.persona text")
+	agentAddCmd.Flags().StringVar(&agentAddPersona, "persona", "", "persona label (written to soul.core_truths)")
 	agentAddCmd.Flags().StringVar(&agentAddScope, "scope", "shared", "workspace scope: shared | agent | task (see plans/active/workspace-scopes.md)")
 	agentAddCmd.Flags().StringVar(&agentAddRepoRoot, "repo", "", "project git repo root (required when --scope=agent; defaults to --cwd if that's a git repo)")
 
 	agentEditCmd.Flags().StringVar(&agentAddRunner, "runner", "", "new runner_type")
 	agentEditCmd.Flags().StringVar(&agentAddCWD, "cwd", "", "new agent working directory")
-	agentEditCmd.Flags().StringVar(&agentAddSystemPrompt, "system-prompt", "", "new system prompt file")
-	agentEditCmd.Flags().StringVar(&agentAddPersona, "persona", "", "new persona text")
+	agentEditCmd.Flags().StringVar(&agentAddPersona, "persona", "", "new persona (written to soul.core_truths)")
 	agentEditCmd.Flags().StringVar(&agentAddScope, "scope", "", "new workspace scope (shared | agent | task); empty = unchanged")
 	agentEditCmd.Flags().StringVar(&agentAddRepoRoot, "repo", "", "new project git repo root; empty = unchanged")
 
@@ -261,24 +257,15 @@ func runAgentAdd(id string) error {
 		}
 	}
 
-	// agent_settings — optional persona / system_prompt.
-	sysPrompt := ""
-	if agentAddSystemPrompt != "" {
-		b, err := os.ReadFile(agentAddSystemPrompt)
-		if err != nil {
-			return fmt.Errorf("read --system-prompt file: %w", err)
-		}
-		sysPrompt = string(b)
-	}
-	if sysPrompt != "" || agentAddPersona != "" {
+	// agent_settings.persona — cosmetic display label read by the dashboard.
+	if agentAddPersona != "" {
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO agent_settings (agent_id, persona, system_prompt)
-			VALUES ($1, NULLIF($2, ''), NULLIF($3, ''))
+			INSERT INTO agent_settings (agent_id, persona)
+			VALUES ($1, $2)
 			ON CONFLICT (agent_id) DO UPDATE SET
-				persona       = COALESCE(EXCLUDED.persona, agent_settings.persona),
-				system_prompt = COALESCE(EXCLUDED.system_prompt, agent_settings.system_prompt),
-				updated_at    = NOW()
-		`, id, agentAddPersona, sysPrompt); err != nil {
+				persona    = EXCLUDED.persona,
+				updated_at = NOW()
+		`, id, agentAddPersona); err != nil {
 			return fmt.Errorf("agent_settings upsert: %w", err)
 		}
 	}
@@ -424,21 +411,6 @@ func runAgentEdit(id string) error {
 	if agentAddRepoRoot != "" {
 		if _, err := tx.Exec(ctx, `UPDATE agents SET workspace_repo_root=$1 WHERE id=$2`, agentAddRepoRoot, id); err != nil {
 			return fmt.Errorf("set workspace_repo_root: %w", err)
-		}
-	}
-	if agentAddSystemPrompt != "" {
-		b, err := os.ReadFile(agentAddSystemPrompt)
-		if err != nil {
-			return fmt.Errorf("read --system-prompt file: %w", err)
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO agent_settings (agent_id, system_prompt)
-			VALUES ($1, $2)
-			ON CONFLICT (agent_id) DO UPDATE SET
-				system_prompt = EXCLUDED.system_prompt,
-				updated_at    = NOW()
-		`, id, string(b)); err != nil {
-			return fmt.Errorf("agent_settings.system_prompt: %w", err)
 		}
 	}
 	if agentAddPersona != "" {
