@@ -13,6 +13,8 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/git"
+	"github.com/maquinista-labs/maquinista/internal/jobreg"
+	"github.com/maquinista-labs/maquinista/internal/memory"
 	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
@@ -280,6 +282,19 @@ func runAgentAdd(id string) error {
 		return fmt.Errorf("soul create: %w", err)
 	}
 
+	// Seed default memory blocks (persona/human/task-note). The soul's
+	// core_truths prime the persona block so the agent starts with
+	// identity context rather than an empty slate.
+	seedPersona := agentAddPersona
+	if seedPersona == "" {
+		if s, lerr := soul.Load(ctx, tx, id); lerr == nil && s != nil {
+			seedPersona = s.CoreTruths
+		}
+	}
+	if err := memory.SeedDefaultBlocks(ctx, tx, id, seedPersona); err != nil {
+		return fmt.Errorf("seed memory blocks: %w", err)
+	}
+
 	// Phase 6 of plans/active/workspace-scopes.md: every agent gets a
 	// default workspace row at creation so the "workspaces as children"
 	// invariant holds for new agents too (migration 028 backfilled
@@ -296,6 +311,21 @@ func runAgentAdd(id string) error {
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
+
+	// Register a per-agent periodic autoflush scheduled job. Fires every
+	// 6 hours and sends the agent a housekeeping prompt to save durable
+	// facts via memory_remember. Uses ON CONFLICT upsert so re-running
+	// `agent add` is idempotent.
+	flushPrompt := "Routine memory housekeeping: review our recent conversation and use memory_remember to save any durable facts, preferences, or lessons worth keeping long-term. Keep entries ≤1 paragraph; categorize as feedback/project/reference/fact/preference. If nothing is worth keeping, acknowledge briefly."
+	if _, aerr := jobreg.AddSchedule(ctx, pool, jobreg.Schedule{
+		Name:    "autoflush:" + id,
+		Cron:    "0 */6 * * *",
+		AgentID: id,
+		Prompt:  map[string]any{"type": "text", "text": flushPrompt},
+	}); aerr != nil {
+		fmt.Printf("Warning: could not register autoflush job for %s: %v\n", id, aerr)
+	}
+
 	fmt.Printf("Added agent %s (runner=%s, cwd=%s, scope=%s, workspace=%s)\n",
 		id, agentAddRunner, cwd, scope, wsID)
 	return nil

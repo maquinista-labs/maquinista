@@ -9,12 +9,16 @@ import (
 	"path/filepath"
 	"time"
 
+	"encoding/json"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/agent"
 	"github.com/maquinista-labs/maquinista/internal/agentspawn"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/git"
+	"github.com/maquinista-labs/maquinista/internal/mailbox"
+	"github.com/maquinista-labs/maquinista/internal/memory"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 )
@@ -212,6 +216,16 @@ func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, b
 		}
 	}
 
+	// On resume, inject a catch-up system turn with any memory/block
+	// changes accumulated while the daemon was offline. This keeps the
+	// resumed session in sync with DB edits (memory_remember calls,
+	// soul edits, operator imports) that happened between stop and start.
+	if sessionID != "" {
+		if cerr := injectResumeCatchup(ctx, pool, agentID); cerr != nil {
+			log.Printf("reconcile: catch-up inject for %s: %v (continuing)", agentID, cerr)
+		}
+	}
+
 	// Publish the new tmux_window. Database controls status; only update
 	// tmux_window (derived state). Never override stop_requested or status.
 	upCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -229,5 +243,55 @@ func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, b
 		botState.SetWindowDisplayName(windowID, agentID)
 		_ = botState.Save(filepath.Join(cfg.MaquinistaDir, "state.json"))
 	}
+	return nil
+}
+
+// injectResumeCatchup reads the agent's started_at timestamp, builds a
+// diff of memory/block changes since then, and — if there are any —
+// enqueues a system inbox row so the resumed session catches up. Then
+// updates started_at=NOW() so the next resume window starts fresh.
+func injectResumeCatchup(ctx context.Context, pool *pgxpool.Pool, agentID string) error {
+	var startedAt time.Time
+	if err := pool.QueryRow(ctx, `SELECT started_at FROM agents WHERE id=$1`, agentID).Scan(&startedAt); err != nil {
+		return fmt.Errorf("read started_at: %w", err)
+	}
+
+	payload, err := memory.BuildCatchup(ctx, pool, agentID, startedAt)
+	if err != nil {
+		return fmt.Errorf("build catchup: %w", err)
+	}
+	if !payload.HasDelta {
+		return nil
+	}
+
+	content, _ := json.Marshal(map[string]string{"type": "text", "text": payload.Text})
+	extMsgID := fmt.Sprintf("catchup:%s:%d", agentID, startedAt.Unix())
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, _, err := mailbox.EnqueueInbox(ctx, tx, mailbox.InboxMessage{
+		AgentID:       agentID,
+		FromKind:      "system",
+		FromID:        "resume-catchup",
+		OriginChannel: "a2a:catchup",
+		ExternalMsgID: extMsgID,
+		Content:       content,
+	}); err != nil {
+		return fmt.Errorf("enqueue catchup: %w", err)
+	}
+
+	// Advance started_at so the next resume catches up from now.
+	if _, err := tx.Exec(ctx, `UPDATE agents SET started_at=NOW() WHERE id=$1`, agentID); err != nil {
+		return fmt.Errorf("advance started_at: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	log.Printf("reconcile: injected memory catch-up for %s (%d bytes)", agentID, len(payload.Text))
 	return nil
 }

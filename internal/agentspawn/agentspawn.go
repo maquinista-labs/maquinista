@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/config"
+	"github.com/maquinista-labs/maquinista/internal/memory"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
@@ -65,6 +66,16 @@ func SpawnFresh(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, p F
 	// 2. Clone soul template.
 	if err := soul.CreateFromTemplate(ctx, pool, p.AgentID, p.SoulTemplateID, soul.Overrides{}); err != nil {
 		log.Printf("agentspawn: soul create for %s: %v (continuing)", p.AgentID, err)
+	}
+
+	// Seed default memory blocks. Prime the persona block from the soul's
+	// core_truths so the agent starts with identity context.
+	var seedPersona string
+	if s, lerr := soul.Load(ctx, pool, p.AgentID); lerr == nil && s != nil {
+		seedPersona = s.CoreTruths
+	}
+	if err := memory.SeedDefaultBlocks(ctx, pool, p.AgentID, seedPersona); err != nil {
+		log.Printf("agentspawn: seed memory blocks for %s: %v (continuing)", p.AgentID, err)
 	}
 
 	// 3. Ensure tmux session.

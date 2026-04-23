@@ -31,53 +31,26 @@ injection.
 Related: `multi-agent-registry.md` §Phase 4 sketches `agent_memory(agent_id,
 key, value)` as a stub — this plan supersedes it.
 
-## Shipped status (as of 2026-04-23)
+## Shipped status (as of 2026-04-22)
 
 | Phase | Status | Notes |
 |-------|--------|-------|
 | 0 — agent_blocks (core) | ✅ shipped | `017_agent_memory.sql`, `internal/memory/memory.go` |
-| 1 — agent_memories (archival) + CLI | ✅ shipped | CRUD, FTS search, pin, `maquinista memory` commands |
+| 1 — agent_memories (archival) + CLI | ✅ shipped | CRUD, FTS search, pin; `maquinista memory` commands in `cmd_memory.go` |
 | 2 — Vector search | ✅ migration shipped | `020_memory_vector_optional.sql`; gated by config |
-| 3 — Spawn-time injection | ✅ shipped | `soul.ComposeForAgent` reads blocks + archival; called by `maquinista soul render` which is subshell'd at spawn |
-| 4 — Auto-flush | ✅ `autoflush.go` written | **Not wired** — see gap §W2 below |
+| 3 — Spawn-time injection | ✅ shipped | `soul.ComposeForAgent` reads blocks + archival; called at spawn via `maquinista soul render` |
+| W1 — SeedDefaultBlocks wiring | ✅ shipped | `runAgentAdd` + `SpawnFresh` both call `SeedDefaultBlocks` |
+| W2 — Autoflush wiring | ✅ shipped | Per-agent `scheduled_jobs` row (every 6h) at agent-add time; `maquinista memory autoflush` for manual trigger |
+| 4 — Auto-flush pattern | ✅ wired | `autoflush.go` already connected via `internal/bot/handlers.go:108` |
 | 4 — Dreaming sweep | ❌ not started | |
-| 5 — Shared archives | ❌ not started | |
-
-### Wiring gaps (must fix before memory is fully live)
-
-**W1 — `SeedDefaultBlocks` not called from `maquinista agent add`**
-
-`SeedDefaultBlocks` is called only in `cmd/maquinista/spawn_topic_agent.go`
-(the per-topic tier-3 path). Persistent agents created via `maquinista agent
-add` never get their default `persona` / `human` / `task-note` blocks seeded,
-so `ComposeForAgent` returns empty blocks for them.
-
-Fix: call `memory.SeedDefaultBlocks(ctx, pool, agentID, seedPersona)` from
-`runAgentAdd` in `cmd/maquinista/cmd_agent.go` after the soul is created,
-passing the soul's `core_truths` as `seedPersona`. Also call it from
-`agentspawn.SpawnFresh` (job-spawned agents) for the same reason.
-
-**W2 — `autoflush.go` not triggered**
-
-`internal/memory/autoflush.go` defines the flush logic but nothing calls it.
-It needs to be wired to one of:
-
-- The sidecar: after each inbox row is acked, check if the session has exceeded
-  `cfg.Memory.FlushAfterTokens`; if so, inject a flush turn via the inbox.
-- A scheduled job: a `scheduled_jobs` row per agent (every 2 h) that calls
-  `maquinista memory autoflush <agentID>`. Simpler, avoids token counting.
-
-Recommended path: scheduled job, since token counting requires parsing the
-transcript and the scheduler already handles cron. Add a
-`cmd/maquinista/cmd_memory.go autoflush` subcommand that shells out to the
-`autoflush.Run` function and wire a per-agent job row at `agent add` time.
+| Phase 1 resume-memory-refresh | ✅ shipped | `injectResumeCatchup` in `reconcile_agents.go`; `internal/memory/resume_catchup.go` |
+| 5 — Shared archives | ✅ shipped | `032_agent_archives.sql`; `internal/memory/archive.go` |
 
 ---
 
 ## Scope
 
-Phases 0–3 are shipped. Remaining work: wiring gaps W1/W2, dreaming sweep
-(Phase 4 remainder), and shared archives (Phase 5).
+Remaining work: dreaming sweep (Phase 4 remainder).
 
 ### Phase 0 — Three-layer memory model (Letta-inspired)
 
