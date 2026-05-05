@@ -32,7 +32,7 @@ GO_SRC := $(shell find . -type f -name '*.go' -not -path './$(DASHBOARD_WEB_DIR)
 #   make build SKIP_DASHBOARD=1
 SKIP_DASHBOARD ?=
 
-.PHONY: build build-go test vet clean \
+.PHONY: build build-go test vet clean up down \
         dashboard-test dashboard-web-dev dashboard-web-test \
         dashboard-e2e dashboard-e2e-install
 
@@ -127,3 +127,11 @@ dashboard-e2e: $(DASHBOARD_NODE_MODULES) $(DASHBOARD_STANDALONE_TGZ)
 # Install Playwright's browser binaries + OS libs (requires sudo).
 dashboard-e2e-install:
 	cd $(DASHBOARD_WEB_DIR) && npx playwright install --with-deps
+
+# --- infrastructure --------------------------------------------------------
+
+up:
+	docker compose -f docker/docker-compose.yml up -d
+
+down:
+	docker compose -f docker/docker-compose.yml down
