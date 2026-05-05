@@ -48,33 +48,28 @@ MAQUINISTA_DEFAULT_AGENT=maquinista
 # MAQUINISTA_APPROVALS_TOPIC_ID=456   # topic ID for approval requests
 ```
 
-### 3. Start Database
+### 3. First-Run Sequence
+
+On a fresh install, run these three commands in order:
 
 ```bash
-docker compose -f docker/docker-compose.yml up -d
+make up               # start Docker dependencies (PostgreSQL)
+make build            # compile the binary
+./maquinista migrate  # apply database schema
+./maquinista start    # start the full stack
 ```
 
-This starts PostgreSQL 16 on host port **5434** (container 5432) with credentials `maquinista:maquinista` and database `maquinistadb`.
+On subsequent runs only `./maquinista start` is needed (Docker and migrations persist).
 
-To also start pgAdmin (available at http://localhost:5051):
+To stop Docker when you're done:
 
 ```bash
-docker compose -f docker/docker-compose.yml --profile debug up -d
+make down
 ```
 
-### 4. Build and Migrate
+Common `start` flags:
 
 ```bash
-make build
-./maquinista migrate
-```
-
-### 5. Run
-
-```bash
-# Start Telegram bot (auto-spawns default agent named "maquinista")
-./maquinista start
-
 # Override the default agent id or working dir
 ./maquinista start --agent otavio --agent-cwd ~/code/myproject
 
