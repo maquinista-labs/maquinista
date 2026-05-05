@@ -231,11 +231,11 @@ export function ConversationView(props: Props) {
                   exit={{ opacity: 0 }}
                   transition={{ type: "spring", stiffness: 380, damping: 30, delay: Math.min(index * 0.04, 0.3) }}
                 >
-                  <div className="max-w-[70%] text-right">
-                    <p className="text-sm text-muted-foreground/70 leading-snug">
+                  <div className="max-w-[70%] rounded-2xl px-3 py-2 text-sm bg-muted/30 text-foreground border border-border/50 text-right">
+                    <p className="leading-snug">
                       {it.excerpt ?? ""}
                     </p>
-                    <time className="text-[10px] text-muted-foreground/40">
+                    <time className="mt-1 block text-[10px] text-muted-foreground">
                       {new Date(it.at).toLocaleTimeString()}
                     </time>
                   </div>
