@@ -100,7 +100,6 @@ func (sp *StatusPoller) allActiveWindows() map[string]bool {
 
 func (sp *StatusPoller) poll() {
 	windows := sp.allActiveWindows()
-	log.Printf("status poller: polling %d windows", len(windows))
 
 	for windowID := range windows {
 		users := sp.bot.state.FindUsersForWindow(windowID)
@@ -167,15 +166,13 @@ func (sp *StatusPoller) poll() {
 				sp.mu.Lock()
 				sp.missCount[windowID] = 0
 				sp.mu.Unlock()
-				log.Printf("status poller: window=%s hasStatus=true text=%q", windowID, statusText)
 			} else {
 				sp.mu.Lock()
 				sp.missCount[windowID]++
 				sp.mu.Unlock()
 			}
 		} else {
-			log.Printf("status poller: window=%s isInteractive=true — skipping status extract", windowID)
-		}
+			}
 
 		// Forward status to dashboard via pg_notify (deduped per window).
 		sp.notifyDashboardStatus(windowID, statusText, hasStatus)
