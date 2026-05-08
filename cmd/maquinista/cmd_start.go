@@ -9,20 +9,23 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/hook"
+	"github.com/maquinista-labs/maquinista/internal/agentspawn"
 	"github.com/maquinista-labs/maquinista/internal/bot"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/db"
-	"github.com/maquinista-labs/maquinista/internal/agentspawn"
+	"github.com/maquinista-labs/maquinista/internal/dispatcher"
 	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/listener"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
-	"github.com/maquinista-labs/maquinista/internal/sidecar"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
+	"github.com/maquinista-labs/maquinista/internal/relay"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/scheduler"
+	"github.com/maquinista-labs/maquinista/internal/sidecar"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
@@ -234,7 +237,6 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	activeInboxMap := &mailbox.ActiveInboxMap{}
 
 	sink := monitor.NewMultiSink()
-	sink.Add(monitor.NewTelegramSink(nil))
 	if pool != nil {
 		sink.Add(monitor.NewOutboxSink(pool, activeInboxMap))
 		sink.Add(monitor.NewToolEventSink(pool))
@@ -322,6 +324,26 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		// that were spawned via the dashboard and have no owner binding yet.
 		// Runs in the background; no-ops when AllowedGroups is empty.
 		go b.RunTopicProvisioner(ctx, pool)
+
+		// Relay: fans out agent_outbox rows to channel_deliveries.
+		relayWorkerID := fmt.Sprintf("relay-%s", uuid.New().String()[:8])
+		go func() {
+			if err := relay.Run(ctx, pool, relayWorkerID); err != nil && ctx.Err() == nil {
+				log.Printf("relay: %v", err)
+			}
+		}()
+		log.Println("relay: started")
+
+		// Dispatcher: sends channel_deliveries rows to Telegram.
+		dispatchClient := &dispatcher.BotAPIClient{API: b.API()}
+		dispatchCfg := dispatcher.DefaultConfig()
+		dispatchCfg.Shadow = false
+		go func() {
+			if err := dispatcher.Run(ctx, pool, dispatchClient, dispatchCfg); err != nil && ctx.Err() == nil {
+				log.Printf("dispatcher: %v", err)
+			}
+		}()
+		log.Println("dispatcher: started")
 	} else {
 		log.Println("mailbox: DB pool unavailable — inbox routing will error")
 	}

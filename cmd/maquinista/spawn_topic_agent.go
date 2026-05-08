@@ -129,6 +129,21 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			return "", fmt.Errorf("pre-registering topic agent row: %w", err)
 		}
 
+		// Pre-bind to the incoming thread immediately so the provisioner
+		// doesn't race to create a duplicate Telegram topic during the
+		// TUI warm-up window (WaitForReady can take up to 15 s, matching
+		// the provisioner's tick interval).
+		var threadNum int64
+		fmt.Sscanf(threadID, "%d", &threadNum)
+		if _, bindErr := pool.Exec(ctx, `
+			INSERT INTO topic_agent_bindings
+				(topic_id, agent_id, binding_type, user_id, thread_id, chat_id)
+			VALUES ($1, $2, 'owner', $3, $4, $5)
+			ON CONFLICT (user_id, thread_id) WHERE binding_type='owner' DO NOTHING
+		`, threadNum, agentID, userID, threadID, chatID); bindErr != nil {
+			log.Printf("spawn_topic_agent: pre-bind %s: %v (continuing)", agentID, bindErr)
+		}
+
 		// Create soul (default template), seed memory blocks. Both live in
 		// Postgres only — no prompt file on disk. The runner launch
 		// command pulls the rendered soul via `maquinista soul render <id>`
