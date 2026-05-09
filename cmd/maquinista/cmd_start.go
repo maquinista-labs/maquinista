@@ -17,6 +17,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/dispatcher"
+	"github.com/maquinista-labs/maquinista/internal/inboxecho"
 	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/listener"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
@@ -344,6 +345,22 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			}
 		}()
 		log.Println("dispatcher: started")
+
+		// Inbox echo fanout: fans non-Telegram inbox rows to inbox_echoes
+		// so dashboard (and future Slack/Discord) messages are mirrored
+		// back to the agent's Telegram topic as "👤 sender: text".
+		echoWorkerID := fmt.Sprintf("inboxecho-%s", uuid.New().String()[:8])
+		go func() {
+			if err := inboxecho.Run(ctx, pool, echoWorkerID); err != nil && ctx.Err() == nil {
+				log.Printf("inbox_echo fanout: %v", err)
+			}
+		}()
+		go func() {
+			if err := inboxecho.RunDispatch(ctx, pool, dispatchClient, inboxecho.DefaultDispatchConfig()); err != nil && ctx.Err() == nil {
+				log.Printf("inbox_echo dispatch: %v", err)
+			}
+		}()
+		log.Println("inbox_echo: started")
 	} else {
 		log.Println("mailbox: DB pool unavailable — inbox routing will error")
 	}

@@ -9,21 +9,30 @@ and writes to one place.
 
 ```
 Telegram message  ──┐
-Dashboard message ──┼──→  agent_inbox  ──→  [mailbox consumer]  ──→  tmux PTY
-A2A mention       ──┘                                                     │
-                                                                          ↓
-                                                               [monitor transcript]
-                                                                          │
-                                                                          ↓
-                                                                   agent_outbox
-                                                                   /           \
-                                                        [dashboard]           [relay]
-                                                      reads directly       fans out to
-                                                                      channel_deliveries
-                                                                              │
-                                                                        [dispatcher]
-                                                                              │
-                                                                       Telegram API
+Dashboard message ──┼──→  agent_inbox  ──→  [sidecar]  ──→  tmux PTY
+A2A mention       ──┘         │                                   │
+                               │                                   ↓
+                               │                        [monitor transcript]
+                               │                                   │
+                               │                                   ↓
+                               │                            agent_outbox
+                               │                            /           \
+                               │                 [dashboard]           [relay]
+                               │               reads directly       fans out to
+                               │                                channel_deliveries
+                               │                                        │
+                               │                                  [dispatcher]
+                               │                                        │
+                               │                                 Telegram API
+                               │
+                    [inboxecho fanout]  ← non-Telegram rows only
+                               │          (origin_channel NOT IN ('telegram','a2a'))
+                               ▼
+                          inbox_echoes
+                               │
+                    [inboxecho dispatch]
+                               │
+                     Telegram API  (👤 sender: text)
 ```
 
 ## Inbox row anatomy
@@ -110,6 +119,55 @@ origin delivery.
 This means the dashboard shows agent responses immediately once the outbox
 row exists, even if the relay and dispatcher are not running.
 
+## Inbox echo pipeline (dashboard → Telegram mirror)
+
+When a user sends a message from the dashboard (or any future non-Telegram
+channel), that inbox row needs to appear in the corresponding Telegram topic
+alongside the agent's reply. This is handled by a parallel pipeline that
+mirrors `agent_inbox` rows to Telegram — the **inbox echo pipeline**.
+
+### How it works
+
+1. **Fanout** (`inboxecho.Run`) — subscribes to `NOTIFY agent_inbox_new`.
+   Claims inbox rows where `origin_channel NOT IN ('telegram', 'a2a')` and
+   `echo_processed = FALSE`. For each, inserts one `inbox_echoes` row per
+   owner binding (one per subscribed Telegram topic). Marks the inbox row
+   `echo_processed = TRUE`.
+
+2. **Dispatch** (`inboxecho.RunDispatch`) — subscribes to `NOTIFY
+   inbox_echo_new`. Claims pending `inbox_echoes` rows, formats the content
+   as `👤 <sender>: <text>`, and sends via `TelegramClient.SendMessage`.
+
+### inbox_echoes schema
+
+```sql
+inbox_echoes (
+    id              UUID
+    inbox_id        UUID        -- FK → agent_inbox.id
+    channel         TEXT        -- 'telegram' | future: 'slack' | 'discord'
+    user_id         TEXT        -- Telegram user id
+    thread_id       TEXT        -- Telegram forum topic thread id
+    chat_id         BIGINT      -- Telegram group chat id
+    status          TEXT        -- pending → sending → sent | failed
+    attempts        INT
+    external_msg_id BIGINT      -- Telegram message id on success
+)
+-- UNIQUE (inbox_id, channel, COALESCE(thread_id, ''))
+```
+
+### Extending to Slack / Discord
+
+Adding a new channel requires no structural changes:
+
+1. Add a new SELECT leg in `inboxecho/fanout.go:ProcessOne` that inserts
+   rows with `channel='slack'` (or `'discord'`) referencing the agent's
+   Slack/Discord bindings (new binding table or a new `binding_type`).
+2. Add a new dispatcher that claims `WHERE channel='slack'` rows and calls
+   the Slack/Discord API.
+3. Wire both goroutines into `runOrchestratorSupervised` in `cmd_start.go`.
+
+The `inbox_echoes` table and fanout loop are channel-agnostic by design.
+
 ## Telegram topic bindings
 
 `topic_agent_bindings` maps agents to Telegram forum topics. The relay
@@ -152,6 +210,8 @@ message — useful when the same agent is reachable from multiple topics.
 | `internal/monitor/outbox.go` | `NewDBOutboxWriter` — appends outbox rows from transcript events |
 | `internal/relay/relay.go` | Fans out outbox rows to `channel_deliveries` |
 | `internal/dispatcher/dispatcher.go` | Sends `channel_deliveries` rows via Telegram Bot API |
+| `internal/inboxecho/fanout.go` | Fans out non-Telegram inbox rows to `inbox_echoes` |
+| `internal/inboxecho/dispatch.go` | Sends `inbox_echoes` rows to Telegram as `👤 sender: text` |
 | `internal/bot/topic_provisioner.go` | Creates Telegram topics + bindings for dashboard agents |
 | `internal/bot/handlers_inbox.go` | Telegram → `agent_inbox` ingestion |
 | `internal/dashboard/web/src/app/api/agents/[id]/inbox/route.ts` | Dashboard → `agent_inbox` ingestion |
