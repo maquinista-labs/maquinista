@@ -73,7 +73,7 @@ func ProcessOne(ctx context.Context, pool *pgxpool.Pool, _ string) (bool, error)
 		FROM agent_inbox
 		WHERE NOT echo_processed
 		  AND origin_channel NOT IN ('telegram', 'a2a')
-		ORDER BY created_at
+		ORDER BY enqueued_at
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
 	`).Scan(&id, &agentID)

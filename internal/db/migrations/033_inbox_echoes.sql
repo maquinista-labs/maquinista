@@ -10,7 +10,7 @@ ALTER TABLE agent_inbox
 
 -- Partial index: only non-Telegram, non-A2A rows that need echo fanout.
 CREATE INDEX IF NOT EXISTS idx_agent_inbox_echo_pending
-    ON agent_inbox (created_at)
+    ON agent_inbox (enqueued_at)
     WHERE NOT echo_processed
       AND origin_channel NOT IN ('telegram', 'a2a');
 
