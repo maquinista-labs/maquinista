@@ -9,3 +9,5 @@ Status lifecycle: Proposto → Aceito → Depreciado/Substituído.
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-deepseek-harness-integration.md) | DeepSeek harness integration (thin claude-compatible runner) | Proposto |
+| [0002](0002-executor-port.md) | Executor port — decouple agent session I/O from tmux (ports & adapters) | Proposto |
+| [0003](0003-substrate-hetzner-multitenant.md) | Substrate/AX executor on dedicated Hetzner box, multi-tenant | Proposto |
