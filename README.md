@@ -180,12 +180,39 @@ Maquinista supports pluggable agent runners via the `--runner` flag:
 |--------|-------------|
 | `claude` | Claude Code CLI (default) |
 | `opencode` | OpenCode CLI |
+| `openclaude` | Claude Code via an OpenAI-compatible proxy |
+| `pi` | pi coding agent (`@mariozechner/pi-coding-agent`), JSONL session store |
 | `custom` | Arbitrary binary with Go template commands |
 
 ```bash
 maquinista run --runner opencode --agents 2
 maquinista orchestrate --project myproject --runner claude
 ```
+
+### Pi
+
+[Pi](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent) is a
+minimal, multi-provider coding agent CLI by Mario Zechner. Install it:
+
+    npm install -g @mariozechner/pi-coding-agent
+
+Tell maquinista to use it:
+
+    export MAQUINISTA_DEFAULT_RUNNER=pi
+
+Runner-level defaults (instance config and per-spawn options win over these):
+
+    export MAQUINISTA_PI_MODEL="openrouter/qwen/qwen3-coder"   # bare names get MAQUINISTA_PI_PROVIDER
+    export MAQUINISTA_PI_PROVIDER="openrouter"                 # only sent for bare (unprefixed) models
+    export MAQUINISTA_PI_THINKING="high"                       # off|minimal|low|medium|high|xhigh
+
+Or per-spawn: `/agent_spawn foo pi`. Model / provider / thinking level are
+passed as runner flags (`--provider`, `--model`, `--thinking`) via spawn
+options; pi itself reads `PI_KEY` / provider key env vars (`OPENROUTER_API_KEY`,
+…), `PI_CODING_AGENT_DIR` (session-root pin) and `PI_OFFLINE`.
+
+Pi has **no permission bypass flag** — run maquinista inside your existing
+sandbox (container, bwrap, or trusted dev shell).
 
 ## Project Structure
 

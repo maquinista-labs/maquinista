@@ -18,6 +18,8 @@ Together they form a pull/zero-token model: no agent is running unless a human o
 
 **OpenClaw**: A full-stack TypeScript implementation with a WebSocket gateway, session archives, multi-agent routing, per-group activation modes, and sequential vs. parallel queue processing per session.
 
+**pi** (badlogic/pi-mono): a minimal multi-provider coding-agent TUI with a JSONL session store (v3, tree-shaped), no permission flow by design, and SDK/RPC modes. Maquinista integrates it as a tmux subprocess runner (see `plans/active/pi-integration.md`) — the opposite trade-off from OpenClaw's in-process SDK embedding.
+
 **Claws alternatives** (lighter implementations):
 - **Nanobot** (Python): asyncio.Queue, inbound/outbound bus separation, two-layer memory (MEMORY.md + HISTORY.md), LLM-driven consolidation
 - **Picoclaw** (Go): three-channel bus (inbound/outbound/outboundMedia), port of nanobot's architecture

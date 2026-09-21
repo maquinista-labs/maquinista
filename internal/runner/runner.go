@@ -2,6 +2,8 @@ package runner
 
 import (
 	"fmt"
+	"sort"
+	"strings"
 	"sync"
 
 	"github.com/maquinista-labs/maquinista/internal/monitor"
@@ -89,4 +91,28 @@ func Runners() map[string]AgentRunner {
 		copy[k] = v
 	}
 	return copy
+}
+
+// Names returns the sorted registry keys — the single source of truth for
+// every "available runners" list surfaced to operators (bot errors, bot
+// command description, CLI flag help). Deriving these strings from the
+// registry means a new runner becomes visible everywhere the moment it
+// registers.
+func Names() []string {
+	mu.RLock()
+	defer mu.RUnlock()
+	names := make([]string, 0, len(runners))
+	for name := range runners {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// NamesJoined returns the registered runner names as a comma-separated
+// string for help texts and flag descriptions (e.g. every entry of
+// Runners() joined). Keeps user-facing lists in sync with the registry
+// automatically — never hardcode names at call sites.
+func NamesJoined() string {
+	return strings.Join(Names(), ", ")
 }

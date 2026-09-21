@@ -64,6 +64,27 @@ func OpenCodeProfile() MonitorProfile {
 	}
 }
 
+// PiProfile returns the pi coding agent's TUI parsing parameters
+// (badlogic/pi-mono, observed live v0.73.1; PI-00 in
+// plans/active/pi-integration.md).
+//
+// Observed layout: the TUI draws '─' (U+2500) chrome separator lines like
+// Claude, plus a bottom bar with cwd, a context meter and
+// "model • thinking". No input-area spinner was observed across idle,
+// busy, compaction, /login and /tree panes, and no interactive UI
+// (permission/plan) screens were captured. The profile therefore ships
+// empty — nil runes/patterns make every helper "never match", so pi panes
+// flow through unparsed instead of being misclassified (mirrors how
+// OpenCodeProfile started under OC-06).
+func PiProfile() MonitorProfile {
+	return MonitorProfile{
+		SpinnerChars:    "",
+		SeparatorRunes:  nil,
+		MinSeparatorLen: 0,
+		UIPatterns:      nil,
+	}
+}
+
 // Spinner characters used by Claude Code's status line.
 const spinnerChars = "·✻✽✶✳✢"
 

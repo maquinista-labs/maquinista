@@ -15,6 +15,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/daemonize"
 	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -128,7 +129,7 @@ var orchestratorLogsCmd = &cobra.Command{
 
 func init() {
 	orchestratorStartCmd.Flags().StringVar(&cfgPath, "env", "", "path to .env config file")
-	orchestratorStartCmd.Flags().StringVar(&startRunner, "runner", "", "default agent runner (claude, openclaude, opencode)")
+	orchestratorStartCmd.Flags().StringVar(&startRunner, "runner", "", fmt.Sprintf("default agent runner (%s)", runner.NamesJoined()))
 	orchestratorStartCmd.Flags().StringVar(&startAgentCWD, "agent-cwd", "", "working dir inherited by newly-spawned topic agents (overrides cfg.DefaultAgentCWD; defaults to $PWD)")
 	orchestratorStartCmd.Flags().BoolVar(&startOrchestrate, "orchestrate", false, "run orchestrator engine alongside bot")
 	orchestratorStartCmd.Flags().StringVar(&startOrchProject, "orchestrate-project", "", "project for orchestrator engine")

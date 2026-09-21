@@ -141,7 +141,7 @@ func init() {
 	orchestrateCmd.Flags().IntVar(&orchMaxAgents, "max-agents", 3, "maximum concurrent agents")
 	orchestrateCmd.Flags().DurationVar(&orchPollInterval, "poll-interval", 10*time.Second, "polling interval")
 	orchestrateCmd.Flags().BoolVar(&orchWorktrees, "worktrees", false, "isolate agents in git worktrees")
-	orchestrateCmd.Flags().StringVar(&orchRunner, "runner", "claude", "agent runner to use (claude, openclaude, opencode)")
+	orchestrateCmd.Flags().StringVar(&orchRunner, "runner", "claude", fmt.Sprintf("agent runner to use (%s)", runner.NamesJoined()))
 	orchestrateCmd.Flags().BoolVar(&orchStatus, "status", false, "show current status and exit")
 	orchestrateCmd.Flags().IntVar(&orchNotifyTopic, "notify-topic", 0, "Telegram thread ID for notifications")
 	orchestrateCmd.Flags().Int64Var(&orchNotifyChat, "notify-chat", 0, "Telegram chat ID for notifications")

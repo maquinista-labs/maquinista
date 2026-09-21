@@ -61,7 +61,7 @@ var startCmd = &cobra.Command{
 
 func init() {
 	startCmd.Flags().StringVar(&cfgPath, "env", "", "path to .env config file")
-	startCmd.Flags().StringVar(&startRunner, "runner", "", "default orchestrator runner (claude, openclaude, opencode)")
+	startCmd.Flags().StringVar(&startRunner, "runner", "", fmt.Sprintf("default orchestrator runner (%s)", runner.NamesJoined()))
 	startCmd.Flags().StringVar(&startAgentCWD, "agent-cwd", "", "working dir inherited by newly-spawned topic agents (overrides cfg.DefaultAgentCWD; defaults to $PWD)")
 	startCmd.Flags().BoolVar(&startOrchestrate, "orchestrate", false, "run orchestrator engine alongside bot")
 	startCmd.Flags().StringVar(&startOrchProject, "orchestrate-project", "", "project for orchestrator engine")
@@ -224,6 +224,9 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	openclaudeSrc := monitor.NewOpenClaudeSource(cfg, pool, b.State(), ms)
 	monitor.RegisterSource("openclaude", openclaudeSrc)
 
+	piSrc := monitor.NewPiSource(cfg, pool, b.State(), ms)
+	monitor.RegisterSource("pi", piSrc)
+
 	// Mirror every captured response into agent_outbox so the dashboard and
 	// relay can consume them. Previously guarded by MAILBOX_OUTBOUND; now
 	// unconditional when a DB pool is available — the outbox is the primary
@@ -250,6 +253,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	mon.AddSource(claudeSrc)
 	mon.AddSource(opencodeSrc)
 	mon.AddSource(openclaudeSrc)
+	mon.AddSource(piSrc)
 	mon.PlanHandler = b.HandlePlanFromMonitor
 
 	sp := bot.NewStatusPoller(b, mon, pool)

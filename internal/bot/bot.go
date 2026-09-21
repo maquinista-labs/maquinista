@@ -147,7 +147,7 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "t_merge", Description: "Merge a branch (auto-resolve conflicts)"},
 		tgbotapi.BotCommand{Command: "t_plan", Description: "Plan and create tasks from a description"},
 		tgbotapi.BotCommand{Command: "plan", Description: "Open a planner session in this topic"},
-		tgbotapi.BotCommand{Command: "runner", Description: "Show/switch default runner (claude, opencode)"},
+		tgbotapi.BotCommand{Command: "runner", Description: fmt.Sprintf("Show/switch default runner (%s)", runner.NamesJoined())},
 		tgbotapi.BotCommand{Command: "agent_list", Description: "List all registered agents"},
 		tgbotapi.BotCommand{Command: "agent_spawn", Description: "Spawn a new execution agent"},
 		tgbotapi.BotCommand{Command: "agent_kill", Description: "Kill a specific agent"},

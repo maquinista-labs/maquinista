@@ -41,7 +41,7 @@ type Config struct {
 	DefaultProject    string
 	PlannerPromptPath string
 
-	// Default agent runner (claude, opencode, etc.)
+	// Default agent runner — valid values listed by runner.Names().
 	DefaultRunner string
 
 	// DefaultAgent is the agent id auto-spawned by `maquinista start` when

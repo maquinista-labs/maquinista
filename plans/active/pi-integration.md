@@ -473,17 +473,17 @@ Things that are *interesting* but do **not** block shipping pi-as-a-runner:
 
 ## 7. Checklist
 
-- [ ] PI-00: Observe pi's TUI output across idle / busy / compaction / `/login` / `/tree`; capture findings as code comments.
-- [ ] PI-01: `PiRunner` + `pi_test.go`, registered via `init()`.
-- [ ] PI-02: `PiProfile()` added to `internal/monitor/terminal.go`.
-- [ ] PI-03: `PiSource` in `internal/monitor/source_pi.go`, registered alongside the other sources, JSONL header + message parsing, CWD slug matched, unknown-role-tolerant.
-- [ ] PI-04: DB/state wiring confirmed runner-name-agnostic; no new hardcoded strings.
-- [ ] PI-05: `/runner`, `/runner pi`, `/agent_spawn … pi` work; "Available: …" strings derived from `runner.Runners()`.
+- [x] PI-00: Observe pi's TUI output across idle / busy / compaction / `/login` / `/tree`; capture findings as code comments.
+- [x] PI-01: `PiRunner` + `pi_test.go`, registered via `init()`.
+- [x] PI-02: `PiProfile()` added to `internal/monitor/terminal.go`.
+- [x] PI-03: `PiSource` in `internal/monitor/source_pi.go`, registered alongside the other sources, JSONL header + message parsing, CWD slug matched, unknown-role-tolerant.
+- [x] PI-04: DB/state wiring confirmed runner-name-agnostic; no new hardcoded strings.
+- [x] PI-05: `/runner`, `/runner pi`, `/agent_spawn … pi` work; "Available: …" strings derived from the registry (`runner.NamesJoined()` over `runner.Runners()`).
 - [ ] PI-06: Session-tracking fallback verified end-to-end for a real pi agent (manual QA log attached).
-- [ ] PI-07: Env/config surface documented and honored — **flags are the only config input** (`--provider/--model/--thinking`); env side is `PI_KEY` (API key), provider key vars (`OPENROUTER_API_KEY`, …), `PI_CODING_AGENT_DIR` (root pin), `PI_OFFLINE`. NOTE: `PI_MODEL`/`PI_PROVIDER`/`PI_REASONING_LEVEL`/`PI_SESSION_ID`/`PI_SESSION_FILE` are *outputs* pi injects into its `bash` tool children (see docs/environment-variables.md, verified 0.73.1) — do not document them as runner inputs.
-- [ ] PI-08: `PlannerCommand` uses `--system-prompt`; integration test confirms the planner persona survives.
-- [ ] PI-09: Unit tests + opt-in integration test green.
-- [ ] PI-10: README runner section + `plans/README.md` index entry + `architecture-comparison.md` mention.
+- [x] PI-07: Env/config surface documented and honored — **flags are the only config input** (`--provider/--model/--thinking`); env side is `PI_KEY` (API key), provider key vars (`OPENROUTER_API_KEY`, …), `PI_CODING_AGENT_DIR` (root pin), `PI_OFFLINE`. NOTE: `PI_MODEL`/`PI_PROVIDER`/`PI_REASONING_LEVEL`/`PI_SESSION_ID`/`PI_SESSION_FILE` are *outputs* pi injects into its `bash` tool children (see docs/environment-variables.md, verified 0.73.1) — do not document them as runner inputs.
+- [x] PI-08: `PlannerCommand` uses `--system-prompt`; integration test confirms the planner persona survives.
+- [x] PI-09: Unit tests + opt-in integration test green.
+- [x] PI-10: README runner section + `plans/README.md` index entry + `architecture-comparison.md` mention.
 
 ---
 

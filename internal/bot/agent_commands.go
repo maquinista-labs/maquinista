@@ -76,7 +76,7 @@ func (b *Bot) handleAgentSpawnCommand(msg *tgbotapi.Message) {
 	if len(args) >= 2 {
 		r, err := runner.Get(args[1])
 		if err != nil {
-			b.reply(chatID, threadID, fmt.Sprintf("Unknown runner %q. Available: claude, opencode", args[1]))
+			b.reply(chatID, threadID, unknownRunnerText(args[1]))
 			return
 		}
 		explicitRunner = r
@@ -240,7 +240,7 @@ func (b *Bot) handleRunnerCommand(msg *tgbotapi.Message) {
 
 	r, err := runner.Get(arg)
 	if err != nil {
-		b.reply(chatID, threadID, fmt.Sprintf("Unknown runner %q. Available: claude, opencode", arg))
+		b.reply(chatID, threadID, unknownRunnerText(arg))
 		return
 	}
 
@@ -282,4 +282,11 @@ func resolveAgentID(pool *pgxpool.Pool, partialID string) (string, error) {
 	default:
 		return "", fmt.Errorf("ambiguous ID '%s': matches %s", partialID, strings.Join(matches, ", "))
 	}
+}
+
+// unknownRunnerText builds the reply for an unrecognized /agent runner
+// argument. The available list is derived from the live registry so a new
+// runner is advertised automatically — never hardcode names here.
+func unknownRunnerText(arg string) string {
+	return fmt.Sprintf("Unknown runner %q. Available: %s", arg, runner.NamesJoined())
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/git"
 	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/memory"
+	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
@@ -120,7 +121,7 @@ func runAgentLogs(agentID string) error {
 }
 
 func init() {
-	agentAddCmd.Flags().StringVar(&agentAddRunner, "runner", "claude", "runner_type (claude, openclaude, opencode, custom)")
+	agentAddCmd.Flags().StringVar(&agentAddRunner, "runner", "claude", fmt.Sprintf("runner_type (%s, custom)", runner.NamesJoined()))
 	agentAddCmd.Flags().StringVar(&agentAddRole, "role", "user", "agent role (user | executor)")
 	agentAddCmd.Flags().StringVar(&agentAddCWD, "cwd", "", "agent working directory")
 	agentAddCmd.Flags().StringVar(&agentAddHandle, "handle", "", "friendly @-handle (unique, lowercase a-z0-9_-)")

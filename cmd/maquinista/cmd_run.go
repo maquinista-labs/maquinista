@@ -135,7 +135,7 @@ func init() {
 	runCmd.Flags().BoolVar(&runWorktrees, "worktrees", false, "deprecated alias for --scope=agent")
 	runCmd.Flags().StringVar(&runScope, "scope", "", "workspace scope: shared | agent (default: shared; see plans/active/workspace-scopes.md)")
 	runCmd.Flags().StringVar(&runRepoRoot, "repo", "", "project git repo root (defaults to process cwd's git root for --scope=agent)")
-	runCmd.Flags().StringVar(&runRunner, "runner", "claude", "agent runner to use (claude, openclaude, opencode)")
+	runCmd.Flags().StringVar(&runRunner, "runner", "claude", fmt.Sprintf("agent runner to use (%s)", runner.NamesJoined()))
 	rootCmd.AddCommand(runCmd)
 }
 
