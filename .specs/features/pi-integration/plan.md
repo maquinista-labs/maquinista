@@ -119,7 +119,7 @@ across the whole plan.
 **Acceptance Criteria**
 
 26. The README Runners section SHALL document the pi install command, `MAQUINISTA_DEFAULT_RUNNER=pi`, the `MAQUINISTA_PI_MODEL`/`MAQUINISTA_PI_PROVIDER`/`MAQUINISTA_PI_THINKING` overrides, provider-key env passthrough, and the no-permission-bypass note
-27. The pi checklist SHALL be fully ticked (PI-00…PI-10 boxes marked `[x]`) in `plans/active/pi-integration.md`
+27. The pi checklist SHALL reflect build-complete state (PI-00…PI-05 and PI-07…PI-10 marked `[x]`; PI-06 open) in `plans/active/pi-integration.md` — *amended 2026-09-21, approved by Otavio: PI-06 is the post-build go-live door (door table above) and stays unticked until live Telegram QA*
 28. The shipped plan SHALL be indexed in `plans/README.md`
 
 **Independent test:** `rg -n 'MAQUINISTA_PI_MODEL|no permission bypass|@mariozechner/pi-coding-agent' README.md` and `rg -c '\[x\] PI-' plans/active/pi-integration.md`.

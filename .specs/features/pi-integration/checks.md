@@ -103,9 +103,11 @@ Proof: `go test ./internal/monitor/ -run TestPiSource_BindFromEcho -v`
 **C26** - README documents the pi install command (`@mariozechner/pi-coding-agent`), `MAQUINISTA_PI_MODEL`/`MAQUINISTA_PI_PROVIDER`/`MAQUINISTA_PI_THINKING` overrides, and the no-permission-bypass sandbox note (PIRUN-06, AC 26)
 Proof: `rg -n -e 'MAQUINISTA_PI_MODEL' -e 'no permission bypass' -e '@mariozechner/pi-coding-agent' README.md`
 
-**C27** - The pi checklist is fully ticked: exactly 11 `[x] PI-` boxes and zero `[ ] PI-` boxes in `plans/active/pi-integration.md` (PIRUN-06, AC 27)
-Proof: `test "$(rg -c '\[x\] PI-' plans/active/pi-integration.md)" = 11`
-Proof: `! rg -n '\[ \] PI-' plans/active/pi-integration.md`
+**C27** - The pi checklist matches build-complete state: exactly 10 `[x] PI-` boxes and exactly 1 `[ ] PI-` box, namely PI-06, in `plans/active/pi-integration.md` (PIRUN-06, AC 27)
+Proof: `test "$(rg -c '\[x\] PI-' plans/active/pi-integration.md)" = 10`
+Proof: `test "$(rg -c '\[ \] PI-' plans/active/pi-integration.md)" = 1`
+Proof: `rg -n '\[ \] PI-06' plans/active/pi-integration.md`
+> Amendment (2026-09-21, approved by Otavio): the original wording demanded 11 ticked / zero unticked, contradicting plan.md's own door table, which declares PI-06 the post-build go-live gate (live Telegram QA, not a coverage member). PI-06 remains the open door; C27 now pins build-complete state with the door explicitly open.
 
 **C28** - The shipped plan is indexed in `plans/README.md` (PIRUN-06, AC 28)
 Proof: `rg -n 'pi-integration' plans/README.md`
