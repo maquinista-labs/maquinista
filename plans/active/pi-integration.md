@@ -66,6 +66,14 @@ Pi has no hook mechanism analogous to Claude Code's `SessionStart`. `HasSessionH
 1. On `Spawn`, we write a preliminary `session_map` row keyed `<tmuxSession>:<windowID>` with `session_id = agentID` (stable proxy).
 2. `PiSource.DiscoverSessions` later cross-references `~/.pi/agent/sessions/<cwd-slug>/*.jsonl` to find the real UUID, and backfills `agents.session_id`.
 
+**Upgrade available (verified 2026-09-21, pi 0.73.1 docs `environment-variables.md`):**
+pi injects `PI_SESSION_ID` and `PI_SESSION_FILE` (absolute JSONL path) into every
+command its `bash` tool runs. The OC-03 guess-and-backfill can be tightened to an
+exact read: have the spawn prompt (or a first bot message) ask the agent to run
+`printf '%s' "$PI_SESSION_FILE"` once, parse the reply from the transcript, and
+bind the real UUID immediately — no slug guessing, no ambiguity for forked trees.
+Keep the OC-03 cross-reference as fallback; use this as the fast path.
+
 ### 3.4 Transcript format
 
 Pi session files are line-delimited JSON (**v3 format**) with a tree shape (`id` / `parentId`) rather than a flat list. Important implications:
@@ -195,6 +203,12 @@ func (p *PiRunner) EnvOverrides() map[string]string {
     // PI_CODING_AGENT_DIR pins pi's config/session root so it doesn't drift
     // between users when multiple accounts run on the same box. Empty map =
     // use pi's default (~/.pi/agent).
+    //
+    // AUTH (gap found in review 2026-09-21): pi ships no subscription OAuth —
+    // it needs a provider key via env (OPENROUTER_API_KEY etc.) or PI_KEY, and
+    // ~/.pi/agent/auth.json starts EMPTY. DetectInstallation should therefore
+    // check key presence (env or auth.json) like the DeepSeek ADR gates on
+    // DEEPSEEK_API_KEY; EnvOverrides injects the key from maquinista config.
     return map[string]string{}
 }
 
@@ -466,7 +480,7 @@ Things that are *interesting* but do **not** block shipping pi-as-a-runner:
 - [ ] PI-04: DB/state wiring confirmed runner-name-agnostic; no new hardcoded strings.
 - [ ] PI-05: `/runner`, `/runner pi`, `/agent_spawn … pi` work; "Available: …" strings derived from `runner.Runners()`.
 - [ ] PI-06: Session-tracking fallback verified end-to-end for a real pi agent (manual QA log attached).
-- [ ] PI-07: `PI_MODEL` / `PI_PROVIDER` / `PI_THINKING` / `PI_CODING_AGENT_DIR` env vars documented and honored.
+- [ ] PI-07: Env/config surface documented and honored — **flags are the only config input** (`--provider/--model/--thinking`); env side is `PI_KEY` (API key), provider key vars (`OPENROUTER_API_KEY`, …), `PI_CODING_AGENT_DIR` (root pin), `PI_OFFLINE`. NOTE: `PI_MODEL`/`PI_PROVIDER`/`PI_REASONING_LEVEL`/`PI_SESSION_ID`/`PI_SESSION_FILE` are *outputs* pi injects into its `bash` tool children (see docs/environment-variables.md, verified 0.73.1) — do not document them as runner inputs.
 - [ ] PI-08: `PlannerCommand` uses `--system-prompt`; integration test confirms the planner persona survives.
 - [ ] PI-09: Unit tests + opt-in integration test green.
 - [ ] PI-10: README runner section + `plans/README.md` index entry + `architecture-comparison.md` mention.
@@ -538,7 +552,7 @@ Flags the runner uses, pinned from [pi README](https://github.com/badlogic/pi-mo
 - Pi README: https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent
 - Pi session file format: `packages/coding-agent/docs/session.md`
 - Pi RPC protocol: `packages/coding-agent/docs/rpc.md`
-- openclaw's Pi integration docs (embedded SDK approach): `../openclaw/docs/pi.md`
-- openclaw's embedded runner source: `../openclaw/src/agents/pi-embedded-runner/`
+- openclaw's Pi integration docs (embedded SDK approach): `../openclaw/docs/pi.md` — **STALE 2026-09-21: `~/code/openclaw` no longer exists on playa; recover from git history or drop**
+- openclaw's embedded runner source: `../openclaw/src/agents/pi-embedded-runner/` — **STALE (same)**
 - Existing maquinista runner pattern: `internal/runner/claude.go`, `internal/runner/opencode.go`, `internal/runner/openclaude.go`
 - OpenCode integration plan (the analog we're mirroring): `plans/active/opencode-integration.md`
