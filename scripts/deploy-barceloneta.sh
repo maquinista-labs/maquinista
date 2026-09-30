@@ -2,8 +2,8 @@
 # deploy-barceloneta.sh — ship playa changes to the barceloneta runtime.
 #
 # Dev happens on playa (~/code/maquinista); maquinista RUNS on barceloneta
-# (/root/git/maquinista, systemd unit `maquinista`). This script is the whole
-# deployment procedure in one command:
+# (/home/barceloneta/code/maquinista, systemd unit `maquinista`, User=barceloneta,
+# sudo NOPASSWD for the restart). This script is the whole deployment procedure:
 #
 #   ./scripts/deploy-barceloneta.sh          # from playa — ssh-trampolines itself
 #   MAQ_DEPLOY_LOCAL=1 ./scripts/...         # force local run (e.g. ON barceloneta)
@@ -16,7 +16,7 @@
 #   5. health check: unit active + no error/panic/fatal in the first 30s of logs
 set -euo pipefail
 
-REPO_DIR="/root/git/maquinista"
+REPO_DIR="/home/barceloneta/code/maquinista"
 UNIT="maquinista"
 
 # ---- trampoline: not on barceloneta? ssh there and run this same script ----
@@ -31,7 +31,7 @@ if [ "$(hostname)" != "barceloneta" ] && [ "${MAQ_DEPLOY_LOCAL:-0}" != "1" ]; th
 fi
 
 cd "$REPO_DIR"
-export PATH="/usr/local/go/bin:/usr/local/bin:$PATH"  # non-interactive ssh has a bare PATH
+export PATH="/home/barceloneta/.local/bin:/usr/local/go/bin:/usr/local/bin:$PATH"  # non-interactive ssh has a bare PATH
 
 echo "==> git pull --rebase (was $(git rev-parse --short HEAD))"
 git pull --rebase origin main
@@ -44,7 +44,7 @@ echo "==> migrating"
 ./maquinista migrate
 
 echo "==> restarting $UNIT"
-systemctl restart "$UNIT"
+sudo -n systemctl restart "$UNIT"
 sleep 4
 
 if ! systemctl is-active --quiet "$UNIT"; then
