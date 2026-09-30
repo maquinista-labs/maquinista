@@ -1,6 +1,6 @@
 # ADR-0003: Substrate/AX Executor on a Dedicated Hetzner Box (Multi-Tenant)
 
-- **Status:** Proposto (pending Otavio's ok)
+- **Status:** Proposto (pending Otavio's ok) — hardware locus revised by [ADR-0004](0004-barceloneta-nuc-execution-box.md): owned NUC pilot first, Robot = scale-out trigger
 - **Date:** 2026-09-21
 - **Deciders:** Otavio
 - **Scope:** execution infrastructure (new box + network link), `internal/executor` second adapter, multi-tenant isolation model

@@ -11,3 +11,4 @@ Status lifecycle: Proposto → Aceito → Depreciado/Substituído.
 | [0001](0001-deepseek-harness-integration.md) | DeepSeek harness integration (thin claude-compatible runner) | Proposto |
 | [0002](0002-executor-port.md) | Executor port — decouple agent session I/O from tmux (ports & adapters) | Proposto |
 | [0003](0003-substrate-hetzner-multitenant.md) | Substrate/AX executor on dedicated Hetzner box, multi-tenant | Proposto |
+| [0004](0004-barceloneta-nuc-execution-box.md) | Barceloneta NUC as execution box — owned silicon first, Robot as scale-out | Proposto |
