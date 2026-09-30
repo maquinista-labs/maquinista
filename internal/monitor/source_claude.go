@@ -101,7 +101,8 @@ func (c *ClaudeSource) DiscoverSessions() []ActiveSession {
 func loadRunnerSessionMap(ctx context.Context, pool *pgxpool.Pool, runnerType string) (map[string]state.SessionMapEntry, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT tmux_session, tmux_window,
-		       COALESCE(session_id,''), COALESCE(cwd,''), COALESCE(window_name,'')
+		       COALESCE(session_id,''), COALESCE(cwd,''), COALESCE(window_name,''),
+		       COALESCE(EXTRACT(EPOCH FROM started_at)*1000, 0)::bigint
 		FROM agents
 		WHERE runner_type = $1
 		  AND status IN ('running','working','idle')
@@ -118,13 +119,15 @@ func loadRunnerSessionMap(ctx context.Context, pool *pgxpool.Pool, runnerType st
 	out := map[string]state.SessionMapEntry{}
 	for rows.Next() {
 		var tmuxSession, tmuxWindow, sessionID, cwd, windowName string
-		if err := rows.Scan(&tmuxSession, &tmuxWindow, &sessionID, &cwd, &windowName); err != nil {
+		var windowCreatedAt int64
+		if err := rows.Scan(&tmuxSession, &tmuxWindow, &sessionID, &cwd, &windowName, &windowCreatedAt); err != nil {
 			return nil, err
 		}
 		out[tmuxSession+":"+tmuxWindow] = state.SessionMapEntry{
-			SessionID:  sessionID,
-			CWD:        cwd,
-			WindowName: windowName,
+			SessionID:       sessionID,
+			CWD:             cwd,
+			WindowName:      windowName,
+			WindowCreatedAt: windowCreatedAt,
 		}
 	}
 	return out, rows.Err()
