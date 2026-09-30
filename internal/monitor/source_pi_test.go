@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/dbtest"
@@ -51,7 +52,7 @@ func TestPiSource_SlugifyCWD(t *testing.T) {
 
 func TestPiSource_Header(t *testing.T) {
 	p := newFixtureSource(t)
-	path, id, err := p.discoverSessionFile("/tmp/proj")
+	path, id, err := p.discoverSessionFile("/tmp/proj", time.Time{})
 	if err != nil {
 		t.Fatalf("discoverSessionFile: %v", err)
 	}
@@ -336,6 +337,229 @@ func TestPiSource_BindFromEcho(t *testing.T) {
 	}
 	if got != echoID {
 		t.Errorf("session_id = %q, want echoed %q", got, echoID)
+	}
+}
+
+// --- Pi relay loop (C1-C3, C6) ---
+
+func piHeaderLine(id string) string {
+	return `{"type":"session","version":3,"id":"` + id + `","cwd":"/tmp/proj"}` + "\n"
+}
+
+func piMsgLine(role, text string) string {
+	return `{"type":"message","id":"m1","parentId":null,"timestamp":"t","message":{"role":"` +
+		role + `","content":[{"type":"text","text":"` + text + `"}],"timestamp":1}}` + "\n"
+}
+
+// writePiSession writes a session file and returns its full path.
+func writePiSession(t *testing.T, dir, id string, lines []string, finalNewline bool) string {
+	t.Helper()
+	slug := filepath.Join(dir, fixSlugDir)
+	if err := os.MkdirAll(slug, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name := "2026-09-21T14-00-00-000Z_" + id + ".jsonl"
+	var body strings.Builder
+	for _, l := range lines {
+		body.WriteString(l)
+	}
+	if finalNewline && !strings.HasSuffix(body.String(), "\n") {
+		body.WriteString("\n")
+	}
+	path := filepath.Join(slug, name)
+	if err := os.WriteFile(path, []byte(body.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestPiSource_SelfTracksOffset: the monitor-shaped poll loop (offset read
+// from MonitorState, passed back in) must see each entry exactly once — the
+// source persists its own read offset, like the claude/openclaude sources.
+func TestPiSource_SelfTracksOffset(t *testing.T) {
+	p := newFixtureSource(t)
+	p.sessionRoot = t.TempDir()
+	id := "01a0c457-aaaa-77af-b6a8-c874297e3cbd"
+	path := writePiSession(t, p.sessionRoot, id, []string{
+		piHeaderLine(id),
+		piMsgLine("user", "first question"),
+		piMsgLine("assistant", "first answer"),
+	}, true)
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	p.appState.SetWindowRunner("w1", "pi")
+	p.lastSessionMap["maq:w1"] = state.SessionMapEntry{SessionID: id, CWD: "/tmp/proj"}
+	sess := ActiveSession{Key: "maq:w1", WindowID: "w1"}
+
+	poll := func() []ParsedEntry {
+		var offset int64
+		if tr, ok := p.monitorState.GetTracked("maq:w1"); ok {
+			offset = tr.LastByteOffset
+		}
+		entries, _, err := p.ReadNewEntries(sess, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+
+	first := poll()
+	if len(first) != 2 {
+		t.Fatalf("first poll = %d entries, want 2", len(first))
+	}
+	tr, ok := p.monitorState.GetTracked("maq:w1")
+	if !ok || tr.LastByteOffset != fi.Size() {
+		t.Fatalf("tracked offset = %d (ok=%v), want file size %d", tr.LastByteOffset, ok, fi.Size())
+	}
+	if second := poll(); len(second) != 0 {
+		t.Fatalf("second poll re-emitted %d entries, want 0 (offset loop)", len(second))
+	}
+}
+
+// TestPiSource_PartialLineNoDupNoLoss: an unterminated final line is held
+// back, then delivered exactly once once completed.
+func TestPiSource_PartialLineNoDupNoLoss(t *testing.T) {
+	p := newFixtureSource(t)
+	p.sessionRoot = t.TempDir()
+	id := "01a0c457-bbbb-77af-b6a8-c874297e3cbd"
+	complete := piHeaderLine(id) + piMsgLine("user", "q1") + piMsgLine("assistant", "a1")
+	// A torn append: pi is mid-write on the next line, so the file ends
+	// with a truncated JSON prefix (no newline yet).
+	partial := `{"type":"message","id":"m1","parentId":null,"timestamp":"t","message":{"role":"user","content":[{"type":"text","text":"slow que`
+	rest := `stion"}],"timestamp":1}}` + "\n"
+	path := writePiSession(t, p.sessionRoot, id, []string{complete, partial}, false)
+
+	p.appState.SetWindowRunner("w1", "pi")
+	p.lastSessionMap["maq:w1"] = state.SessionMapEntry{SessionID: id, CWD: "/tmp/proj"}
+	sess := ActiveSession{Key: "maq:w1", WindowID: "w1"}
+
+	poll := func() []ParsedEntry {
+		var offset int64
+		if tr, ok := p.monitorState.GetTracked("maq:w1"); ok {
+			offset = tr.LastByteOffset
+		}
+		entries, _, err := p.ReadNewEntries(sess, offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+
+	first := poll()
+	if len(first) != 2 {
+		t.Fatalf("first poll = %d entries, want 2 (partial line held back)", len(first))
+	}
+	if tr, ok := p.monitorState.GetTracked("maq:w1"); !ok || tr.LastByteOffset != int64(len(complete)) {
+		t.Fatalf("tracked offset = %d (ok=%v), want %d (start of partial line)",
+			tr.LastByteOffset, ok, len(complete))
+	}
+
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(rest); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	second := poll()
+	if len(second) != 1 || second[0].Role != "user" || second[0].Text != "slow question" {
+		t.Fatalf("second poll = %+v, want exactly the completed line", second)
+	}
+}
+
+// TestPiSource_RebindsToPaneFile: a binding persisted before the live
+// transcript appeared is re-evaluated; the rebind seeds the offset at the
+// new file's size (no backlog relay).
+func TestPiSource_RebindsToPaneFile(t *testing.T) {
+	pool, _ := dbtest.PgContainer(t)
+	if _, err := db.RunMigrations(pool); err != nil {
+		t.Fatalf("migrations: %v", err)
+	}
+	if err := db.RegisterAgent(pool, "agent-pi-3", "maq", "w3", strPtr("/tmp/proj"), nil, "pi", nil, "executor"); err != nil {
+		t.Fatalf("RegisterAgent: %v", err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE agents SET cwd='/tmp/proj' WHERE id='agent-pi-3'`); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Now()
+	staleID := "01a0c457-cccc-77af-b6a8-c874297e3cbd"
+	liveID := "01a0c457-dddd-77af-b6a8-c874297e3cbd"
+
+	// Pane v1 started at now-60s; its transcript (bound in phase 1) was
+	// last written at now-30s.
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE agents SET started_at=$1 WHERE id='agent-pi-3'`, now.Add(-60*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	st := state.NewState()
+	st.SetWindowRunner("w3", "pi")
+	p := NewPiSource(nil, pool, st, state.NewMonitorState())
+	p.sessionRoot = t.TempDir()
+	stalePath := writePiSession(t, p.sessionRoot, staleID, []string{
+		piHeaderLine(staleID),
+		piMsgLine("user", "stale smoke"),
+		piMsgLine("assistant", "42"),
+	}, true)
+	if err := os.Chtimes(stalePath, now.Add(-30*time.Second), now.Add(-30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase 1: first bind — only the stale candidate exists.
+	if sessions := p.DiscoverSessions(); len(sessions) != 1 {
+		t.Fatalf("phase 1: DiscoverSessions = %d sessions, want 1", len(sessions))
+	}
+	var bound string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT session_id FROM agents WHERE id='agent-pi-3'`).Scan(&bound); err != nil {
+		t.Fatal(err)
+	}
+	if bound != staleID {
+		t.Fatalf("phase 1: session_id = %q, want stale %q", bound, staleID)
+	}
+
+	// Pane v2: recreated at now-10s; the live transcript appears with a
+	// fresh mtime (pi creates the file lazily, after pane start).
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE agents SET started_at=$1 WHERE id='agent-pi-3'`, now.Add(-10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	livePath := writePiSession(t, p.sessionRoot, liveID, []string{
+		piHeaderLine(liveID),
+		piMsgLine("user", "real conversation"),
+		piMsgLine("assistant", "real reply"),
+	}, true)
+	liveFi, err := os.Stat(livePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Phase 2: re-evaluation must rebind to the live transcript and seed
+	// the offset at its size.
+	if sessions := p.DiscoverSessions(); len(sessions) != 1 {
+		t.Fatalf("phase 2: DiscoverSessions = %d sessions, want 1", len(sessions))
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT session_id FROM agents WHERE id='agent-pi-3'`).Scan(&bound); err != nil {
+		t.Fatal(err)
+	}
+	if bound != liveID {
+		t.Fatalf("phase 2: session_id = %q, want live %q (binding never re-evaluated)", bound, liveID)
+	}
+	if p.lastSessionMap["maq:w3"].SessionID != liveID {
+		t.Fatalf("phase 2: session map = %q, want %q",
+			p.lastSessionMap["maq:w3"].SessionID, liveID)
+	}
+	tr, ok := p.monitorState.GetTracked("maq:w3")
+	if !ok || tr.LastByteOffset != liveFi.Size() {
+		t.Fatalf("phase 2: tracked offset = %d (ok=%v), want live size %d",
+			tr.LastByteOffset, ok, liveFi.Size())
 	}
 }
 

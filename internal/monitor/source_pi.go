@@ -190,8 +190,11 @@ func listSessionFiles(dir string) ([]string, error) {
 }
 
 // discoverSessionFile finds the newest parseable session file for cwd and
-// returns its path plus the session id from its header.
-func (p *PiSource) discoverSessionFile(cwd string) (string, string, error) {
+// returns its path plus the session id from its header. When notBefore is
+// non-zero, candidates must have an mtime at or after it: pi TUI creates
+// its transcript lazily (observed ~26s after pane start), so a file older
+// than the pane is a previous pane's transcript, never the live one.
+func (p *PiSource) discoverSessionFile(cwd string, notBefore time.Time) (string, string, error) {
 	dir := filepath.Join(p.sessionRoot, SlugifyCWD(cwd))
 	names, err := listSessionFiles(dir)
 	if err != nil {
@@ -199,6 +202,12 @@ func (p *PiSource) discoverSessionFile(cwd string) (string, string, error) {
 	}
 	for i := len(names) - 1; i >= 0; i-- {
 		path := filepath.Join(dir, names[i])
+		if !notBefore.IsZero() {
+			info, serr := os.Stat(path)
+			if serr != nil || info.ModTime().Before(notBefore) {
+				continue
+			}
+		}
 		if id := piHeaderID(path); id != "" {
 			return path, id, nil
 		}
@@ -237,11 +246,19 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 		if p.appState.GetWindowRunner(windowID) != "pi" {
 			continue
 		}
-		if entry.SessionID != "" {
-			continue
+		// Re-evaluate the binding every cycle, not only when unbound:
+		// pi TUI creates its transcript file lazily (observed ~26s after
+		// pane start), so a binding persisted in that gap points at a
+		// previous pane's transcript and never self-corrects. Candidates
+		// must postdate the pane's creation (agents.started_at, carried
+		// in the session map as WindowCreatedAt); when the age is
+		// unknown the legacy newest-parseable rule applies. An echoed
+		// $PI_SESSION_FILE still wins over any timestamp-derived id.
+		var notBefore time.Time
+		if entry.WindowCreatedAt > 0 {
+			notBefore = time.UnixMilli(entry.WindowCreatedAt)
 		}
-
-		path, headerID, derr := p.discoverSessionFile(entry.CWD)
+		path, headerID, derr := p.discoverSessionFile(entry.CWD, notBefore)
 		if derr != nil {
 			log.Printf("Pi: no session file for %s (window %s): %v", entry.CWD, windowID, derr)
 			continue
@@ -255,6 +272,10 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 			log.Printf("Pi: binding via echoed $PI_SESSION_FILE %s (header said %s)", echo, sessionID)
 			sessionID = echo
 		}
+		if entry.SessionID == sessionID {
+			continue
+		}
+		prev := entry.SessionID
 
 		entry.SessionID = sessionID
 		sm[key] = entry
@@ -270,6 +291,18 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 				log.Printf("Pi: persist session_id: %v", uerr)
 			}
 			cancel()
+		}
+
+		// Seed the tracked offset at the bound file's current size:
+		// transcript content predating the binding (spawn prompt,
+		// earlier pane) must not relay as backlog on the next poll.
+		if seedPath := p.findSessionFile(entry); seedPath != "" {
+			if fi, serr := os.Stat(seedPath); serr == nil {
+				p.monitorState.UpdateOffset(key, sessionID, seedPath, fi.Size())
+			}
+		}
+		if prev != "" {
+			log.Printf("Pi: rebound %s: %s -> %s", key, prev, sessionID)
 		}
 		log.Printf("Pi session discovered: %s -> %s", entry.CWD, sessionID)
 	}
@@ -355,9 +388,11 @@ func (p *PiSource) ReadNewEntries(session ActiveSession, lastOffset int64) ([]Pa
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024) // 1MB buffer
 	var bytesRead int64
+	var lastLineLen int
 
 	for scanner.Scan() {
 		line := scanner.Bytes()
+		lastLineLen = len(line)
 		bytesRead += int64(len(line)) + 1 // +1 for newline
 
 		if pe := parsePiLine(line); pe != nil {
@@ -373,10 +408,37 @@ func (p *PiSource) ReadNewEntries(session ActiveSession, lastOffset int64) ([]Pa
 	}
 
 	newOffset := offset + bytesRead
+	// An unterminated final line means pi is mid-append: hold the offset
+	// at the line start so the completed line is read (exactly once) on a
+	// later pass, instead of resuming mid-line and silently losing it.
+	if bytesRead > 0 && !endsWithNewline(f, newOffset) {
+		if lastLineLen > 0 {
+			newOffset -= int64(lastLineLen) + 1
+		}
+	}
 	if newOffset == lastOffset {
 		return nil, lastOffset, nil
 	}
+	// Self-track like the claude/openclaude sources: the monitor discards
+	// the returned offset (monitor.go keeps `_ = newOffset`), so without
+	// this write every poll re-read the transcript from the same offset
+	// and re-emitted it.
+	p.monitorState.UpdateOffset(session.Key, entry.SessionID, path, newOffset)
 	return entries, newOffset, nil
+}
+
+// endsWithNewline reports whether the byte just before pos is a newline.
+// An out-of-range pos means the count includes a phantom newline (the last
+// scanned line had none), so there is definitively no newline there.
+func endsWithNewline(f *os.File, pos int64) bool {
+	if pos <= 0 {
+		return true
+	}
+	var b [1]byte
+	if _, err := f.ReadAt(b[:], pos-1); err != nil {
+		return false // beyond EOF or unreadable: hold the offset back
+	}
+	return b[0] == '\n'
 }
 
 // parsePiLine converts one pi JSONL line into a ParsedEntry, or nil when
