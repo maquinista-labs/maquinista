@@ -249,12 +249,10 @@ func readPiInventory(dir string) []piFile {
 // bound to; windows with no file yet are absent from the result.
 //
 // Binding rules, per cwd group of live windows:
-//  1. Sticky: an existing binding survives while its transcript exists and
-//     was created at/after the pane's start (agents.started_at, carried as
-//     WindowCreatedAt). A binding left over from a previous pane epoch
-//     points at an older file and is invalidated — this self-corrects the
-//     lazily-created transcript gap (pi writes its first byte ~26s after
-//     spawn) without re-running a newest-file rule.
+//  1. Sticky: an existing binding survives while its transcript file
+//     exists. Resume makes this safe: reconcile re-spawns panes with their
+//     session id, so a pane may legitimately hold a transcript created in
+//     a previous daemon epoch, and a monitor restart must not drop it.
 //  2. Exclusive claims: two live windows sharing a cwd must never hold the
 //     same transcript. When they do (concurrent panes defeat any
 //     newest-file rule), the whole group is re-paired deterministically:
@@ -263,20 +261,21 @@ func readPiInventory(dir string) []piFile {
 //     the pane's start. Until its own transcript appears it stays unbound
 //     instead of borrowing a sibling's file.
 func resolvePiBindings(windows []*piWindow, inventory func(cwd string) []piFile) map[string]piFile {
-	// Pass 1: validate sticky bindings.
+	// Pass 1: validate sticky bindings. A binding whose transcript file
+	// still exists stays — even when the file predates the pane, because
+	// reconcile resumes pi sessions by id and a pane legitimately holds a
+	// transcript from a previous daemon epoch. The age filter's real job
+	// is pass 3 (backfill): a fresh pane must not claim a dead sibling's
+	// file while its own lazily-created transcript is still missing.
 	for _, w := range windows {
 		if w.entry.SessionID == "" {
 			continue
 		}
 		for _, f := range inventory(w.entry.CWD) {
-			if f.id != w.entry.SessionID {
-				continue
+			if f.id == w.entry.SessionID {
+				w.sticky = true
+				break
 			}
-			if !w.notBefore.IsZero() && f.created.Before(w.notBefore.Add(-piBindingSlack)) {
-				break // transcript predates the pane: previous epoch
-			}
-			w.sticky = true
-			break
 		}
 	}
 

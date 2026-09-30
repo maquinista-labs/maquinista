@@ -119,23 +119,48 @@ func TestResolvePiBindings_LazyNewPaneStaysUnbound(t *testing.T) {
 	}
 }
 
-// A binding carried over from a previous pane epoch points at a file older
-// than the pane and must be invalidated (self-correcting the lazy-creation
-// gap), while files claimed by other live windows stay off limits.
-func TestResolvePiBindings_StaleEpochRebindsToOwnFile(t *testing.T) {
+// Reconcile resumes pi sessions by id, so a restarted pane legitimately
+// holds a transcript created in a previous daemon epoch. Sticky bindings
+// must survive that — only fresh backfill (empty session_id) is age
+// filtered.
+func TestResolvePiBindings_ResumedSessionKeepsOldTranscript(t *testing.T) {
 	dir := t.TempDir()
-	idA := "aaaaaaaa-0000-0000-0000-000000000001" // dead epoch's transcript
-	idB := "bbbbbbbb-0000-0000-0000-000000000002" // another live pane's
-	idC := "cccccccc-0000-0000-0000-000000000003" // this pane's new transcript
+	idA := "aaaaaaaa-0000-0000-0000-000000000001" // pre-restart transcript
+	idB := "bbbbbbbb-0000-0000-0000-000000000002"
+	writePiSessionFile(t, dir, time.Date(2026, 9, 30, 22, 34, 44, 0, time.UTC), idA)
+	writePiSessionFile(t, dir, time.Date(2026, 10, 1, 0, 56, 16, 0, time.UTC), idB)
+
+	wResumed := piWindowFor("maquinista:3", "/repo", idA, time.Date(2026, 10, 1, 2, 10, 0, 0, time.UTC))
+	wOther := piWindowFor("maquinista:4", "/repo", idB, time.Date(2026, 10, 1, 0, 56, 10, 0, time.UTC))
+
+	inv := func(string) []piFile { return readPiInventory(dir) }
+	bound := resolvePiBindings([]*piWindow{wResumed, wOther}, inv)
+
+	if bound["maquinista:3"].id != idA {
+		t.Fatalf("resumed pane bound to %v, want its resumed transcript %s", bound["maquinista:3"].id, idA)
+	}
+	if bound["maquinista:4"].id != idB {
+		t.Fatalf("sibling bound to %v, want %s", bound["maquinista:4"].id, idB)
+	}
+}
+
+// Fresh backfill after a pane restart: the restarted pane's row has no
+// session_id yet; it must claim only files created at/after its own start,
+// never the dead epoch's transcript, and never a claimed sibling's file.
+func TestResolvePiBindings_FreshBackfillAgeAndClaims(t *testing.T) {
+	dir := t.TempDir()
+	idA := "aaaaaaaa-0000-0000-0000-000000000001" // dead epoch
+	idB := "bbbbbbbb-0000-0000-0000-000000000002" // sibling's
+	idC := "cccccccc-0000-0000-0000-000000000003" // restarted pane's own
 	writePiSessionFile(t, dir, time.Date(2026, 9, 30, 22, 34, 44, 0, time.UTC), idA)
 	writePiSessionFile(t, dir, time.Date(2026, 10, 1, 0, 56, 16, 0, time.UTC), idB)
 	writePiSessionFile(t, dir, time.Date(2026, 10, 1, 2, 10, 26, 0, time.UTC), idC)
 
-	wOther := piWindowFor("maquinista:4", "/repo", idB, time.Date(2026, 10, 1, 0, 56, 10, 0, time.UTC))
-	wRestarted := piWindowFor("maquinista:3", "/repo", idA, time.Date(2026, 10, 1, 2, 10, 0, 0, time.UTC))
+	wSibling := piWindowFor("maquinista:4", "/repo", idB, time.Date(2026, 10, 1, 0, 56, 10, 0, time.UTC))
+	wRestarted := piWindowFor("maquinista:3", "/repo", "", time.Date(2026, 10, 1, 2, 10, 0, 0, time.UTC))
 
 	inv := func(string) []piFile { return readPiInventory(dir) }
-	bound := resolvePiBindings([]*piWindow{wOther, wRestarted}, inv)
+	bound := resolvePiBindings([]*piWindow{wSibling, wRestarted}, inv)
 
 	if bound["maquinista:3"].id != idC {
 		t.Fatalf("restarted pane bound to %v, want its own new transcript %s", bound["maquinista:3"].id, idC)

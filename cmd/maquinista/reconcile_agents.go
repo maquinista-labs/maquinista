@@ -86,6 +86,25 @@ func reconcileAgentPanes(ctx context.Context, cfg *config.Config, pool *pgxpool.
 		return 0, err
 	}
 
+	// Resume-guard: two live pi agents must never resume the same
+	// transcript — pi sessions are single-writer, and a shared file makes
+	// the monitor relay one reply to every topic holding it. Duplicate
+	// session_ids (corrupted bindings) all boot fresh instead: each pane
+	// creates its own transcript and the monitor's binding pass re-pairs
+	// them deterministically afterwards.
+	sessionClaims := map[string]int{}
+	for _, a := range agents {
+		if a.RunnerType == "pi" && a.SessionID != "" {
+			sessionClaims[a.SessionID]++
+		}
+	}
+	dupSessions := map[string]bool{}
+	for id, n := range sessionClaims {
+		if n > 1 {
+			dupSessions[id] = true
+		}
+	}
+
 	respawned := 0
 	for _, a := range agents {
 		// Already live? The DB-tracked tmux_window may be stale after a
@@ -93,6 +112,13 @@ func reconcileAgentPanes(ctx context.Context, cfg *config.Config, pool *pgxpool.
 		// remembered won't resolve. tmuxWindowExists guards against that.
 		if a.TmuxWindow != "" && tmuxWindowExists(cfg.TmuxSessionName, a.TmuxWindow) {
 			continue
+		}
+		if dupSessions[a.SessionID] {
+			log.Printf("reconcile: %s drops duplicate pi session %s (booting fresh)", a.ID, a.SessionID)
+			a.SessionID = ""
+			if _, err := pool.Exec(ctx, `UPDATE agents SET session_id='' WHERE id=$1`, a.ID); err != nil {
+				log.Printf("reconcile: clear duplicate session_id for %s: %v", a.ID, err)
+			}
 		}
 		if err := respawnAgent(ctx, cfg, pool, botState, defaultCWD, a.ID, a.CWD, a.RunnerType, a.SessionID, a.WorkspaceScope, a.RepoRoot); err != nil {
 			log.Printf("reconcile: respawn %s: %v", a.ID, err)
@@ -226,13 +252,18 @@ func respawnAgent(ctx context.Context, cfg *config.Config, pool *pgxpool.Pool, b
 		}
 	}
 
-	// Publish the new tmux_window. Database controls status; only update
-	// tmux_window (derived state). Never override stop_requested or status.
+	// Publish the new tmux_window and mark the pane live. This is the one
+	// status write reconcile owns: the pane was just proven up, and a row
+	// left 'stopped' here leaves the monitor blind until a human flips it
+	// (observed 01/10). Operator intent is respected upstream — rows with
+	// stop_requested=TRUE never reach this function. started_at refreshes
+	// the pane epoch for binding/discovery logic.
 	upCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	if _, err := pool.Exec(upCtx, `
 		UPDATE agents
-		SET tmux_window = $2, last_seen = NOW()
+		SET tmux_window = $2, last_seen = NOW(),
+		    status = 'running', started_at = NOW()
 		WHERE id = $1
 	`, agentID, windowID); err != nil {
 		return fmt.Errorf("update agents: %w", err)
