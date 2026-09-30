@@ -172,6 +172,178 @@ func piHeaderID(path string) string {
 	return h.ID
 }
 
+// piBindingSlack relaxes the pane-age filter for bindings: a transcript's
+// embedded creation time should always postdate agents.started_at (the
+// agents row is written before the pane spawns), but pi stamps filenames
+// in UTC while the DB clock may drift slightly.
+const piBindingSlack = 90 * time.Second
+
+// piFile is one parseable session transcript found in a cwd's session dir.
+type piFile struct {
+	path    string
+	id      string
+	created time.Time // from the <ts>_ filename prefix; zero when unparseable
+}
+
+// piWindow is one live pi window (from the runner session map) competing
+// for a transcript binding.
+type piWindow struct {
+	key       string
+	entry     state.SessionMapEntry
+	windowID  string
+	notBefore time.Time // pane creation (agents.started_at); zero = unknown
+	sticky    bool      // existing binding validated this cycle
+}
+
+// piFileCreatedTime parses pi's filename prefix — UTC
+// "2006-01-02T15-04-05.000Z" with ':' rendered as '-' — e.g.
+// 2026-09-30T22-34-44-810Z_01a0f474-….jsonl. Zero when it doesn't match.
+// This is the file's CREATION time; ModTime moves on every append and is
+// useless for deciding which pane a file belongs to.
+func piFileCreatedTime(name string) time.Time {
+	idx := strings.Index(name, "_")
+	if idx <= 0 {
+		return time.Time{}
+	}
+	stamp := name[:idx]
+	// pi renders the millis separator as '-' (…T22-34-44-810Z); Go's
+	// fractional-second layout uses '.'. Normalize the dash form to the
+	// dot form — only when no fractional dot already follows the 'T' —
+	// so both spellings parse.
+	if ti := strings.Index(stamp, "T"); ti >= 0 && strings.LastIndex(stamp, ".") < ti {
+		if i := strings.LastIndex(stamp, "-"); i > ti {
+			stamp = stamp[:i] + "." + stamp[i+1:]
+		}
+	}
+	t, err := time.Parse("2006-01-02T15-04-05.000Z", stamp)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// readPiInventory lists a cwd's parseable session files sorted ascending by
+// name — pi's <timestamp>_ prefix makes lexicographic order chronological
+// by creation.
+func readPiInventory(dir string) []piFile {
+	names, err := listSessionFiles(dir)
+	if err != nil {
+		return nil
+	}
+	var inv []piFile
+	for _, n := range names {
+		id := piHeaderID(filepath.Join(dir, n))
+		if id == "" {
+			continue
+		}
+		inv = append(inv, piFile{
+			path:    filepath.Join(dir, n),
+			id:      id,
+			created: piFileCreatedTime(n),
+		})
+	}
+	return inv
+}
+
+// resolvePiBindings computes which transcript file each live pi window is
+// bound to; windows with no file yet are absent from the result.
+//
+// Binding rules, per cwd group of live windows:
+//  1. Sticky: an existing binding survives while its transcript exists and
+//     was created at/after the pane's start (agents.started_at, carried as
+//     WindowCreatedAt). A binding left over from a previous pane epoch
+//     points at an older file and is invalidated — this self-corrects the
+//     lazily-created transcript gap (pi writes its first byte ~26s after
+//     spawn) without re-running a newest-file rule.
+//  2. Exclusive claims: two live windows sharing a cwd must never hold the
+//     same transcript. When they do (concurrent panes defeat any
+//     newest-file rule), the whole group is re-paired deterministically:
+//     newest pane ↔ newest file.
+//  3. An unbound window takes the newest unclaimed file created at/after
+//     the pane's start. Until its own transcript appears it stays unbound
+//     instead of borrowing a sibling's file.
+func resolvePiBindings(windows []*piWindow, inventory func(cwd string) []piFile) map[string]piFile {
+	// Pass 1: validate sticky bindings.
+	for _, w := range windows {
+		if w.entry.SessionID == "" {
+			continue
+		}
+		for _, f := range inventory(w.entry.CWD) {
+			if f.id != w.entry.SessionID {
+				continue
+			}
+			if !w.notBefore.IsZero() && f.created.Before(w.notBefore.Add(-piBindingSlack)) {
+				break // transcript predates the pane: previous epoch
+			}
+			w.sticky = true
+			break
+		}
+	}
+
+	// Pass 2: a transcript claimed by two live windows is corrupt state;
+	// re-pair the whole cwd group deterministically.
+	groups := map[string][]*piWindow{}
+	for _, w := range windows {
+		groups[w.entry.CWD] = append(groups[w.entry.CWD], w)
+	}
+	for _, ws := range groups {
+		counts := map[string]int{}
+		for _, w := range ws {
+			if w.sticky {
+				counts[w.entry.SessionID]++
+			}
+		}
+		dup := false
+		for _, c := range counts {
+			if c > 1 {
+				dup = true
+			}
+		}
+		if !dup {
+			continue
+		}
+		for _, w := range ws {
+			w.sticky = false
+		}
+	}
+
+	// Pass 3: bind. Newest pane claims first, newest unclaimed file first,
+	// so concurrent panes on one cwd each end up with their own file.
+	bound := map[string]piFile{}
+	claimed := map[string]bool{}
+	var toBind []*piWindow
+	for _, w := range windows {
+		if !w.sticky {
+			toBind = append(toBind, w)
+			continue
+		}
+		for _, f := range inventory(w.entry.CWD) {
+			if f.id == w.entry.SessionID {
+				bound[w.key] = f
+				claimed[f.id] = true
+				break
+			}
+		}
+	}
+	sort.Slice(toBind, func(i, j int) bool { return toBind[i].notBefore.After(toBind[j].notBefore) })
+	for _, w := range toBind {
+		inv := inventory(w.entry.CWD)
+		for i := len(inv) - 1; i >= 0; i-- { // newest first
+			f := inv[i]
+			if claimed[f.id] {
+				continue
+			}
+			if !w.notBefore.IsZero() && f.created.Before(w.notBefore.Add(-piBindingSlack)) {
+				continue
+			}
+			bound[w.key] = f
+			claimed[f.id] = true
+			break
+		}
+	}
+	return bound
+}
+
 // listSessionFiles returns the .jsonl file names in dir sorted ascending
 // (pi's <timestamp>_ prefix makes lexicographic order chronological).
 func listSessionFiles(dir string) ([]string, error) {
@@ -237,7 +409,12 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 		}
 	}
 
-	// Backfill session ids for hookless pi agents.
+	// Collect live pi windows from the runner session map, then resolve
+	// transcript bindings for the whole set at once: sticky per pane,
+	// exclusively claimed, deterministically re-paired on conflict (see
+	// resolvePiBindings). An echoed $PI_SESSION_FILE still wins over any
+	// derived id.
+	var windows []*piWindow
 	for key, entry := range sm {
 		windowID := windowIDFromSessionKey(key)
 		if windowID == "" {
@@ -246,25 +423,36 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 		if p.appState.GetWindowRunner(windowID) != "pi" {
 			continue
 		}
-		// Re-evaluate the binding every cycle, not only when unbound:
-		// pi TUI creates its transcript file lazily (observed ~26s after
-		// pane start), so a binding persisted in that gap points at a
-		// previous pane's transcript and never self-corrects. Candidates
-		// must postdate the pane's creation (agents.started_at, carried
-		// in the session map as WindowCreatedAt); when the age is
-		// unknown the legacy newest-parseable rule applies. An echoed
-		// $PI_SESSION_FILE still wins over any timestamp-derived id.
-		var notBefore time.Time
+		w := &piWindow{key: key, entry: entry, windowID: windowID}
 		if entry.WindowCreatedAt > 0 {
-			notBefore = time.UnixMilli(entry.WindowCreatedAt)
+			w.notBefore = time.UnixMilli(entry.WindowCreatedAt)
 		}
-		path, headerID, derr := p.discoverSessionFile(entry.CWD, notBefore)
-		if derr != nil {
-			log.Printf("Pi: no session file for %s (window %s): %v", entry.CWD, windowID, derr)
+		windows = append(windows, w)
+	}
+
+	inventories := map[string][]piFile{}
+	inventory := func(cwd string) []piFile {
+		if inv, ok := inventories[cwd]; ok {
+			return inv
+		}
+		inv := readPiInventory(filepath.Join(p.sessionRoot, SlugifyCWD(cwd)))
+		inventories[cwd] = inv
+		return inv
+	}
+
+	bound := resolvePiBindings(windows, inventory)
+
+	for _, w := range windows {
+		f, ok := bound[w.key]
+		if !ok {
+			// pi creates the transcript lazily (~26s after spawn); the
+			// window binds on a later cycle, when its own file exists.
+			// It must never borrow a sibling pane's file in the meantime.
 			continue
 		}
-		sessionID := headerID
-		if echo := piEchoSessionID(path); echo != "" && echo != sessionID {
+		entry := sm[w.key]
+		sessionID := f.id
+		if echo := piEchoSessionID(f.path); echo != "" && echo != sessionID {
 			// The transcript echoed its own $PI_SESSION_FILE — that is
 			// the authoritative binding, not the file we happened to
 			// find by timestamp (the agent may have resumed another
@@ -278,7 +466,7 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 		prev := entry.SessionID
 
 		entry.SessionID = sessionID
-		sm[key] = entry
+		sm[w.key] = entry
 
 		// Persist so the bot and follow-up polls see it without
 		// rediscovering.
@@ -287,7 +475,7 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 			if _, uerr := p.pool.Exec(ctx, `
 				UPDATE agents SET session_id=$1, last_seen=NOW()
 				WHERE tmux_session=$2 AND tmux_window=$3
-			`, sessionID, strings.SplitN(key, ":", 2)[0], strings.SplitN(key, ":", 2)[1]); uerr != nil {
+			`, sessionID, strings.SplitN(w.key, ":", 2)[0], strings.SplitN(w.key, ":", 2)[1]); uerr != nil {
 				log.Printf("Pi: persist session_id: %v", uerr)
 			}
 			cancel()
@@ -296,13 +484,11 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 		// Seed the tracked offset at the bound file's current size:
 		// transcript content predating the binding (spawn prompt,
 		// earlier pane) must not relay as backlog on the next poll.
-		if seedPath := p.findSessionFile(entry); seedPath != "" {
-			if fi, serr := os.Stat(seedPath); serr == nil {
-				p.monitorState.UpdateOffset(key, sessionID, seedPath, fi.Size())
-			}
+		if fi, serr := os.Stat(f.path); serr == nil {
+			p.monitorState.UpdateOffset(w.key, sessionID, f.path, fi.Size())
 		}
 		if prev != "" {
-			log.Printf("Pi: rebound %s: %s -> %s", key, prev, sessionID)
+			log.Printf("Pi: rebound %s: %s -> %s", w.key, prev, sessionID)
 		}
 		log.Printf("Pi session discovered: %s -> %s", entry.CWD, sessionID)
 	}
