@@ -8,7 +8,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/dbtest"
 )
 
-func TestMigration034_LinearIssueMap(t *testing.T) {
+func TestMigration034_TicketIssueMap(t *testing.T) {
 	pool, _ := dbtest.PgContainer(t)
 	applied, err := RunMigrations(pool)
 	if err != nil {
@@ -22,14 +22,14 @@ func TestMigration034_LinearIssueMap(t *testing.T) {
 		}
 		return false
 	}
-	if !has("034_linear_bridge.sql") {
-		t.Fatalf("034_linear_bridge.sql was not applied; got %v", applied)
+	if !has("034_ticket_bridge.sql") {
+		t.Fatalf("034_ticket_bridge.sql was not applied; got %v", applied)
 	}
 	ctx := context.Background()
 
 	want := []struct{ col, dtype, nullable string }{
-		{"linear_issue_id", "text", "NO"},
-		{"identifier", "text", "NO"},
+		{"issue_id", "text", "NO"},
+		{"issue_key", "text", "NO"},
 		{"team_id", "text", "NO"},
 		{"task_id", "text", "NO"},
 		{"last_synced_state", "text", "YES"},
@@ -46,24 +46,24 @@ func TestMigration034_LinearIssueMap(t *testing.T) {
 		err := pool.QueryRow(ctx, `
 			SELECT data_type, is_nullable, column_default
 			FROM information_schema.columns
-			WHERE table_name='linear_issue_map' AND column_name=$1`, w.col,
+		WHERE table_name='ticket_issue_map' AND column_name=$1`, w.col,
 		).Scan(&dtype, &nullable, &dflt)
 		if err != nil {
-			t.Errorf("linear_issue_map.%s missing: %v", w.col, err)
+			t.Errorf("ticket_issue_map.%s missing: %v", w.col, err)
 			continue
 		}
 		if dtype != w.dtype || nullable != w.nullable {
-			t.Errorf("linear_issue_map.%s: got %s nullable=%s, want %s nullable=%s",
+			t.Errorf("ticket_issue_map.%s: got %s nullable=%s, want %s nullable=%s",
 				w.col, dtype, nullable, w.dtype, w.nullable)
 		}
 		switch w.col {
 		case "attempts":
 			if dflt == nil || *dflt != "0" {
-				t.Errorf("linear_issue_map.attempts default: got %v, want 0", dflt)
+				t.Errorf("ticket_issue_map.attempts default: got %v, want 0", dflt)
 			}
 		case "next_attempt_at", "created_at", "updated_at":
 			if dflt == nil || !strings.Contains(*dflt, "now()") {
-				t.Errorf("linear_issue_map.%s default: got %v, want now()", w.col, dflt)
+				t.Errorf("ticket_issue_map.%s default: got %v, want now()", w.col, dflt)
 			}
 		}
 	}
@@ -71,15 +71,15 @@ func TestMigration034_LinearIssueMap(t *testing.T) {
 	var n int
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
-		WHERE r.relname = 'linear_issue_map' AND c.contype = 'p'`,
+		WHERE r.relname = 'ticket_issue_map' AND c.contype = 'p'`,
 	).Scan(&n); err != nil || n != 1 {
-		t.Errorf("linear_issue_map primary key: n=%d err=%v", n, err)
+		t.Errorf("ticket_issue_map primary key: n=%d err=%v", n, err)
 	}
 	if err := pool.QueryRow(ctx, `
 		SELECT count(*) FROM pg_constraint c JOIN pg_class r ON r.oid = c.conrelid
-		WHERE r.relname = 'linear_issue_map' AND c.contype = 'u'`,
+		WHERE r.relname = 'ticket_issue_map' AND c.contype = 'u'`,
 	).Scan(&n); err != nil || n != 1 {
-		t.Errorf("linear_issue_map UNIQUE(task_id): n=%d err=%v", n, err)
+		t.Errorf("ticket_issue_map UNIQUE(task_id): n=%d err=%v", n, err)
 	}
 }
 
@@ -125,22 +125,22 @@ func TestMigration034_Cascade(t *testing.T) {
 
 	mustExec(t, pool, `INSERT INTO tasks (id, title) VALUES ('t1', 'cascade me')`)
 	mustExec(t, pool, `
-		INSERT INTO linear_issue_map (linear_issue_id, identifier, team_id, task_id)
-		VALUES ('li-1', 'MAQ-1', 'team-maq', 't1')`)
+		INSERT INTO ticket_issue_map (issue_id, issue_key, team_id, task_id)
+		VALUES ('iss-1', 'MAQ-1', 'team-maq', 't1')`)
 
 	// UNIQUE(task_id): a second map row for the same task must be refused.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO linear_issue_map (linear_issue_id, identifier, team_id, task_id)
-		VALUES ('li-2', 'MAQ-2', 'team-maq', 't1')`); err == nil {
-		t.Errorf("second linear_issue_map row for the same task_id should violate UNIQUE")
+		INSERT INTO ticket_issue_map (issue_id, issue_key, team_id, task_id)
+		VALUES ('iss-2', 'MAQ-2', 'team-maq', 't1')`); err == nil {
+		t.Errorf("second ticket_issue_map row for the same task_id should violate UNIQUE")
 	}
 
 	mustExec(t, pool, `DELETE FROM tasks WHERE id='t1'`)
 	var n int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM linear_issue_map WHERE task_id='t1'`).Scan(&n); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM ticket_issue_map WHERE task_id='t1'`).Scan(&n); err != nil {
 		t.Fatalf("count after delete: %v", err)
 	}
 	if n != 0 {
-		t.Errorf("cascade did not remove linear_issue_map rows: n=%d", n)
+		t.Errorf("cascade did not remove ticket_issue_map rows: n=%d", n)
 	}
 }
