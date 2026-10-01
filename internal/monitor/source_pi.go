@@ -183,6 +183,7 @@ type piFile struct {
 	path    string
 	id      string
 	created time.Time // from the <ts>_ filename prefix; zero when unparseable
+	mtime   time.Time // last write observed on disk; zero when unreadable
 }
 
 // piWindow is one live pi window (from the runner session map) competing
@@ -193,6 +194,20 @@ type piWindow struct {
 	windowID  string
 	notBefore time.Time // pane creation (agents.started_at); zero = unknown
 	sticky    bool      // existing binding validated this cycle
+}
+
+// fileModTime stats path and returns its last-write time, or zero.
+func fileModTime(path string) time.Time {
+	if fi, err := os.Stat(path); err == nil {
+		return fi.ModTime()
+	}
+	return time.Time{}
+}
+
+// sameEpoch reports whether f was created within piBindingSlack of the
+// window's start (its own pane's epoch, not a resumed older transcript).
+func sameEpoch(f piFile, notBefore time.Time) bool {
+	return !notBefore.IsZero() && !f.created.Before(notBefore.Add(-piBindingSlack))
 }
 
 // piFileCreatedTime parses pi's filename prefix — UTC
@@ -240,6 +255,7 @@ func readPiInventory(dir string) []piFile {
 			path:    filepath.Join(dir, n),
 			id:      id,
 			created: piFileCreatedTime(n),
+			mtime:   fileModTime(filepath.Join(dir, n)),
 		})
 	}
 	return inv
@@ -260,6 +276,13 @@ func readPiInventory(dir string) []piFile {
 //  3. An unbound window takes the newest unclaimed file created at/after
 //     the pane's start. Until its own transcript appears it stays unbound
 //     instead of borrowing a sibling's file.
+//  4. A sticky binding whose transcript was last written BEFORE the pane
+//     started is stale — the pane never appended to it (any write bumps
+//     the mtime). When an unclaimed same-epoch transcript exists, the
+//     stale binding is invalidated and rule 3 re-pairs (pane booted fresh
+//     after a restart and discovery never repaired it); with no candidate
+//     the stale binding stands, because an idle resumed pane must not be
+//     unbound.
 func resolvePiBindings(windows []*piWindow, inventory func(cwd string) []piFile) map[string]piFile {
 	// Pass 1: validate sticky bindings. A binding whose transcript file
 	// still exists stays — even when the file predates the pane, because
@@ -276,6 +299,52 @@ func resolvePiBindings(windows []*piWindow, inventory func(cwd string) []piFile)
 				w.sticky = true
 				break
 			}
+		}
+	}
+
+	// Pass 1.5: stale-binding invalidation. A sticky binding whose
+	// transcript was last written BEFORE the pane started is provably not
+	// this pane's transcript — any pane write bumps the mtime. Resume
+	// legitimately holds such bindings (idle resumed panes), so the
+	// binding only stands while the pane may still append to it. When the
+	// pane never wrote its bound file AND an unclaimed same-epoch
+	// transcript exists (the pane booted fresh after a restart and
+	// discovery never re-paired it), invalidate so pass 3 re-pairs
+	// deterministically. Without a candidate the binding is kept — an
+	// idle pane must not be unbound.
+	for _, w := range windows {
+		if !w.sticky || w.notBefore.IsZero() {
+			continue
+		}
+		inv := inventory(w.entry.CWD)
+		var bf *piFile
+		for i := range inv {
+			if inv[i].id == w.entry.SessionID {
+				bf = &inv[i]
+				break
+			}
+		}
+		if bf == nil || !bf.mtime.Before(w.notBefore) {
+			continue // file gone (pass 3 handles) or pane wrote it
+		}
+		for _, f := range inv {
+			if f.id == w.entry.SessionID || !sameEpoch(f, w.notBefore) {
+				continue
+			}
+			claimedByOther := false
+			for _, o := range windows {
+				if o != w && o.sticky && o.entry.SessionID == f.id {
+					claimedByOther = true
+					break
+				}
+			}
+			if claimedByOther {
+				continue
+			}
+			w.sticky = false
+			log.Printf("Pi: stale binding %s -> %s (mtime %s predates pane start %s), re-pairing",
+				w.key, bf.id, bf.mtime.UTC().Format(time.RFC3339), w.notBefore.UTC().Format(time.RFC3339))
+			break
 		}
 	}
 
@@ -338,6 +407,24 @@ func resolvePiBindings(windows []*piWindow, inventory func(cwd string) []piFile)
 			bound[w.key] = f
 			claimed[f.id] = true
 			break
+		}
+	}
+
+	// Fallback: a window the staleness rule invalidated that pass 3 left
+	// without a candidate re-claims its persisted transcript — monitoring
+	// the old file beats dropping the window to unbound. The mtime rule
+	// re-arms: the next pane write (or a later repair candidate) heals it.
+	for _, w := range windows {
+		if _, ok := bound[w.key]; ok || w.entry.SessionID == "" {
+			continue
+		}
+		for _, f := range inventory(w.entry.CWD) {
+			if f.id == w.entry.SessionID {
+				bound[w.key] = f
+				claimed[f.id] = true
+				log.Printf("Pi: no repair candidate for %s, keeping stale %s", w.key, f.id)
+				break
+			}
 		}
 	}
 	return bound
@@ -460,6 +547,20 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 			sessionID = echo
 		}
 		if entry.SessionID == sessionID {
+			// Unchanged binding — but if nothing is tracked for this key
+			// (fresh monitor state over an already-bound pane), the poll
+			// loop would read from 0 and relay the transcript's whole
+			// history. Seed it once, by the same epoch rule as a fresh
+			// binding: same-epoch → 0, pre-epoch → current size.
+			if _, tracked := p.monitorState.GetTracked(w.key); !tracked {
+				if fi, serr := os.Stat(f.path); serr == nil {
+					off := fi.Size()
+					if sameEpoch(f, w.notBefore) {
+						off = 0
+					}
+					p.monitorState.UpdateOffset(w.key, sessionID, f.path, off)
+				}
+			}
 			continue
 		}
 		prev := entry.SessionID
@@ -480,11 +581,19 @@ func (p *PiSource) DiscoverSessions() []ActiveSession {
 			cancel()
 		}
 
-		// Seed the tracked offset at the bound file's current size:
-		// transcript content predating the binding (spawn prompt,
+		// Seed the tracked offset. A transcript of this pane's own epoch
+		// (created within piBindingSlack of the pane's start) seeds at 0
+		// so a first turn that completed before discovery still relays —
+		// user-role entries never reach the outbox sink, so the spawn
+		// prompt cannot echo. An older (resumed) transcript seeds at its
+		// current size: content predating the binding (spawn prompt,
 		// earlier pane) must not relay as backlog on the next poll.
 		if fi, serr := os.Stat(f.path); serr == nil {
-			p.monitorState.UpdateOffset(w.key, sessionID, f.path, fi.Size())
+			off := fi.Size()
+			if sameEpoch(f, w.notBefore) {
+				off = 0
+			}
+			p.monitorState.UpdateOffset(w.key, sessionID, f.path, off)
 		}
 		if prev != "" {
 			log.Printf("Pi: rebound %s: %s -> %s", w.key, prev, sessionID)
