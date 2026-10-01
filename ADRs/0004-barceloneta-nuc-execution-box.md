@@ -18,7 +18,12 @@ was verified **2026-10-01, by direct inspection**:
 - **Bare metal**: `systemd-detect-virt` → `none`; `/dev/kvm` present
   (`crw-rw----+ root:kvm`); VT-x flags on every core. KVM is real here.
 - **Capacity**: Intel Core 3 100U (6C/8T, 15 W U-series), 16 GB RAM
-  (~12 GB available), 56 GB NVMe with 43 GB free.
+  (~12 GB available), 931 GB NVMe as plain ext4 partitions (no LVM):
+  `/` 57 GB (43 GB free), `/var` 22 GB, swap 16 GB, `/home` 834 GB
+  (**808 GB available** — Proxmox `home` dir storage, holds the
+  ct100–102 disks). Earlier draft quoted the root partition only
+  ("56 GB NVMe with 43 GB free"); corrected by direct inspection
+  2026-10-01 (`lsblk` + `pvesm status`).
 - **Existing load**: maquinista daemon + tmux agents (the workload this ADR
   would isolate) and Proxmox LXC containers ct100–ct102 (pihole, navidrome,
   jellyfin) rooted on the same host.
@@ -90,6 +95,11 @@ design changes.
 - **G-00a Coexistence budget**: k3s (single node) installs *alongside*
   Proxmox + LXC on 16 GB without disturbing ct100–ct102 or the maquinista
   daemon. Measured: free RAM after k3s idle ≤ 4 GB, no OOM events in 24 h.
+  **Disk locus (decided 2026-10-01)**: k3s runs with `--data-dir /home/k3s`
+  so containerd images, cluster state and local-path PVCs land on `/home`
+  (808 GB free) instead of the default `/var/lib/rancher` — `/var` is its
+  own 22 GB partition shared with the maquinista Postgres and would fill
+  first under sandbox image churn.
   Fallback shape if the host is too tight: k3s inside one dedicated LXC
   (gVisor-only; microVM mode then needs KVM passthrough — likely no-go, so
   this fallback forfeits microVM, and is recorded as such).
@@ -153,8 +163,9 @@ this a config move, not a port.
 
 - ADR-0002 — `Executor` port; ADR-0003 — Substrate/AX plan this ADR revises
   (its S-00a/S-00b gates re-scope into G-00b/G-00c here)
-- Barceloneta inspection 2026-10-01: `systemd-detect-virt`=none, `/dev/kvm`
-  present, VT-x ×16, Core 3 100U / 16 GB / 56 GB NVMe (43 GB free)
+- Barceloneta inspection 2026-10-01 (disk layout re-verified same day):
+  `systemd-detect-virt`=none, `/dev/kvm` present, VT-x ×16,
+  Core 3 100U / 16 GB / 931 GB NVMe — `/` 43 GB free, `/home` 808 GB free
 - maquinista incident 30/09–01/10: two pi panes shared one transcript;
   fixed in `458c6c6` + `cbc7ab4` (resume-safe bindings, duplicate-session
   resume-guard) — the isolation motivation, on record
