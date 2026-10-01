@@ -12,3 +12,4 @@ Status lifecycle: Proposto → Aceito → Depreciado/Substituído.
 | [0002](0002-executor-port.md) | Executor port — decouple agent session I/O from tmux (ports & adapters) | Proposto |
 | [0003](0003-substrate-hetzner-multitenant.md) | Substrate/AX executor on dedicated Hetzner box, multi-tenant | Proposto |
 | [0004](0004-barceloneta-nuc-execution-box.md) | Barceloneta NUC as execution box — owned silicon first, Robot as scale-out | Proposto |
+| [0005](0005-linear-pr-iteration-pipeline.md) | Linear-driven PR iteration pipeline — tlc-spec-lean execution via maquinista agent sessions | Proposto |
