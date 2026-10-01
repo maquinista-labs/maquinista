@@ -23,6 +23,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
+	"github.com/maquinista-labs/maquinista/internal/pipeline"
 	"github.com/maquinista-labs/maquinista/internal/relay"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/scheduler"
@@ -454,6 +455,24 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				log.Printf("auto-tunnel: %s", url)
 			}
 		}()
+	}
+
+	// Linear bridge (ADR-0005): MAQ Todo issues labeled "pipeline" become
+	// task rows the task-scheduler claims; linearSync mirrors task state
+	// back to the board. No-op unless LINEAR_API_KEY + MAQUINISTA_LINEAR_TEAM_ID.
+	if pCfg := pipeline.FromEnv(); pCfg.Enabled() && pool != nil {
+		lc := pipeline.NewLinearClient(pCfg.APIKey)
+		go func() {
+			if err := pipeline.RunBridge(ctx, pool, lc, pCfg); err != nil && ctx.Err() == nil {
+				log.Printf("pipeline: bridge: %v", err)
+			}
+		}()
+		go func() {
+			if err := pipeline.RunSync(ctx, pool, lc, pCfg.TeamID, 10*time.Second); err != nil && ctx.Err() == nil {
+				log.Printf("pipeline: sync: %v", err)
+			}
+		}()
+		log.Println("pipeline: linear bridge started")
 	}
 
 	err = b.Run(ctx)
