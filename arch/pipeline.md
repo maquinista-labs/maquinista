@@ -75,8 +75,37 @@ Core neutrality is enforced by check: under `internal/pipeline/` only
 `linear.go` + `linear_test.go` may mention linear; under `internal/db/` and
 `cmd/` none may.
 
+## Role souls
+
+EX-02 seeds five pipeline role templates (migration
+`035_seed_pipeline_souls.sql`, `028` style — catalog entries only; the
+dispatcher clones them per spawn):
+
+| Template | Role | reasoning_class |
+|---|---|---|
+| `pipeline-worker` | spec-first task execution (tlc-spec-lean: PLAN/CHECKS/BUILD/VERIFY, validators, `maquinista-done`) | `standard` |
+| `pipeline-reviewer` | independent diff review — fresh per round, zero-author | `high` |
+| `pipeline-arbiter` | adjudication of contested / repeated `request_changes` | `high` |
+| `pipeline-fixer` | reviewer-findings resolution in the same worktree/PR | `standard` |
+| `pipeline-merger` | rebase + `gh pr checks` gate + propose/merge | `standard` |
+
+Cross-exercise contracts frozen here (EX-03 dispatch + verdict parsing build
+on these literals):
+
+- **Verdict line** — reviewer/arbiter sessions end their output with exactly
+  one line: `VERDICT: approve` / `VERDICT: request_changes` /
+  `VERDICT: needs_human`.
+- **Dispatch hints** — every pipeline template carries `extras` keys
+  `default_runner` (all `pi`) and `reasoning_class`; EX-03 resolves them to
+  runner + model at dispatch.
+
+Souls stay runner-agnostic (ADR-0005 revisit triggers): re-binding a role to
+a new harness is an extras edit, not a soul rewrite.
+
 ## TODO
 
-- worker / reviewer / fixer / merger souls + the PR loop: EX-02+ of
+- dispatch + verdict parsing + zero-author check + review rounds: EX-03 of
   ADR-0005 (`ADRs/0005-linear-pr-iteration-pipeline.md`)
+- fixer re-claim loop: EX-04; merge mode: EX-05; Telegram plumbing: EX-06
 - `tasks.review_rounds` accounting lands with the review loop (EX-03/EX-04)
+
