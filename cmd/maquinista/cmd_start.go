@@ -23,6 +23,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 	"github.com/maquinista-labs/maquinista/internal/monitor"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
+	"github.com/maquinista-labs/maquinista/internal/pipeline"
 	"github.com/maquinista-labs/maquinista/internal/relay"
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/scheduler"
@@ -454,6 +455,29 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				log.Printf("auto-tunnel: %s", url)
 			}
 		}()
+	}
+
+	// Ticket bridge (ADR-0005/0006): ticket-system issues labeled "pipeline"
+	// become task rows the task-scheduler claims; sync mirrors task state
+	// back to the board. Provider-neutral — no-op unless
+	// MAQUINISTA_TICKETS_API_KEY + MAQUINISTA_TICKETS_TEAM_ID.
+	if tCfg := pipeline.FromEnv(); tCfg.Enabled() && pool != nil {
+		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
+		if perr != nil {
+			log.Printf("pipeline: %v", perr)
+		} else {
+			go func() {
+				if err := pipeline.RunBridge(ctx, pool, prov, tCfg); err != nil && ctx.Err() == nil {
+					log.Printf("pipeline: bridge: %v", err)
+				}
+			}()
+			go func() {
+				if err := pipeline.RunSync(ctx, pool, prov, tCfg.TeamID, 10*time.Second); err != nil && ctx.Err() == nil {
+					log.Printf("pipeline: sync: %v", err)
+				}
+			}()
+			log.Printf("pipeline: ticket bridge started (%s)", tCfg.Provider)
+		}
 	}
 
 	err = b.Run(ctx)

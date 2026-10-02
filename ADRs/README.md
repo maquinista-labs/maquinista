@@ -13,3 +13,4 @@ Status lifecycle: Proposto → Aceito → Depreciado/Substituído.
 | [0003](0003-substrate-hetzner-multitenant.md) | Substrate/AX executor on dedicated Hetzner box, multi-tenant | Proposto |
 | [0004](0004-barceloneta-nuc-execution-box.md) | Barceloneta NUC as execution box — owned silicon first, Robot as scale-out | Proposto |
 | [0005](0005-linear-pr-iteration-pipeline.md) | Linear-driven PR iteration pipeline — tlc-spec-lean execution via maquinista agent sessions | Proposto |
+| [0006](0006-ticket-provider-abstraction.md) | Ticket-provider abstraction — vendor-neutral pipeline core behind a TicketProvider seam | Proposto |
