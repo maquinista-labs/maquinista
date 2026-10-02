@@ -199,3 +199,41 @@ func TestDispatchOne_ConcurrentRacersDispatchOnce(t *testing.T) {
 		t.Errorf("successes=%d, want 1", successCount)
 	}
 }
+
+// Regression (EX-07 round 2): a claimed task whose inbox prompt is owned by
+// a DEAD previous agent (stale processed row from attempt 1) must heal —
+// enqueueWorkOnTask upserts the same-key row and repoints it at the live
+// agent. Without this the fresh worker sits at an idle prompt forever.
+func TestHealMissingInbox_RepointsStaleRow(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status) VALUES ('T', 'x', 'claimed')`)
+	pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+		VALUES ('impl-old', 'maquinista', 'impl-old', 'T', 'dead', 'implementor')
+	`)
+	pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+		VALUES ('impl-T', 'maquinista', 'impl-T', 'T', 'working', 'implementor')
+	`)
+	// Stale prompt row owned by the dead attempt-1 agent.
+	pool.Exec(ctx, `
+		INSERT INTO agent_inbox (agent_id, from_kind, from_id, origin_channel, external_msg_id, content, status, attempts)
+		VALUES ('impl-old', 'system', 'task-scheduler', 'task', 'task:T', '{"type":"task"}', 'processed', 1)
+	`)
+
+	healed, err := HealMissingInbox(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healed != 1 {
+		t.Errorf("healed=%d, want 1", healed)
+	}
+
+	var agentID, status string
+	pool.QueryRow(ctx, `SELECT agent_id, status FROM agent_inbox WHERE origin_channel='task' AND external_msg_id='task:T'`).Scan(&agentID, &status)
+	if agentID != "impl-T" || status != "pending" {
+		t.Errorf("agent=%q status=%q, want impl-T/pending", agentID, status)
+	}
+}

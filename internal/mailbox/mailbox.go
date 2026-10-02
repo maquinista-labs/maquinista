@@ -105,6 +105,62 @@ func EnqueueInbox(ctx context.Context, tx pgx.Tx, m InboxMessage) (uuid.UUID, bo
 	return returned, false, nil
 }
 
+// UpsertInbox inserts a row into agent_inbox, or — when the
+// (origin_channel, external_msg_id) key already exists — repoints the
+// existing row at the new payload and resets it for redelivery:
+// status → 'pending', attempts → 0, lease/error/processing fields cleared.
+//
+// Use this for messages that must reach their recipient even after a
+// previous attempt consumed the key (e.g. task prompts re-enqueued for a
+// fresh implementor agent). EnqueueInbox keeps its collapse-to-no-op
+// semantics for channel dedup (Telegram message ids).
+func UpsertInbox(ctx context.Context, tx pgx.Tx, m InboxMessage) (uuid.UUID, error) {
+	if m.AgentID == "" {
+		return uuid.Nil, errors.New("agent_id required")
+	}
+	if len(m.Content) == 0 {
+		return uuid.Nil, errors.New("content required")
+	}
+	if m.FromKind == "" {
+		m.FromKind = "user"
+	}
+
+	var returned uuid.UUID
+	err := tx.QueryRow(ctx, `
+		INSERT INTO agent_inbox (
+			id, agent_id, conversation_id, from_kind, from_id,
+			origin_channel, origin_user_id, origin_thread_id, origin_chat_id,
+			external_msg_id, content, max_attempts
+		) VALUES (
+			$1, $2, $3, $4, NULLIF($5,''),
+			NULLIF($6,''), NULLIF($7,''), NULLIF($8,''), $9,
+			NULLIF($10,''), $11, COALESCE(NULLIF($12,0), 5)
+		)
+		ON CONFLICT (origin_channel, external_msg_id) DO UPDATE SET
+			agent_id      = EXCLUDED.agent_id,
+			content       = EXCLUDED.content,
+			from_kind     = EXCLUDED.from_kind,
+			from_id       = EXCLUDED.from_id,
+			status        = 'pending',
+			attempts      = 0,
+			claimed_by    = NULL,
+			claimed_at    = NULL,
+			lease_expires = NULL,
+			last_error    = NULL,
+			processed_at  = NULL,
+			enqueued_at   = NOW(),
+			max_attempts  = EXCLUDED.max_attempts
+		RETURNING id
+	`, uuid.New(), m.AgentID, m.ConversationID, m.FromKind, m.FromID,
+		m.OriginChannel, m.OriginUserID, m.OriginThreadID, m.OriginChatID,
+		m.ExternalMsgID, m.Content, m.MaxAttempts,
+	).Scan(&returned)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("upsert inbox: %w", err)
+	}
+	return returned, nil
+}
+
 // ClaimInbox picks up to `limit` pending rows for `agentID` with a lease.
 // Rows whose lease has expired while still 'processing' are also eligible.
 // Uses FOR UPDATE SKIP LOCKED so concurrent claimers never overlap.
