@@ -27,8 +27,9 @@ migration plus edits in every layer, and EX-02+ are about to build on the bridge
 has to exist before they do.
 
 When this ships: `internal/pipeline` core (bridge, sync, config, cmd wiring) contains no
-'linear' occurrence outside the provider file and its test; adding a second tracker is +1
-provider file and +1 factory case.
+vendor-transport code (Linear API, GraphQL, client types, legacy key reads) outside the
+provider file and its test; the provider name stays as configuration data; adding a second
+tracker is +1 provider file and +1 factory case.
 
 ## Out of scope
 
@@ -87,8 +88,11 @@ across the whole plan.
    columnID) error; Issue{ID, Key, Title, Description, URL}; Column enum InProgress,
    InReview, ChangesRequested, NeedsHuman, Done whose String() SHALL return "In Progress",
    "In Review", "Changes Requested", "Needs Human", "Done"
-6. A case-insensitive search for 'linear' under internal/pipeline/ SHALL match exactly
-   internal/pipeline/linear.go and internal/pipeline/linear_test.go
+6. WHEN the pipeline tree is searched for vendor-transport symbols THEN matches SHALL
+   appear exactly in internal/pipeline/linear.go and internal/pipeline/linear_test.go
+   (symbols: LINEAR_API_KEY, the Linear API host, LinearClient, GraphQL plumbing); the
+   literal provider name "linear" (factory key, MAQUINISTA_TICKETS_PROVIDER default,
+   tests asserting them) is configuration data, not vendor coupling, and MAY appear in core
 7. WHEN the Linear provider resolves credentials THEN it SHALL read
    MAQUINISTA_TICKETS_API_KEY first and fall back to LINEAR_API_KEY; all transport behavior
    (raw Authorization header, data-envelope unwrap, GQL/HTTP error surfacing, Todo+pipeline
@@ -105,7 +109,7 @@ across the whole plan.
 
 **Independent test:** `go test ./internal/pipeline/ -v` (TestColumn, TestNewProvider,
 TestLinearProvider, TestClaim, TestSync, TestTicketsConfig) plus
-`rg -il linear internal/pipeline/ | sort`.
+`rg -il 'LINEAR_API_KEY|api\.linear|linearclient|graphql' internal/pipeline/ | sort`.
 
 ### S3: wiring + docs (P2)
 

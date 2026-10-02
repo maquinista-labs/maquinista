@@ -31,10 +31,12 @@ the Column enum whose String() returns the five canonical names (TA-02, AC 5)
 
 Proof: `go test ./internal/pipeline/ -run TestColumn -v`
 
-**C6** - Under internal/pipeline/ exactly linear.go and linear_test.go match 'linear'
+**C6** - Under internal/pipeline/ exactly linear.go and linear_test.go match vendor-
+transport symbols (LINEAR_API_KEY, api.linear, LinearClient, GraphQL); the provider
+name "linear" as factory key / config default is configuration data, allowed in core
 (TA-02, AC 6)
 
-Proof: `rg -il linear internal/pipeline/ | sort; echo rc=$?`
+Proof: `rg -il 'LINEAR_API_KEY|api\.linear|linearclient|graphql' internal/pipeline/ | sort; echo rc=$?`
 
 **C7** - Linear provider keeps transport semantics (raw Authorization, envelope unwrap,
 GQL/HTTP errors, Todo+pipeline intake filter) and resolves MAQUINISTA_TICKETS_API_KEY with

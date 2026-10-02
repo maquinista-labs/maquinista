@@ -77,8 +77,11 @@ vendor specifics (GraphQL, auth, envelope): linear.go (+ linear_test.go)
   no-op. The legacy `LINEAR_API_KEY` fallback lives **inside** the Linear
   provider as migration sugar — core never reads it.
 - **Core neutrality is enforced by negative checks**, not convention:
-  `rg -il linear internal/pipeline/` must match exactly `linear.go` +
-  `linear_test.go`; `rg -i linear internal/db/ cmd/` must be empty.
+  vendor-transport symbols (`LINEAR_API_KEY`, the Linear API host,
+  `LinearClient`, GraphQL) must match exactly `linear.go` + `linear_test.go`
+  under `internal/pipeline/`; the provider name `"linear"` (factory key,
+  config default) is configuration data, not coupling. `rg -i linear
+  internal/db/ cmd/` must be empty.
 
 ### Consequences
 
