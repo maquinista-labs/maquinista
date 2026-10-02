@@ -188,9 +188,25 @@ topic_agent_bindings (
 Dashboard-spawned agents have no binding at creation time. The
 `RunTopicProvisioner` background goroutine (15 s interval):
 - **Creates** topics for agents without an owner binding.
+- **Creates** the Pipeline topic for the synthetic `pipeline` notifier agent
+  (`ensurePipelineTopic`, EX-06) — kept out of `provisionMissingTopics`,
+  which selects `role='user'` only, since the notifier's role has different
+  reconcile semantics.
 - **Closes** topics and removes bindings for agents that are archived,
   dead, or deleted so the relay stops delivering to them and the Telegram
   group stays clean.
+
+### Pipeline notifications (EX-06)
+
+Pipeline lifecycle notes (review verdicts, watchdog parks, merge outcomes,
+CI-cap questions) are `agent_outbox` rows written by the `pipeline` agent
+(migration `036` seed, role `notifier`): `pipeline.Notify` appends one row,
+the stock binding leg fans it to `channel_deliveries`, the dispatcher sends
+it to the Pipeline topic. No new delivery code — the notifier is just an
+agent with a binding. Emissions sit inside guarded task transitions, so a
+re-read pass never re-notifies (exactly-once per verdict/merge outcome).
+Notification failures are logged and swallowed: a dead Telegram path never
+fails a pipeline pass.
 
 ## in_reply_to is a routing hint, not required
 

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maquinista-labs/maquinista/internal/pipeline"
 )
 
 // RunTopicProvisioner runs as a background goroutine. Every 15 s it:
@@ -34,11 +35,67 @@ func (b *Bot) RunTopicProvisioner(ctx context.Context, pool *pgxpool.Pool) {
 			if err := b.provisionMissingTopics(ctx, pool); err != nil {
 				log.Printf("topic provisioner: %v", err)
 			}
+			if err := b.ensurePipelineTopic(ctx, pool); err != nil {
+				log.Printf("topic provisioner (pipeline): %v", err)
+			}
 			if err := b.closeOrphanedTopics(ctx, pool); err != nil {
 				log.Printf("topic provisioner (close): %v", err)
 			}
 		}
 	}
+}
+
+// ensurePipelineTopic provisions the Pipeline notification topic: the
+// synthetic 'pipeline' agent (migration 036) has its outbox rows delivered
+// by the relay binding leg to this topic, so the agent needs the same
+// owner-binding treatment as user agents — but it must NOT ride
+// provisionMissingTopics, which selects role='user' and would fight the
+// reconcile/sidecar semantics of that role (EX-06).
+func (b *Bot) ensurePipelineTopic(ctx context.Context, pool *pgxpool.Pool) error {
+	if len(b.config.AllowedGroups) == 0 || len(b.config.AllowedUsers) == 0 {
+		return nil // need a group + an operator user id for the binding
+	}
+	chatID := b.config.AllowedGroups[0]
+	userID := fmt.Sprintf("%d", b.config.AllowedUsers[0])
+
+	// Only when the agent row exists (seeded by migration 036), is alive,
+	// and has no owner binding yet.
+	var exists bool
+	err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM agents a
+			WHERE a.id = $1
+			  AND a.status NOT IN ('archived', 'dead')
+			  AND NOT EXISTS (
+			        SELECT 1 FROM topic_agent_bindings b
+			        WHERE b.agent_id = a.id
+			          AND b.binding_type = 'owner'
+			      )
+		)
+	`, pipeline.NotifyAgentID).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("query pipeline agent: %w", err)
+	}
+	if !exists {
+		return nil
+	}
+
+	threadID, err := b.createForumTopic(chatID, "Pipeline")
+	if err != nil {
+		return fmt.Errorf("create pipeline topic: %w", err)
+	}
+	threadIDStr := fmt.Sprintf("%d", threadID)
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO topic_agent_bindings
+			(topic_id, agent_id, binding_type, user_id, thread_id, chat_id)
+		VALUES ($1, $2, 'owner', $3, $4, $5)
+		ON CONFLICT DO NOTHING
+	`, threadID, pipeline.NotifyAgentID, userID, threadIDStr, chatID); err != nil {
+		return fmt.Errorf("bind pipeline agent: %w", err)
+	}
+	b.State().SetGroupChatID(userID, threadIDStr, chatID)
+	log.Printf("topic provisioner: created Pipeline topic %d (chat %d) for %s", threadID, chatID, pipeline.NotifyAgentID)
+	return nil
 }
 
 // provisionMissingTopics finds user agents without an owner binding and

@@ -781,9 +781,14 @@ func GetAgent(pool *pgxpool.Pool, id string) (*Agent, error) {
 
 // EnqueueMerge adds an entry to the merge queue.
 func EnqueueMerge(pool *pgxpool.Pool, taskID, agentID, branch, worktreeDir, baseBranch, commitSHA string) error {
+	// ON CONFLICT targets the migration-036 partial unique index — a live
+	// (pending/merging) entry for the same task already existing makes the
+	// insert a no-op, so the enqueue pass and the approve verb's
+	// demand-enqueue are idempotent instead of racing (EX-06).
 	_, err := pool.Exec(context.Background(), `
 		INSERT INTO merge_queue (task_id, agent_id, branch, worktree_dir, base_branch, commit_sha)
 		VALUES ($1, $2, $3, $4, $5, $6)
+		ON CONFLICT (task_id) WHERE status IN ('pending', 'merging') DO NOTHING
 	`, taskID, agentID, branch, worktreeDir, baseBranch, commitSHA)
 	if err != nil {
 		return fmt.Errorf("enqueuing merge: %w", err)
@@ -881,18 +886,38 @@ func FailMerge(pool *pgxpool.Pool, id int64, errMsg string) error {
 
 // ReleaseMergeEntry returns a merge queue entry to 'pending' (clearing the
 // claim timestamp), so the processor picks it up again on a later pass.
-// Used when CI is still running or a human approval is required.
+// Used when CI is still running or a human approval is required. Guarded on
+// 'merging': an entry that raced to a terminal state in another arm must not
+// be resurrected (EX-06 review follow-up).
 func ReleaseMergeEntry(pool *pgxpool.Pool, id int64) error {
 	_, err := pool.Exec(context.Background(), `
 		UPDATE merge_queue
 		SET    status     = 'pending',
 		       started_at = NULL
 		WHERE  id = $1
+		  AND  status = 'merging'
 	`, id)
 	if err != nil {
 		return fmt.Errorf("releasing merge entry: %w", err)
 	}
 	return nil
+}
+
+// BumpMergeAttempts increments the retry counter of a merge queue entry and
+// returns the new count. The gh CI gate uses it to cap red-PR churn (EX-06).
+func BumpMergeAttempts(pool *pgxpool.Pool, id int64) (int, error) {
+	ctx := context.Background()
+	var attempts int
+	err := pool.QueryRow(ctx, `
+		UPDATE merge_queue
+		SET    attempts = attempts + 1
+		WHERE  id = $1
+		RETURNING attempts
+	`, id).Scan(&attempts)
+	if err != nil {
+		return 0, fmt.Errorf("bumping merge attempts for entry %d: %w", id, err)
+	}
+	return attempts, nil
 }
 
 // GetPendingMergeEntryByTask returns the oldest pending merge queue entry for

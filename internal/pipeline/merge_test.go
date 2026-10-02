@@ -178,12 +178,37 @@ func TestMergeConfigFromEnv(t *testing.T) {
 	if cfg.AutoMerge {
 		t.Error("auto-merge must default to off")
 	}
+	if cfg.MaxAttempts != defaultMergeAttempts {
+		t.Errorf("default max attempts = %d, want %d", cfg.MaxAttempts, defaultMergeAttempts)
+	}
 
 	t.Setenv("PIPELINE_MERGE_MODE", "gh")
 	t.Setenv("PIPELINE_AUTO_MERGE", "1")
+	t.Setenv("MAQUINISTA_MERGE_ATTEMPTS_MAX", "7")
 	cfg = MergeConfigFromEnv()
 	if cfg.Mode != MergeModeGH || !cfg.AutoMerge {
 		t.Errorf("got mode=%q auto=%v, want gh+true", cfg.Mode, cfg.AutoMerge)
+	}
+	if cfg.MaxAttempts != 7 {
+		t.Errorf("max attempts = %d, want 7", cfg.MaxAttempts)
+	}
+
+	// EX-06 reviewer nit: boolean knobs accept the usual truthy spellings.
+	for _, v := range []string{"yes", "True", "t", "Y"} {
+		t.Setenv("PIPELINE_AUTO_MERGE", v)
+		if cfg := MergeConfigFromEnv(); !cfg.AutoMerge {
+			t.Errorf("AUTO_MERGE=%q not accepted", v)
+		}
+	}
+	t.Setenv("PIPELINE_AUTO_MERGE", "")
+	if cfg := MergeConfigFromEnv(); cfg.AutoMerge {
+		t.Error("empty AUTO_MERGE must stay off")
+	}
+
+	// Garbage attempts cap falls back to the default instead of 0.
+	t.Setenv("MAQUINISTA_MERGE_ATTEMPTS_MAX", "banana")
+	if cfg := MergeConfigFromEnv(); cfg.MaxAttempts != defaultMergeAttempts {
+		t.Errorf("garbage cap → %d, want default %d", cfg.MaxAttempts, defaultMergeAttempts)
 	}
 }
 
@@ -411,6 +436,130 @@ func TestRunMergeOnApprove(t *testing.T) {
 	}
 	if status, _ := taskRow(t, pool, taskID); status != "done" {
 		t.Errorf("task = %s, want done", status)
+	}
+}
+
+// ---- EX-06: CI retry cap, idempotent enqueue, release guard ----
+
+// TestProcessMergeGH_CICapParksNeedsHuman: a PR that stays red past the cap
+// must fail the entry, park the task needs-human, and ask once — not churn.
+func TestProcessMergeGH_CICapParksNeedsHuman(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	_, worktree := initRemoteTrio(t, "cicap")
+	entry := seedReadyTask(t, pool, worktree)
+	taskID := entry.TaskID
+
+	gh := &fakeGh{checks: ChecksFailed}
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, MaxAttempts: 2, Gh: gh}
+
+	// Attempt 1: below cap → silent release to pending.
+	if err := ProcessMergeGH(ctx, pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "pending" {
+		t.Fatalf("attempt 1: entry = %q, want released to pending", got)
+	}
+	texts := pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 0 {
+		t.Fatalf("attempt 1 notified: %q (below-cap release must stay silent)", texts)
+	}
+
+	// Re-claim and attempt 2: at cap → failed entry + parked task + question.
+	claimed, err := db.ClaimMergeEntryByID(pool, entry.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claimed == nil || claimed.ID != entry.ID {
+		t.Fatalf("re-claim got %+v, want entry %d", claimed, entry.ID)
+	}
+	if err := ProcessMergeGH(ctx, pool, cfg, &fakeProvider{}, "team-1", claimed); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "failed" {
+		t.Fatalf("attempt 2: entry = %q, want failed", got)
+	}
+	if status, _ := taskRow(t, pool, taskID); status != "pending_approval" {
+		t.Fatalf("attempt 2: task = %s, want parked pending_approval", status)
+	}
+	if gh.mergeCalls != 0 {
+		t.Errorf("merge fired %d times on red PR", gh.mergeCalls)
+	}
+	texts = pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 1 {
+		t.Fatalf("attempt 2 emitted %d notes, want 1", len(texts))
+	}
+	for _, want := range []string{"🆘", "CI failed 2 times", "parked needs-human", "maquinista approve " + taskID} {
+		if !strings.Contains(texts[0], want) {
+			t.Errorf("note %q missing %q", texts[0], want)
+		}
+	}
+}
+
+// TestProcessMergeGH_MergeFailNotifies: infrastructure failure on a green PR
+// fails the entry (terminal) and leaves the task re-approvable.
+func TestProcessMergeGH_MergeFailNotifies(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	_, worktree := initRemoteTrio(t, "mergefail")
+	entry := seedReadyTask(t, pool, worktree)
+	taskID := entry.TaskID
+
+	gh := &fakeGh{checks: ChecksGreen, mergeErr: errors.New("remote hung up")}
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, MaxAttempts: 5, Gh: gh}
+
+	if err := ProcessMergeGH(ctx, pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "failed" {
+		t.Fatalf("entry = %q, want failed", got)
+	}
+	if status, _ := taskRow(t, pool, taskID); status != "ready_to_merge" {
+		t.Fatalf("task = %s, want ready_to_merge (work is done)", status)
+	}
+	texts := pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 1 || !strings.Contains(texts[0], "merge failed") {
+		t.Fatalf("notes = %q, want one merge-failed note", texts)
+	}
+}
+
+// TestEnqueueMerge_Idempotent: a live (pending/merging) entry wins —
+// re-approval while queued must not duplicate it.
+func TestEnqueueMerge_Idempotent(t *testing.T) {
+	pool := testPool(t)
+	_, worktree := initRemoteTrio(t, "idem")
+	entry := seedReadyTask(t, pool, worktree)
+
+	err := db.EnqueueMerge(pool, entry.TaskID, entry.AgentID, "other/branch", worktree, "main", *entry.CommitSHA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM merge_queue WHERE task_id = $1 AND status IN ('pending','merging')`,
+		entry.TaskID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("live entries = %d, want 1", n)
+	}
+}
+
+// TestReleaseMergeEntry_GuardsTerminal: a merged entry must never be
+// resurrected by a late release (double-merge prevention).
+func TestReleaseMergeEntry_GuardsTerminal(t *testing.T) {
+	pool := testPool(t)
+	_, worktree := initRemoteTrio(t, "guard")
+	entry := seedReadyTask(t, pool, worktree)
+
+	if err := db.CompleteMerge(pool, entry.ID, "abc123"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.ReleaseMergeEntry(pool, entry.ID); err != nil {
+		t.Fatalf("release of merged entry: %v", err)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "merged" {
+		t.Fatalf("entry = %q, want merged (guard must hold)", got)
 	}
 }
 

@@ -498,7 +498,7 @@ func enqueueReviewPrompt(ctx context.Context, pool *pgxpool.Pool, agentID, taskI
 // liveReviewersSQL drives both the verdict pass and the watchdog: live
 // reviewer agents on pipeline tasks still in 'review'.
 const liveReviewersSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE a.role = '` + reviewerRole + `'
@@ -536,6 +536,10 @@ func verdictPass(ctx context.Context, pool *pgxpool.Pool, maxRounds int, session
 		} else {
 			log.Printf("pipeline: dispatch: verdict %s on %s (reviewer %s) → %s", verdict, r.taskID, r.agentID, status)
 		}
+		// EX-06: the verdict summary IS the merge proposal (approve) or
+		// the needs-human question — emitted inside the applied
+		// transition, so exactly once per verdict.
+		notifyVerdict(ctx, pool, r.taskID, r.taskTitle, verdict, landed, r.round, maxRounds)
 		killReviewerPane(sessionName, r.session, r.window, killWindow)
 	}
 	return nil
@@ -630,15 +634,18 @@ func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verd
 // or fixer (in 'changes_requested') with NO outbox activity (the monitor
 // writes rows as the agent streams) for longer than the timeout flips the
 // task to pending_approval and retires the pane.
-// liveReviewer is one live reviewer/fixer pane on a pipeline task.
+// liveReviewer is one live reviewer/fixer pane on a pipeline task. The
+// title/round columns feed the EX-06 Pipeline-topic summaries.
 type liveReviewer struct {
 	agentID, session, window, taskID string
+	taskTitle                        string
+	round                            int
 }
 
 // liveFixersSQL drives the fixer watchdog arm: live fixer agents on
 // pipeline tasks still in changes_requested.
 const liveFixersSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE a.role = '` + fixerRole + `'
@@ -661,11 +668,11 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration
 		if err != nil {
 			return err
 		}
-		if !applied {
-			continue
+		if applied {
+			log.Printf("pipeline: dispatch: watchdog retired stalled reviewer %s on %s → needs_human", r.agentID, r.taskID)
+			notifyf(ctx, pool, "🆘 %s: %s", r.taskTitle, fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout))
+			killReviewerPane(sessionName, r.session, r.window, killWindow)
 		}
-		log.Printf("pipeline: dispatch: watchdog retired stalled reviewer %s on %s → needs_human", r.agentID, r.taskID)
-		killReviewerPane(sessionName, r.session, r.window, killWindow)
 	}
 
 	var fixers []liveReviewer
@@ -678,11 +685,11 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration
 		if err != nil {
 			return err
 		}
-		if !applied {
-			continue
+		if applied {
+			log.Printf("pipeline: dispatch: watchdog retired stalled fixer %s on %s → needs_human", r.agentID, r.taskID)
+			notifyf(ctx, pool, "🆘 %s: %s", r.taskTitle, fmt.Sprintf("watchdog: fix stalled past %s — needs human", timeout))
+			killReviewerPane(sessionName, r.session, r.window, killWindow)
 		}
-		log.Printf("pipeline: dispatch: watchdog retired stalled fixer %s on %s → needs_human", r.agentID, r.taskID)
-		killReviewerPane(sessionName, r.session, r.window, killWindow)
 	}
 	return nil
 }
@@ -977,7 +984,7 @@ func scanReviewers(ctx context.Context, pool *pgxpool.Pool, sql string, args []a
 	defer rows.Close()
 	for rows.Next() {
 		var r liveReviewer
-		if err := rows.Scan(&r.agentID, &r.session, &r.window, &r.taskID); err != nil {
+		if err := rows.Scan(&r.agentID, &r.session, &r.window, &r.taskID, &r.taskTitle, &r.round); err != nil {
 			return err
 		}
 		*out = append(*out, r)
