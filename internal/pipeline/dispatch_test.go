@@ -25,11 +25,15 @@ type fakeSpawner struct {
 func (f *fakeSpawner) SpawnReviewer(_ context.Context, p ReviewSpawnParams) error {
 	f.spawns = append(f.spawns, p)
 	if f.insertRow {
+		role := p.Role
+		if role == "" {
+			role = "reviewer"
+		}
 		execOK(f.t, f.pool, `
 			INSERT INTO agents (id, tmux_session, tmux_window, role, task_id, status,
 			                    runner_type, cwd, window_name, started_at, last_seen, stop_requested)
-			VALUES ($1, 'sess', $1, 'reviewer', $2, 'running', $3, $4, $1, NOW(), NOW(), FALSE)
-		`, p.AgentID, p.TaskID, p.RunnerType, p.WorktreePath)
+			VALUES ($1, 'sess', $1, $5, $2, 'running', $3, $4, $1, NOW(), NOW(), FALSE)
+		`, p.AgentID, p.TaskID, p.RunnerType, p.WorktreePath, role)
 	}
 	return nil
 }
@@ -266,7 +270,7 @@ func TestReviewRounds_IncrementsPerSpawn(t *testing.T) {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 
-	if _, err := applyVerdict(ctx, pool, "reviewer-tc", "tc", VerdictRequestChanges, "changes_requested"); err != nil {
+	if _, _, err := applyVerdict(ctx, pool, "reviewer-tc", "tc", VerdictRequestChanges, "changes_requested", 3); err != nil {
 		t.Fatalf("applyVerdict: %v", err)
 	}
 	if got := taskCol(t, pool, "tc", "status"); got != "changes_requested" {
@@ -316,7 +320,7 @@ func TestVerdictTransitions(t *testing.T) {
 				VALUES ('reviewer-`+taskID+`', $1::jsonb)
 			`, `{"text":"findings...\nVERDICT: `+c.verdict+`\n"}`)
 
-			if err := verdictPass(ctx, pool, "sess", nil); err != nil {
+			if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
 				t.Fatalf("verdictPass: %v", err)
 			}
 
@@ -363,7 +367,7 @@ func TestVerdict_MalformedWaits(t *testing.T) {
 		VALUES ('reviewer-tm', '{"text":"VERDICT: approved-ish"}'::jsonb)
 	`)
 
-	if err := verdictPass(ctx, pool, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if got := taskCol(t, pool, "tm", "status"); got != "review" {

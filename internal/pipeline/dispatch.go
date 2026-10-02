@@ -1,5 +1,5 @@
-// Review dispatch (EX-03, ADR-0005): pipeline tasks completing their worker
-// enter 'review' (done-path branch in db.MarkDone). This loop
+// Review dispatch (EX-03/EX-04, ADR-0005): pipeline tasks completing their
+// worker enter 'review' (done-path branch in db.MarkDone). This loop
 //
 //  1. spawns a fresh, zero-author reviewer agent per review task (soul
 //     template pipeline-reviewer, runner/model resolved from the template's
@@ -7,7 +7,13 @@
 //  2. heals a missing review prompt (crash between spawn and enqueue),
 //  3. parses the reviewer's outbox for the contract verdict line and
 //     transitions the task,
-//  4. watchdogs stalled reviews into Needs Human.
+//  4. spawns a fresh fixer per changes_requested episode (pipeline-fixer
+//     soul, same worktree) fed with the reviewer's findings — the fixer
+//     completes via maquinista-done, which re-enters 'review' through the
+//     done-path branch and closes the loop,
+//  5. caps the loop: a request_changes landing at/after the review-round cap
+//     parks the task in Needs Human instead of cycling forever,
+//  6. watchdogs stalled reviews AND stalled fixes into Needs Human.
 //
 // The board mirror is purely derived (sync.go DerivedState) — dispatch never
 // talks to the ticket system and holds no provider dependency.
@@ -16,13 +22,16 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 )
@@ -38,8 +47,27 @@ const (
 // (migration 035). Dispatch reads its extras and never writes templates.
 const ReviewerSoulTemplate = "pipeline-reviewer"
 
-// reviewerRole is the agents.role value for dispatched reviewers.
-const reviewerRole = "reviewer"
+// FixerSoulTemplate is the soul template dispatch clones per fixer episode
+// (migration 035): resolve the reviewer's findings in the SAME worktree/PR.
+const FixerSoulTemplate = "pipeline-fixer"
+
+// reviewerRole / fixerRole are the agents.role values for dispatched
+// pipeline agents.
+const (
+	reviewerRole = "reviewer"
+	fixerRole    = "fixer"
+)
+
+// DefaultMaxReviewRounds is the fixer-loop cap (ADR-0005 AC 7): the
+// request_changes that lands when a task has already burned this many review
+// rounds parks it in Needs Human instead of changes_requested.
+const DefaultMaxReviewRounds = 3
+
+// queryRow is the minimal surface shared by *pgxpool.Pool and pgx.Tx for
+// single-row reads inside or outside a tx.
+type queryRow interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
 
 var (
 	verdictRe    = regexp.MustCompile(`(?m)^[ \t]*VERDICT:[ \t]*(approve|request_changes|needs_human)[ \t]*$`)
@@ -69,20 +97,29 @@ func HasMalformedVerdictLine(text string) bool {
 type DispatchConfig struct {
 	// Interval between passes (default 10s, same cadence as sync).
 	Interval time.Duration
-	// ReviewTimeout is the stall watchdog bound: a live reviewer with no
-	// outbox activity for this long parks the task in pending_approval
-	// (default 2h, MAQUINISTA_REVIEW_TIMEOUT).
+	// ReviewTimeout is the stall watchdog bound: a live reviewer or fixer
+	// with no outbox activity for this long parks the task in
+	// pending_approval (default 2h, MAQUINISTA_REVIEW_TIMEOUT).
 	ReviewTimeout time.Duration
+	// MaxReviewRounds is the fixer-loop cap (default 3,
+	// MAQUINISTA_REVIEW_ROUNDS_MAX).
+	MaxReviewRounds int
 	// SessionName is the tmux session reviewers run in (window cleanup).
 	SessionName string
 }
 
 // DefaultDispatchConfig returns the documented defaults.
 func DefaultDispatchConfig(sessionName string) DispatchConfig {
-	return DispatchConfig{Interval: 10 * time.Second, ReviewTimeout: 2 * time.Hour, SessionName: sessionName}
+	return DispatchConfig{
+		Interval:        10 * time.Second,
+		ReviewTimeout:   2 * time.Hour,
+		MaxReviewRounds: DefaultMaxReviewRounds,
+		SessionName:     sessionName,
+	}
 }
 
-// DispatchConfigFromEnv applies MAQUINISTA_REVIEW_TIMEOUT over the defaults.
+// DispatchConfigFromEnv applies MAQUINISTA_REVIEW_TIMEOUT and
+// MAQUINISTA_REVIEW_ROUNDS_MAX over the defaults.
 func DispatchConfigFromEnv(sessionName string) DispatchConfig {
 	cfg := DefaultDispatchConfig(sessionName)
 	if v := strings.TrimSpace(os.Getenv("MAQUINISTA_REVIEW_TIMEOUT")); v != "" {
@@ -92,17 +129,28 @@ func DispatchConfigFromEnv(sessionName string) DispatchConfig {
 			log.Printf("pipeline: dispatch: invalid MAQUINISTA_REVIEW_TIMEOUT %q, using %s", v, cfg.ReviewTimeout)
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("MAQUINISTA_REVIEW_ROUNDS_MAX")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxReviewRounds = n
+		} else {
+			log.Printf("pipeline: dispatch: invalid MAQUINISTA_REVIEW_ROUNDS_MAX %q, using %d", v, cfg.MaxReviewRounds)
+		}
+	}
 	return cfg
 }
 
 // ReviewSpawnParams carries what the spawner needs to materialize one
-// reviewer pane. AgentID is pre-minted by dispatch (fresh, zero-author).
+// dispatched pane (reviewer or fixer). AgentID is pre-minted by dispatch;
+// Role/SoulTemplateID are set by the dispatch passes (reviewer defaults kept
+// for EX-03-era callers that leave them empty).
 type ReviewSpawnParams struct {
-	AgentID      string
-	TaskID       string
-	WorktreePath string
-	RunnerType   string // extras default_runner override ("" = cfg default)
-	Model        string // resolved from reasoning_class ("" = runner default)
+	AgentID        string
+	TaskID         string
+	WorktreePath   string
+	Role           string // "reviewer" (default) or "fixer"
+	SoulTemplateID string // "" = pipeline-reviewer
+	RunnerType     string // extras default_runner override ("" = cfg default)
+	Model          string // resolved from reasoning_class ("" = runner default)
 }
 
 // ReviewSpawner materializes a reviewer agent: agents row (task-bound,
@@ -129,6 +177,9 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 	if cfg.ReviewTimeout <= 0 {
 		cfg.ReviewTimeout = 2 * time.Hour
 	}
+	if cfg.MaxReviewRounds <= 0 {
+		cfg.MaxReviewRounds = DefaultMaxReviewRounds
+	}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -143,8 +194,11 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := promptPass(ctx, pool); err != nil {
 			log.Printf("pipeline: dispatch: prompt pass: %v", err)
 		}
-		if err := verdictPass(ctx, pool, cfg.SessionName, killWindow); err != nil {
+		if err := verdictPass(ctx, pool, cfg.MaxReviewRounds, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: verdict pass: %v", err)
+		}
+		if err := fixerPass(ctx, pool, spawn); err != nil {
+			log.Printf("pipeline: dispatch: fixer pass: %v", err)
 		}
 		if err := watchdogPass(ctx, pool, cfg.ReviewTimeout, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: watchdog pass: %v", err)
@@ -205,11 +259,13 @@ func dispatchPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) 
 			log.Printf("pipeline: dispatch: resolve exec for %s: %v", c.taskID, err)
 		}
 		err = spawn.SpawnReviewer(ctx, ReviewSpawnParams{
-			AgentID:      agentID,
-			TaskID:       c.taskID,
-			WorktreePath: c.worktree,
-			RunnerType:   runnerType,
-			Model:        model,
+			AgentID:        agentID,
+			TaskID:         c.taskID,
+			WorktreePath:   c.worktree,
+			Role:           reviewerRole,
+			SoulTemplateID: ReviewerSoulTemplate,
+			RunnerType:     runnerType,
+			Model:          model,
 		})
 		if err != nil {
 			// Includes the cross-process unique-live loss; next tick no-ops.
@@ -242,11 +298,11 @@ func taskAuthor(ctx context.Context, pool *pgxpool.Pool, taskID string) (string,
 	return *author, nil
 }
 
-// mintReviewerID picks the first reviewer-<taskID>[-rN] id not present in
-// agents (same shape as orchestrator.mintAgentID, kept local to avoid the
+// mintAgentID picks the first <role>-<taskID>[-rN] id not present in agents
+// (same shape as orchestrator.mintAgentID, kept local to avoid the
 // cross-package dependency).
-func mintReviewerID(ctx context.Context, pool *pgxpool.Pool, taskID string) (string, error) {
-	base := reviewerRole + "-" + taskID
+func mintAgentID(ctx context.Context, pool *pgxpool.Pool, role, taskID string) (string, error) {
+	base := role + "-" + taskID
 	for n := 1; n < 100; n++ {
 		candidate := base
 		if n > 1 {
@@ -260,7 +316,11 @@ func mintReviewerID(ctx context.Context, pool *pgxpool.Pool, taskID string) (str
 			return candidate, nil
 		}
 	}
-	return "", fmt.Errorf("mintReviewerID: exhausted retries for %s", base)
+	return "", fmt.Errorf("mintAgentID: exhausted retries for %s", base)
+}
+
+func mintReviewerID(ctx context.Context, pool *pgxpool.Pool, taskID string) (string, error) {
+	return mintAgentID(ctx, pool, reviewerRole, taskID)
 }
 
 // resolveTemplateExec reads the reviewer template's frozen extras contract
@@ -269,17 +329,24 @@ func mintReviewerID(ctx context.Context, pool *pgxpool.Pool, taskID string) (str
 // runnerOverride/model may be empty: empty runner = cfg default, empty model
 // = the runner's own resolution chain (MAQUINISTA_PI_MODEL env or default).
 func resolveTemplateExec(ctx context.Context, pool *pgxpool.Pool) (runnerOverride, model string, err error) {
+	return resolveTemplateExecFor(ctx, pool, ReviewerSoulTemplate)
+}
+
+// resolveTemplateExecFor is the template-parameterized resolver: reads the
+// named soul template's frozen extras (default_runner, reasoning_class) and
+// maps them through ResolveExec. Dispatch reads templates, never writes.
+func resolveTemplateExecFor(ctx context.Context, pool *pgxpool.Pool, templateID string) (runnerOverride, model string, err error) {
 	var raw []byte
-	err = pool.QueryRow(ctx, `SELECT extras FROM soul_templates WHERE id = $1`, ReviewerSoulTemplate).Scan(&raw)
+	err = pool.QueryRow(ctx, `SELECT extras FROM soul_templates WHERE id = $1`, templateID).Scan(&raw)
 	if err != nil {
-		return "", "", fmt.Errorf("load template %s: %w", ReviewerSoulTemplate, err)
+		return "", "", fmt.Errorf("load template %s: %w", templateID, err)
 	}
 	var ex struct {
 		DefaultRunner  string `json:"default_runner"`
 		ReasoningClass string `json:"reasoning_class"`
 	}
 	if err := json.Unmarshal(raw, &ex); err != nil {
-		return "", "", fmt.Errorf("parse extras of %s: %w", ReviewerSoulTemplate, err)
+		return "", "", fmt.Errorf("parse extras of %s: %w", templateID, err)
 	}
 	modelHigh := strings.TrimSpace(os.Getenv("MAQUINISTA_PI_MODEL_HIGH"))
 	modelStd := strings.TrimSpace(os.Getenv("MAQUINISTA_PI_MODEL"))
@@ -436,7 +503,7 @@ WHERE a.role = '` + reviewerRole + `'
   AND t.status = 'review'
   AND t.metadata->>'ticket_issue_id' IS NOT NULL`
 
-func verdictPass(ctx context.Context, pool *pgxpool.Pool, sessionName string, killWindow func(session, windowID string) error) error {
+func verdictPass(ctx context.Context, pool *pgxpool.Pool, maxRounds int, sessionName string, killWindow func(session, windowID string) error) error {
 	var reviewers []liveReviewer
 	if err := scanReviewers(ctx, pool, liveReviewersSQL, nil, &reviewers); err != nil {
 		return err
@@ -453,15 +520,19 @@ func verdictPass(ctx context.Context, pool *pgxpool.Pool, sessionName string, ki
 		if !ok {
 			continue
 		}
-		retire, err := applyVerdict(ctx, pool, r.agentID, r.taskID, verdict, status)
+		landed, applied, err := applyVerdict(ctx, pool, r.agentID, r.taskID, verdict, status, maxRounds)
 		if err != nil {
 			log.Printf("pipeline: dispatch: apply verdict %s → %s: %v", r.taskID, verdict, err)
 			continue
 		}
-		if !retire {
+		if !applied {
 			continue // task row raced to another status; leave the pane be
 		}
-		log.Printf("pipeline: dispatch: verdict %s on %s (reviewer %s) → %s", verdict, r.taskID, r.agentID, status)
+		if landed != status {
+			log.Printf("pipeline: dispatch: verdict %s on %s (reviewer %s) → %s (round cap %d reached — needs human)", verdict, r.taskID, r.agentID, landed, maxRounds)
+		} else {
+			log.Printf("pipeline: dispatch: verdict %s on %s (reviewer %s) → %s", verdict, r.taskID, r.agentID, status)
+		}
 		killReviewerPane(sessionName, r.session, r.window, killWindow)
 	}
 	return nil
@@ -510,83 +581,389 @@ func statusForVerdict(v string) (string, bool) {
 }
 
 // applyVerdict transitions the task, records the verdict, and retires the
-// reviewer — one tx, guarded on the task still being in 'review'. Returns
-// false when the row raced (nothing written).
-func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verdict, status string) (bool, error) {
+// reviewer — one tx, guarded on the task still being in 'review'. The round
+// cap is decided ATOMICALLY inside the UPDATE: a request_changes landing at
+// or past maxRounds burned rounds parks the task in pending_approval
+// instead. Returns the landed status; applied=false when the row raced
+// (nothing written).
+func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verdict, status string, maxRounds int) (string, bool, error) {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback(ctx)
+
+	var landed string
+	err = tx.QueryRow(ctx, `
+		UPDATE tasks SET status = CASE
+			WHEN $2::text = 'changes_requested' AND review_rounds >= $3::int THEN 'pending_approval'
+			ELSE $2::text END
+		WHERE id = $1 AND status = 'review'
+		RETURNING status
+	`, taskID, status, maxRounds).Scan(&landed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	content := "VERDICT: " + verdict
+	if landed != status {
+		content = fmt.Sprintf("VERDICT: %s (round cap %d reached — needs human)", verdict, maxRounds)
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ($1, $2, 'verdict', $3)
+	`, taskID, agentID, content); err != nil {
+		return "", false, err
+	}
+	if _, err := tx.Exec(ctx, `UPDATE agents SET status='dead', last_seen=NOW() WHERE id=$1`, agentID); err != nil {
+		return "", false, err
+	}
+	return landed, true, tx.Commit(ctx)
+}
+
+// watchdogPass parks stalled pipeline agents: a live reviewer (in 'review')
+// or fixer (in 'changes_requested') with NO outbox activity (the monitor
+// writes rows as the agent streams) for longer than the timeout flips the
+// task to pending_approval and retires the pane.
+// liveReviewer is one live reviewer/fixer pane on a pipeline task.
+type liveReviewer struct {
+	agentID, session, window, taskID string
+}
+
+// liveFixersSQL drives the fixer watchdog arm: live fixer agents on
+// pipeline tasks still in changes_requested.
+const liveFixersSQL = `
+SELECT a.id, a.tmux_session, a.tmux_window, t.id
+FROM agents a
+JOIN tasks t ON t.id = a.task_id
+WHERE a.role = '` + fixerRole + `'
+  AND a.status <> 'dead'
+  AND t.status = 'changes_requested'
+  AND t.metadata->>'ticket_issue_id' IS NOT NULL`
+
+func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
+	stallFilter := `
+  AND NOT EXISTS (
+        SELECT 1 FROM agent_outbox o
+        WHERE o.agent_id = a.id AND o.created_at > NOW() - make_interval(secs => $1))`
+	var reviewers []liveReviewer
+	if err := scanReviewers(ctx, pool, liveReviewersSQL+stallFilter,
+		[]any{timeout.Seconds()}, &reviewers); err != nil {
+		return err
+	}
+	for _, r := range reviewers {
+		applied, err := parkTask(ctx, pool, r.agentID, r.taskID, fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout), "review")
+		if err != nil {
+			return err
+		}
+		if !applied {
+			continue
+		}
+		log.Printf("pipeline: dispatch: watchdog retired stalled reviewer %s on %s → needs_human", r.agentID, r.taskID)
+		killReviewerPane(sessionName, r.session, r.window, killWindow)
+	}
+
+	var fixers []liveReviewer
+	if err := scanReviewers(ctx, pool, liveFixersSQL+stallFilter,
+		[]any{timeout.Seconds()}, &fixers); err != nil {
+		return err
+	}
+	for _, r := range fixers {
+		applied, err := parkTask(ctx, pool, r.agentID, r.taskID, fmt.Sprintf("watchdog: fix stalled past %s — needs human", timeout), "changes_requested")
+		if err != nil {
+			return err
+		}
+		if !applied {
+			continue
+		}
+		log.Printf("pipeline: dispatch: watchdog retired stalled fixer %s on %s → needs_human", r.agentID, r.taskID)
+		killReviewerPane(sessionName, r.session, r.window, killWindow)
+	}
+	return nil
+}
+
+// parkTask flips the task to pending_approval (guarded on its current
+// status), records the watchdog note as a verdict row, and retires the
+// agent — one tx. applied=false when the row raced to another status.
+func parkTask(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note, expectStatus string) (bool, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback(ctx)
-
-	tag, err := tx.Exec(ctx, `UPDATE tasks SET status=$1 WHERE id=$2 AND status='review'`, status, taskID)
+	tag, err := tx.Exec(ctx, `UPDATE tasks SET status='pending_approval' WHERE id=$1 AND status=$2`, taskID, expectStatus)
 	if err != nil {
+		tx.Rollback(ctx)
 		return false, err
 	}
 	if tag.RowsAffected() == 0 {
+		tx.Rollback(ctx)
 		return false, nil
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO task_context (task_id, agent_id, kind, content)
 		VALUES ($1, $2, 'verdict', $3)
-	`, taskID, agentID, "VERDICT: "+verdict); err != nil {
+	`, taskID, agentID, note); err != nil {
+		tx.Rollback(ctx)
 		return false, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE agents SET status='dead', last_seen=NOW() WHERE id=$1`, agentID); err != nil {
+		tx.Rollback(ctx)
 		return false, err
 	}
 	return true, tx.Commit(ctx)
 }
 
-// watchdogPass parks stalled reviews: a live reviewer with NO outbox
-// activity (the monitor writes rows as the agent streams) for longer than
-// the timeout flips the task to pending_approval and retires the pane.
-// liveReviewer is one live reviewer pane on a pipeline review task.
-type liveReviewer struct {
-	agentID, session, window, taskID string
-}
+// ---- fixer loop (EX-04) -------------------------------------------------
+//
+// A task parked in changes_requested by a request_changes verdict is
+// re-claimed by a fresh fixer session working the SAME worktree/PR. The
+// episode is keyed by review_rounds (frozen while parked — it only bumps at
+// the next reviewer spawn); the fix row + inbox dedup + unique-live index
+// are the three idempotency guards. The fixer completes via maquinista-done
+// → db.MarkDone → 'review' (done-path branch), where the next reviewer spawn
+// bumps the round: the loop closes with no new transition code. No
+// zero-author guard here BY DESIGN — a fixer continuing the previous fixer's
+// work is the point; the reviewer at round N+1 is always a fresh mint.
 
-func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
-	var reviewers []liveReviewer
-	if err := scanReviewers(ctx, pool, liveReviewersSQL+`
-	  AND NOT EXISTS (
-	        SELECT 1 FROM agent_outbox o
-	        WHERE o.agent_id = a.id AND o.created_at > NOW() - make_interval(secs => $1))`,
-		[]any{timeout.Seconds()}, &reviewers); err != nil {
+// fixerCandidatesSQL: changes_requested pipeline tasks with a worktree, a
+// request_changes verdict, no live fixer, and no fix row for the current
+// episode. Role-scoped live check (symmetric with reviewCandidatesSQL):
+// cross-role windows (a reviewer pane the verdict pass failed to kill) rely
+// on uq_agents_task_live + the next-tick retry, same as EX-03.
+const fixerCandidatesSQL = `
+SELECT t.id, t.worktree_path, v.agent_id
+FROM tasks t
+JOIN LATERAL (
+    SELECT agent_id FROM task_context
+    WHERE task_id = t.id AND kind = 'verdict'
+      AND content LIKE 'VERDICT: request_changes%'
+    ORDER BY created_at DESC LIMIT 1
+) v ON TRUE
+WHERE t.status = 'changes_requested'
+  AND t.metadata->>'ticket_issue_id' IS NOT NULL
+  AND t.worktree_path IS NOT NULL AND t.worktree_path <> ''
+  AND NOT EXISTS (
+        SELECT 1 FROM agents a
+        WHERE a.task_id = t.id AND a.status <> 'dead' AND a.role = '` + fixerRole + `')
+  AND NOT EXISTS (
+        SELECT 1 FROM task_context f
+        WHERE f.task_id = t.id AND f.kind = 'fix'
+          AND f.content = 'round ' || t.review_rounds::text)`
+
+// fixerPromptHealSQL: a live fixer whose episode's prompt row is missing
+// (crash between spawn and enqueue) — healed exactly once by the dedup'd
+// external_msg_id.
+const fixerPromptHealSQL = `
+SELECT a.id, t.id, t.review_rounds, v.agent_id
+FROM tasks t
+JOIN agents a ON a.task_id = t.id AND a.status <> 'dead' AND a.role = '` + fixerRole + `'
+JOIN LATERAL (
+    SELECT agent_id FROM task_context
+    WHERE task_id = t.id AND kind = 'verdict'
+      AND content LIKE 'VERDICT: request_changes%'
+    ORDER BY created_at DESC LIMIT 1
+) v ON TRUE
+WHERE t.status = 'changes_requested'
+  AND t.metadata->>'ticket_issue_id' IS NOT NULL
+  AND NOT EXISTS (
+        SELECT 1 FROM agent_inbox i
+        WHERE i.agent_id = a.id
+          AND i.origin_channel = 'task'
+          AND i.external_msg_id = 'fix:' || t.id || ':' || t.review_rounds)`
+
+// maxFindingsChars bounds the reviewer-message excerpt embedded in the fix
+// prompt (the soul mandates a numbered findings list at the top of the final
+// reply; the tail keeps the prompt bounded).
+const maxFindingsChars = 6000
+
+func fixerPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) error {
+	rows, err := pool.Query(ctx, fixerCandidatesSQL)
+	if err != nil {
 		return err
 	}
-	for _, r := range reviewers {
-		tx, err := pool.Begin(ctx)
-		if err != nil {
+	type cand struct{ taskID, worktree, reviewerAgent string }
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.taskID, &c.worktree, &c.reviewerAgent); err != nil {
+			rows.Close()
 			return err
 		}
-		tag, err := tx.Exec(ctx, `UPDATE tasks SET status='pending_approval' WHERE id=$1 AND status='review'`, r.taskID)
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, c := range cands {
+		agentID, err := mintAgentID(ctx, pool, fixerRole, c.taskID)
 		if err != nil {
-			tx.Rollback(ctx)
-			return err
-		}
-		if tag.RowsAffected() == 0 {
-			tx.Rollback(ctx)
+			log.Printf("pipeline: dispatch: mint fixer %s: %v", c.taskID, err)
 			continue
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO task_context (task_id, agent_id, kind, content)
-			VALUES ($1, $2, 'verdict', $3)
-		`, r.taskID, r.agentID, fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout)); err != nil {
-			tx.Rollback(ctx)
+		runnerType, model, err := resolveTemplateExecFor(ctx, pool, FixerSoulTemplate)
+		if err != nil {
+			log.Printf("pipeline: dispatch: resolve fixer exec for %s: %v", c.taskID, err)
+		}
+		err = spawn.SpawnReviewer(ctx, ReviewSpawnParams{
+			AgentID:        agentID,
+			TaskID:         c.taskID,
+			WorktreePath:   c.worktree,
+			Role:           fixerRole,
+			SoulTemplateID: FixerSoulTemplate,
+			RunnerType:     runnerType,
+			Model:          model,
+		})
+		if err != nil {
+			// Includes the cross-process unique-live loss; next tick no-ops.
+			log.Printf("pipeline: dispatch: spawn fixer %s for %s: %v", agentID, c.taskID, err)
+			continue
+		}
+		// Reviewer round now parked in changes_requested = the episode being
+		// fixed; round is frozen until the next reviewer spawn bumps it.
+		var round int
+		if err := pool.QueryRow(ctx,
+			`SELECT review_rounds FROM tasks WHERE id = $1`, c.taskID).Scan(&round); err != nil {
+			log.Printf("pipeline: dispatch: fixer round lookup %s: %v", c.taskID, err)
+			continue
+		}
+		if err := recordFixEpisode(ctx, pool, agentID, c.taskID, round, c.reviewerAgent); err != nil {
+			// Prompt miss heals on the next tick (fixerPromptHealSQL).
+			log.Printf("pipeline: dispatch: record fix episode %s: %v", c.taskID, err)
+		}
+		log.Printf("pipeline: dispatch: spawned fixer %s for task %s (round %d, worktree %s)", agentID, c.taskID, round, c.worktree)
+	}
+	return fixerPromptPass(ctx, pool)
+}
+
+// fixerPromptPass heals the crash-between-spawn-and-enqueue case for fixers
+// (mirrors promptPass for reviewers).
+func fixerPromptPass(ctx context.Context, pool *pgxpool.Pool) error {
+	rows, err := pool.Query(ctx, fixerPromptHealSQL)
+	if err != nil {
+		return err
+	}
+	type gap struct{ agentID, taskID string; round int; reviewerAgent string }
+	var gaps []gap
+	for rows.Next() {
+		var g gap
+		if err := rows.Scan(&g.agentID, &g.taskID, &g.round, &g.reviewerAgent); err != nil {
+			rows.Close()
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE agents SET status='dead', last_seen=NOW() WHERE id=$1`, r.agentID); err != nil {
+		gaps = append(gaps, g)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, g := range gaps {
+		log.Printf("pipeline: dispatch: healing missing fix prompt %s round %d", g.taskID, g.round)
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			log.Printf("pipeline: dispatch: heal fix prompt %s: %v", g.taskID, err)
+			continue
+		}
+		if err := enqueueFixPrompt(ctx, tx, g.agentID, g.taskID, g.round, g.reviewerAgent); err != nil {
 			tx.Rollback(ctx)
-			return err
+			log.Printf("pipeline: dispatch: heal fix prompt %s: %v", g.taskID, err)
+			continue
 		}
 		if err := tx.Commit(ctx); err != nil {
-			return err
+			log.Printf("pipeline: dispatch: heal fix prompt %s: %v", g.taskID, err)
 		}
-		log.Printf("pipeline: dispatch: watchdog retired stalled reviewer %s on %s → needs_human", r.agentID, r.taskID)
-		killReviewerPane(sessionName, r.session, r.window, killWindow)
 	}
 	return nil
+}
+
+// latestFindings returns the reviewer's newest assistant message — the same
+// row latestVerdict parses; per the soul contract the reply body IS the
+// numbered findings list. Tail-capped to maxFindingsChars.
+func latestFindings(ctx context.Context, q queryRow, reviewerAgent string) (string, error) {
+	var text *string
+	err := q.QueryRow(ctx, `
+		SELECT content->>'text' FROM agent_outbox
+		WHERE agent_id = $1 AND content ? 'text'
+		ORDER BY created_at DESC LIMIT 1
+	`, reviewerAgent).Scan(&text)
+	if err != nil {
+		return "", err
+	}
+	if text == nil {
+		return "", fmt.Errorf("no findings text from %s", reviewerAgent)
+	}
+	t := *text
+	if len(t) > maxFindingsChars {
+		t = t[len(t)-maxFindingsChars:]
+	}
+	return t, nil
+}
+
+// recordFixEpisode inserts the episode marker (task_context kind 'fix',
+// content 'round <N>' — the dedup key fixerCandidatesSQL reads) and then
+// enqueues the fix prompt. The marker commits FIRST and ALONE: its presence,
+// not the prompt's, is what stops re-spawning for this episode (a findings
+// load failure must not un-bound the fixer mint — the prompt miss heals via
+// fixerPromptPass, and a permanently missing findings text is bounded by the
+// watchdog parking the task). The inbox insert dedups on
+// (origin_channel, external_msg_id).
+func recordFixEpisode(ctx context.Context, pool *pgxpool.Pool, agentID, taskID string, round int, reviewerAgent string) error {
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ($1, $2, 'fix', $3)
+	`, taskID, agentID, fmt.Sprintf("round %d", round)); err != nil {
+		return fmt.Errorf("insert fix row: %w", err)
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if err := enqueueFixPrompt(ctx, tx, agentID, taskID, round, reviewerAgent); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// fixerPromptBody is the per-episode briefing. The fixer soul carries the
+// full method (findings top to bottom, proofs re-run, no scope growth); this
+// carries the findings and the round specifics.
+func fixerPromptBody(taskID string, round int, findings string) string {
+	return fmt.Sprintf(
+		"Fix round for task %s (review round %d failed). The reviewer's findings follow. "+
+			"Your cwd is the task worktree — same branch, same PR as the rounds before. "+
+			"Resolve every finding, re-run the affected proofs, and push. "+
+			"Finish with: maquinista-done %s \"<summary naming the findings resolved>\".\n\n"+
+			"Reviewer findings:\n%s",
+		taskID, round, taskID, findings)
+}
+
+func enqueueFixPrompt(ctx context.Context, tx pgx.Tx, agentID, taskID string, round int, reviewerAgent string) error {
+	findings, err := latestFindings(ctx, tx, reviewerAgent)
+	if err != nil {
+		return fmt.Errorf("load findings: %w", err)
+	}
+	content, err := json.Marshal(map[string]any{
+		"type":    "fix",
+		"task_id": taskID,
+		"round":   round,
+		"prompt":  fixerPromptBody(taskID, round, findings),
+	})
+	if err != nil {
+		return err
+	}
+	_, _, err = mailbox.EnqueueInbox(ctx, tx, mailbox.InboxMessage{
+		AgentID:       agentID,
+		FromKind:      "system",
+		FromID:        "pipeline",
+		OriginChannel: "task",
+		ExternalMsgID: fmt.Sprintf("fix:%s:%d", taskID, round),
+		Content:       content,
+	})
+	return err
 }
 
 func scanReviewers(ctx context.Context, pool *pgxpool.Pool, sql string, args []any, out *[]liveReviewer) error {
