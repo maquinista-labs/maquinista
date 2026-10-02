@@ -109,6 +109,30 @@ func WorktreeAdd(repoRoot, worktreeDir, branch string) error {
 	return nil
 }
 
+// WorktreeAddFrom creates a new worktree with a new branch starting at
+// startRef (e.g. "origin/main") instead of HEAD.
+func WorktreeAddFrom(repoRoot, worktreeDir, branch, startRef string) error {
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", "-b", branch, worktreeDir, startRef)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add -b %s %s %s: %s: %w", branch, worktreeDir, startRef, string(out), err)
+	}
+	return nil
+}
+
+// WorktreeAttach creates a worktree checking out an existing branch.
+func WorktreeAttach(repoRoot, worktreeDir, branch string) error {
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", worktreeDir, branch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add %s %s: %s: %w", worktreeDir, branch, string(out), err)
+	}
+	return nil
+}
+
+// RefExists reports whether ref resolves in dir (no-op quiet probe).
+func RefExists(dir, ref string) bool {
+	return exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run() == nil
+}
+
 // WorktreeRemove removes a worktree directory.
 func WorktreeRemove(repoRoot, worktreeDir string) error {
 	cmd := exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", worktreeDir)

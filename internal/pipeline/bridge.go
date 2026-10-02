@@ -24,6 +24,10 @@ type TicketsConfig struct {
 	TeamID   string
 	Project  string
 	Interval time.Duration
+	// Repo is the repo root sibling worktrees are provisioned from
+	// (MAQ-13). Empty → RunBridge resolves WorktreeRepo() once at startup;
+	// still empty → claims go out without a worktree and park needs-human.
+	Repo string
 }
 
 // Enabled reports whether the bridge should run: both the credential and the
@@ -39,6 +43,7 @@ func FromEnv() TicketsConfig {
 		APIKey:   os.Getenv("MAQUINISTA_TICKETS_API_KEY"),
 		TeamID:   os.Getenv("MAQUINISTA_TICKETS_TEAM_ID"),
 		Project:  os.Getenv("MAQUINISTA_TICKETS_PROJECT"),
+		Repo:     os.Getenv(WorktreeRepoEnv),
 	}
 	if cfg.Provider == "" {
 		cfg.Provider = "linear"
@@ -55,11 +60,12 @@ func FromEnv() TicketsConfig {
 	return cfg
 }
 
-// ClaimIssue inserts, in one transaction, the task row (status "ready") and
-// the ticket_issue_map row (pending_state canonical "In Progress"). The map
-// row's PK makes the INSERT the claim: a conflict rolls the whole
-// transaction back and reports created=false.
-func ClaimIssue(ctx context.Context, pool *pgxpool.Pool, iss Issue, teamID, project string) (bool, error) {
+// ClaimIssue inserts, in one transaction, the task row (status "ready",
+// worktree_path = worktree when non-nil) and the ticket_issue_map row
+// (pending_state canonical "In Progress"). The map row's PK makes the INSERT
+// the claim: a conflict rolls the whole transaction back and reports
+// created=false.
+func ClaimIssue(ctx context.Context, pool *pgxpool.Pool, iss Issue, teamID, project string, worktree *string) (bool, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return false, fmt.Errorf("pipeline: begin claim tx: %w", err)
@@ -68,9 +74,10 @@ func ClaimIssue(ctx context.Context, pool *pgxpool.Pool, iss Issue, teamID, proj
 
 	taskID := uuid.NewString()
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO tasks (id, title, body, status, project_id, metadata)
-		VALUES ($1, $2, $3, 'ready', $4, $5::jsonb)`,
+		INSERT INTO tasks (id, title, body, status, project_id, worktree_path, metadata)
+		VALUES ($1, $2, $3, 'ready', $4, $5, $6::jsonb)`,
 		taskID, fmt.Sprintf("[%s] %s", iss.Key, iss.Title), iss.Description, project,
+		worktree,
 		fmt.Sprintf(`{"ticket_issue_id":%q,"ticket_url":%q}`, iss.ID, iss.URL),
 	); err != nil {
 		return false, fmt.Errorf("pipeline: insert task: %w", err)
@@ -100,6 +107,18 @@ func RunBridge(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider, cfg
 	if cfg.Interval <= 0 {
 		cfg.Interval = 60 * time.Second
 	}
+	// MAQ-13: resolve the worktree repo root once. Unresolvable (no
+	// MAQUINISTA_TICKETS_REPO, cwd not a checkout) is logged once here —
+	// claims then go out without a worktree and the task scheduler parks
+	// each one needs-human, so the failure stays loud without looping.
+	if cfg.Repo == "" {
+		if r, err := WorktreeRepo(); err != nil {
+			log.Printf("pipeline: worktree repo root unresolved (%v); claims will park needs-human — set %s", err, WorktreeRepoEnv)
+		} else {
+			cfg.Repo = r
+			log.Printf("pipeline: worktree repo root %s", cfg.Repo)
+		}
+	}
 	log.Printf("pipeline: bridge polling team %s every %s (project %q, provider %s)", cfg.TeamID, cfg.Interval, cfg.Project, cfg.Provider)
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
@@ -122,14 +141,34 @@ func claimReady(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider, cf
 		return fmt.Errorf("fetching intake issues: %w", err)
 	}
 	for _, iss := range issues {
-		created, err := ClaimIssue(ctx, pool, iss, cfg.TeamID, cfg.Project)
+		wt := ensureClaimWorktree(cfg, iss)
+		created, err := ClaimIssue(ctx, pool, iss, cfg.TeamID, cfg.Project, wt)
 		if err != nil {
 			log.Printf("pipeline: claim %s: %v", iss.Key, err)
 			continue
 		}
 		if created {
-			log.Printf("pipeline: claimed %s (%s)", iss.Key, iss.Title)
+			if wt != nil {
+				log.Printf("pipeline: claimed %s (%s) with worktree %s (branch %s)", iss.Key, iss.Title, *wt, SlugFromKey(iss.Key))
+			} else {
+				log.Printf("pipeline: claimed %s (%s) WITHOUT worktree — scheduler will park it needs-human", iss.Key, iss.Title)
+			}
 		}
 	}
 	return nil
+}
+
+// ensureClaimWorktree provisions the sibling worktree for iss (MAQ-13).
+// Best effort: nil on any failure — the task claims without a worktree_path
+// and the task scheduler parks it needs-human exactly once (loud, no loop).
+func ensureClaimWorktree(cfg TicketsConfig, iss Issue) *string {
+	if cfg.Repo == "" {
+		return nil
+	}
+	dir, err := EnsureIssueWorktree(cfg.Repo, iss)
+	if err != nil {
+		log.Printf("pipeline: claim %s: worktree: %v (claiming without — will park needs-human)", iss.Key, err)
+		return nil
+	}
+	return &dir
 }

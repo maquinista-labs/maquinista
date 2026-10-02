@@ -34,11 +34,11 @@ func TestNotifyf_SwallowsDeadPool(t *testing.T) {
 	pool := testPool(t)
 	pool.Close() // subsequent ops error
 
-	notifyf(context.Background(), pool, "this must not panic: %d", 42)
+	Notifyf(context.Background(), pool, "this must not panic: %d", 42)
 }
 
 // TestNotify_MissingPipelineAgentFails: without migration 036's seed the
-// FK fails — Notify surfaces the error (notifyf logs it).
+// FK fails — Notify surfaces the error (Notifyf logs it).
 func TestNotify_MissingPipelineAgentFails(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()

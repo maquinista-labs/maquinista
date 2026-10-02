@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
+	"github.com/maquinista-labs/maquinista/internal/pipeline"
 )
 
 // EnsureAgentFn is a thin adapter so the scheduler can be tested without
@@ -24,10 +26,20 @@ import (
 // orchestrator.EnsureAgent via a closure that also supplies a Spawner.
 type EnsureAgentFn func(ctx context.Context, role, taskID string) (agentID string, err error)
 
+// parkNoWorktreeNote is the task_context verdict row recorded when a task is
+// parked for having no worktree_path (DispatchOne claim-time park and the
+// ParkUnspawnable backstop share it).
+const parkNoWorktreeNote = "no worktree_path — implementor can never spawn (EnsureAgent refuses worktree-less tasks by design); parked needs-human"
+
 // Config bundles scheduler knobs.
 type Config struct {
 	PollInterval time.Duration
 	EnsureAgent  EnsureAgentFn
+	// ParkGrace is how long a claimed task with no worktree_path and no
+	// live agent sits before ParkUnspawnable parks it needs-human
+	// (MAQ-13 backstop). <= 0 → default 10m, overridable via
+	// MAQUINISTA_WORKTREE_GRACE.
+	ParkGrace time.Duration
 }
 
 // Run drives the task-scheduler loop until ctx is cancelled.
@@ -40,6 +52,14 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 	}
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = 30 * time.Second
+	}
+	if cfg.ParkGrace <= 0 {
+		cfg.ParkGrace = DefaultParkGrace
+		if v := os.Getenv(ParkGraceEnv); v != "" {
+			if d, err := time.ParseDuration(v); err == nil && d > 0 {
+				cfg.ParkGrace = d
+			}
+		}
 	}
 
 	listener, err := pool.Acquire(ctx)
@@ -54,6 +74,14 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 	for {
 		if err := drain(ctx, pool, cfg); err != nil {
 			log.Printf("taskscheduler: %v", err)
+		}
+		// MAQ-13 backstop: claimed tasks with no worktree_path and no live
+		// agent are unspawnable forever (the scheduler only claims 'ready'
+		// rows, so nothing revisits them). Park past grace, exactly once.
+		if parked, perr := ParkUnspawnable(ctx, pool, cfg.ParkGrace); perr != nil {
+			log.Printf("taskscheduler: park unspawnable: %v", perr)
+		} else if parked > 0 {
+			log.Printf("taskscheduler: parked %d unspawnable claimed task(s) needs-human", parked)
 		}
 		// Self-heal: a claimed task whose agent has no inbox row (spawn
 		// raced the enqueue, mailbox dropped it, crash mid-dispatch) would
@@ -93,6 +121,7 @@ func drain(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, error) {
 	var taskID string
 	var roleFromMeta *string
+	var worktree *string
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -101,7 +130,7 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 	defer tx.Rollback(ctx)
 
 	err = tx.QueryRow(ctx, `
-		SELECT id, metadata->>'role'
+		SELECT id, metadata->>'role', worktree_path
 		FROM tasks t
 		WHERE status = 'ready'
 		  AND NOT EXISTS (
@@ -111,13 +140,35 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 		ORDER BY priority DESC, created_at
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`).Scan(&taskID, &roleFromMeta)
+	`).Scan(&taskID, &roleFromMeta, &worktree)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("claim task: %w", err)
 	}
+	// Structural dead end (MAQ-13): no worktree_path means EnsureAgent can
+	// never spawn (it refuses worktree-less tasks by design), so claiming
+	// would only start a ready→claimed→ready log loop. Park needs-human
+	// inside the claim tx instead — the guarded transition makes it exactly
+	// once — and ping the Pipeline topic once.
+	if worktree == nil || *worktree == "" {
+		if _, err := tx.Exec(ctx, `UPDATE tasks SET status='pending_approval' WHERE id=$1`, taskID); err != nil {
+			return false, fmt.Errorf("park no-worktree: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO task_context (task_id, kind, content) VALUES ($1, 'verdict', $2)`,
+			taskID, parkNoWorktreeNote); err != nil {
+			return false, fmt.Errorf("park no-worktree note: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return false, fmt.Errorf("commit park: %w", err)
+		}
+		log.Printf("taskscheduler: task %s parked needs-human: no worktree_path (implementor can never spawn)", taskID)
+		pipeline.Notifyf(ctx, pool, "🆘 %s: no worktree_path — cannot spawn an implementor. Parked needs-human. Provision the worktree, set tasks.worktree_path, flip the task back to 'ready'.",
+			pipeline.TaskTitle(ctx, pool, taskID))
+		return true, nil
+	}
+
 	role := "implementor"
 	if roleFromMeta != nil && *roleFromMeta != "" {
 		role = *roleFromMeta

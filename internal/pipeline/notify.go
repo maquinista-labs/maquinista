@@ -45,18 +45,18 @@ func Notify(ctx context.Context, pool *pgxpool.Pool, text string) error {
 	return tx.Commit(ctx)
 }
 
-// notifyf is the fire-and-forget form used inside transition arms: a failed
+// Notifyf is the fire-and-forget form used inside transition arms: a failed
 // notification is logged, never allowed to fail the pipeline transition it
 // reports (the state change is the system of record; the note is a courtesy).
-func notifyf(ctx context.Context, pool *pgxpool.Pool, format string, args ...any) {
+func Notifyf(ctx context.Context, pool *pgxpool.Pool, format string, args ...any) {
 	if err := Notify(ctx, pool, fmt.Sprintf(format, args...)); err != nil {
 		log.Printf("pipeline: notify: %v", err)
 	}
 }
 
-// taskTitle returns "<title> (<short-id>)" for summaries, tolerating a
+// TaskTitle returns "<title> (<short-id>)" for summaries, tolerating a
 // missing row (best-effort label, never a reason to fail the transition).
-func taskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
+func TaskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
 	var title string
 	if err := pool.QueryRow(ctx,
 		`SELECT title FROM tasks WHERE id = $1`, taskID).Scan(&title); err != nil {
@@ -72,20 +72,20 @@ func taskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
 func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdict, landed string, round, maxRounds int) {
 	label := title
 	if label == "" {
-		label = taskTitle(ctx, pool, taskID)
+		label = TaskTitle(ctx, pool, taskID)
 	}
 	switch {
 	case landed == "pending_approval":
-		notifyf(ctx, pool, "🆘 %s: review round cap %d reached (%s) — parked needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.",
+		Notifyf(ctx, pool, "🆘 %s: review round cap %d reached (%s) — parked needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.",
 			label, maxRounds, verdict, taskID, taskID)
 	case verdict == VerdictApprove:
-		notifyf(ctx, pool, "✅ %s approved (review round %d) → ready_to_merge. Merge proposal: `maquinista approve %s` — or set PIPELINE_AUTO_MERGE=1 for autonomous merges.",
+		Notifyf(ctx, pool, "✅ %s approved (review round %d) → ready_to_merge. Merge proposal: `maquinista approve %s` — or set PIPELINE_AUTO_MERGE=1 for autonomous merges.",
 			label, round, taskID)
 	case verdict == VerdictRequestChanges:
-		notifyf(ctx, pool, "🔁 %s: request_changes (review round %d) — fixer spawning.",
+		Notifyf(ctx, pool, "🔁 %s: request_changes (review round %d) — fixer spawning.",
 			label, round)
 	default: // needs_human
-		notifyf(ctx, pool, "🆘 %s: reviewer escalated needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.",
+		Notifyf(ctx, pool, "🆘 %s: reviewer escalated needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.",
 			label, taskID, taskID)
 	}
 }
