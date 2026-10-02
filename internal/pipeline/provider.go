@@ -83,6 +83,12 @@ type TicketProvider interface {
 
 	// SetIssueColumn moves an issue to the column with the given provider ID.
 	SetIssueColumn(ctx context.Context, issueID, columnID string) error
+
+	// AddIssueLink posts a link (the task's PR URL) onto the issue — for
+	// Linear, a comment. Exactly-once delivery is the CALLER's job: the
+	// sync loop dedups on ticket_issue_map.pr_url_synced, so the provider
+	// implementation must be safe to call again after a failure.
+	AddIssueLink(ctx context.Context, issueID, url string) error
 }
 
 // NewProvider resolves a provider by name (MAQUINISTA_TICKETS_PROVIDER).

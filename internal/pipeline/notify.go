@@ -65,27 +65,45 @@ func taskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
 	return fmt.Sprintf("%s (%s)", title, taskID)
 }
 
+// prLinkSuffix returns "\n🔗 PR: <url>" when the task has a pr_url, else "".
+// Best-effort (a lookup failure logs and yields no link) so tasks without a
+// PR — or an unreadable row — degrade to the old linkless message instead of
+// surfacing a null/empty link (MAQ-10).
+func prLinkSuffix(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
+	var prURL *string
+	if err := pool.QueryRow(ctx, `SELECT pr_url FROM tasks WHERE id = $1`, taskID).Scan(&prURL); err != nil {
+		log.Printf("pipeline: notify: pr_url lookup %s: %v", taskID, err)
+		return ""
+	}
+	if prURL == nil || *prURL == "" {
+		return ""
+	}
+	return "\n🔗 PR: " + *prURL
+}
+
 // notifyVerdict turns an applied review verdict into the Pipeline-topic
 // summary: approve is the merge proposal, request_changes notes the fixer
-// round, needs_human / round-cap are the questions. Verdicts landed before
-// EX-06 never re-notify: the emission sits inside the guarded transition.
+// round, needs_human / round-cap are the questions. A task with a PR gets
+// the link on every verdict (MAQ-10). Verdicts landed before EX-06 never
+// re-notify: the emission sits inside the guarded transition.
 func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdict, landed string, round, maxRounds int) {
 	label := title
 	if label == "" {
 		label = taskTitle(ctx, pool, taskID)
 	}
+	pr := prLinkSuffix(ctx, pool, taskID)
 	switch {
 	case landed == "pending_approval":
-		notifyf(ctx, pool, "🆘 %s: review round cap %d reached (%s) — parked needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.",
-			label, maxRounds, verdict, taskID, taskID)
+		notifyf(ctx, pool, "🆘 %s: review round cap %d reached (%s) — parked needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
+			label, maxRounds, verdict, taskID, taskID, pr)
 	case verdict == VerdictApprove:
-		notifyf(ctx, pool, "✅ %s approved (review round %d) → ready_to_merge. Merge proposal: `maquinista approve %s` — or set PIPELINE_AUTO_MERGE=1 for autonomous merges.",
-			label, round, taskID)
+		notifyf(ctx, pool, "✅ %s approved (review round %d) → ready_to_merge. Merge proposal: `maquinista approve %s` — or set PIPELINE_AUTO_MERGE=1 for autonomous merges.%s",
+			label, round, taskID, pr)
 	case verdict == VerdictRequestChanges:
-		notifyf(ctx, pool, "🔁 %s: request_changes (review round %d) — fixer spawning.",
-			label, round)
+		notifyf(ctx, pool, "🔁 %s: request_changes (review round %d) — fixer spawning.%s",
+			label, round, pr)
 	default: // needs_human
-		notifyf(ctx, pool, "🆘 %s: reviewer escalated needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.",
-			label, taskID, taskID)
+		notifyf(ctx, pool, "🆘 %s: reviewer escalated needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
+			label, taskID, taskID, pr)
 	}
 }

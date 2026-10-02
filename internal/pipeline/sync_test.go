@@ -205,3 +205,98 @@ func TestSync_SkipsNonCanonicalPending(t *testing.T) {
 		t.Errorf("row mutated on non-canonical pending: pend=%v last=%v, want pend kept, last NULL", pend, last)
 	}
 }
+
+// syncedPR reads ticket_issue_map.pr_url_synced for the issue.
+func syncedPR(t *testing.T, pool *pgxpool.Pool, issueID string) *string {
+	t.Helper()
+	var synced *string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT pr_url_synced FROM ticket_issue_map WHERE issue_id = $1`, issueID,
+	).Scan(&synced); err != nil {
+		t.Fatalf("pr_url_synced %s: %v", issueID, err)
+	}
+	return synced
+}
+
+// TestSync_IssueLinkExactlyOnce (MAQ-10): the PR URL is pushed to the issue
+// exactly once per URL; later ticks and unchanged URLs never re-write.
+func TestSync_IssueLinkExactlyOnce(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	fake := &fakeTickets{}
+	seedMappedTask(t, pool, "tsk-link", "review", "uuid-link", "", "", 0, -5)
+
+	// (a) No PR yet: nothing pushed, nothing booked.
+	if n, err := SyncIssueLinks(ctx, pool, fake); err != nil || n != 0 {
+		t.Fatalf("(a) pushed=%d err=%v, want 0/nil", n, err)
+	}
+	if len(fake.links) != 0 {
+		t.Fatalf("(a) links = %+v, want none", fake.links)
+	}
+
+	// (b) PR opens: exactly one push, bookkeeping stamped.
+	const pr1 = "https://github.com/maquinista-labs/maquinista/pull/11"
+	execOK(t, pool, `UPDATE tasks SET pr_url = $2 WHERE id = $1`, "tsk-link", pr1)
+	if n, err := SyncIssueLinks(ctx, pool, fake); err != nil || n != 1 {
+		t.Fatalf("(b) pushed=%d err=%v, want 1/nil", n, err)
+	}
+	if len(fake.links) != 1 || fake.links[0].issueID != "uuid-link" || fake.links[0].url != pr1 {
+		t.Fatalf("(b) links = %+v, want one push of %s", fake.links, pr1)
+	}
+	if got := syncedPR(t, pool, "uuid-link"); got == nil || *got != pr1 {
+		t.Fatalf("(b) pr_url_synced = %v, want %q", got, pr1)
+	}
+
+	// (c) Idempotent across ticks: unchanged URL → no further writes.
+	if n, err := SyncIssueLinks(ctx, pool, fake); err != nil || n != 0 {
+		t.Fatalf("(c) pushed=%d err=%v, want 0/nil", n, err)
+	}
+	if len(fake.links) != 1 {
+		t.Fatalf("(c) links = %+v, want still exactly 1 (no comment spam)", fake.links)
+	}
+
+	// (d) New PR on the task: exactly one more push.
+	const pr2 = pr1 + "x"
+	execOK(t, pool, `UPDATE tasks SET pr_url = $2 WHERE id = $1`, "tsk-link", pr2)
+	if n, err := SyncIssueLinks(ctx, pool, fake); err != nil || n != 1 {
+		t.Fatalf("(d) pushed=%d err=%v, want 1/nil", n, err)
+	}
+	if len(fake.links) != 2 || fake.links[1].url != pr2 {
+		t.Fatalf("(d) links = %+v, want second push of %s", fake.links, pr2)
+	}
+}
+
+// TestSync_IssueLinkRetriesAfterFailure: a provider failure is logged and the
+// row stays unsynced, so the next tick retries — still exactly one successful
+// write per URL.
+func TestSync_IssueLinkRetriesAfterFailure(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	const pr = "https://github.com/maquinista-labs/maquinista/pull/12"
+	fake := &fakeTickets{linkErr: errors.New("linear down")}
+	seedMappedTask(t, pool, "tsk-linkretry", "review", "uuid-linkretry", "", "", 0, -5)
+	execOK(t, pool, `UPDATE tasks SET pr_url = $2 WHERE id = $1`, "tsk-linkretry", pr)
+
+	if n, err := SyncIssueLinks(ctx, pool, fake); err != nil || n != 0 {
+		t.Fatalf("failed tick: pushed=%d err=%v, want 0/nil", n, err)
+	}
+	if got := syncedPR(t, pool, "uuid-linkretry"); got != nil {
+		t.Fatalf("pr_url_synced = %v, want NULL after failed push", got)
+	}
+
+	fake.linkErr = nil
+	if n, err := SyncIssueLinks(ctx, pool, fake); err != nil || n != 1 {
+		t.Fatalf("retry tick: pushed=%d err=%v, want 1/nil", n, err)
+	}
+	if got := syncedPR(t, pool, "uuid-linkretry"); got == nil || *got != pr {
+		t.Fatalf("pr_url_synced = %v, want %q", got, pr)
+	}
+
+	// And a third tick stays quiet.
+	if n, err := SyncIssueLinks(ctx, pool, fake); err != nil || n != 0 {
+		t.Fatalf("post-success tick: pushed=%d err=%v, want 0/nil", n, err)
+	}
+	if len(fake.links) != 2 { // failed attempt + successful retry
+		t.Fatalf("links = %+v, want 2 attempts total", fake.links)
+	}
+}

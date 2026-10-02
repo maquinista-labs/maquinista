@@ -90,6 +90,14 @@ column ids via `TicketProvider.Columns` before pushing (`SetIssueColumn`).
   degrades to backoff, never to a lost transition
 - a state name missing from the team (operator renamed a column) backs off
   like any other failure instead of hot-looping
+- **PR-link sync (MAQ-10)** — the same tick also runs `SyncIssueLinks`:
+  every mapped task whose `pr_url` is set and differs from
+  `ticket_issue_map.pr_url_synced` (the last URL successfully written,
+  migration 037) gets one `TicketProvider.AddIssueLink` write — for Linear,
+  a comment carrying the raw URL. `pr_url_synced` is stamped only after a
+  successful push, so ticks are idempotent (exactly one write per URL) and
+  a failed push retries on the next tick. Tasks without a PR select
+  nothing — no empty-link writes.
 
 ## Review dispatch (EX-03)
 
@@ -229,6 +237,10 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   one `agent_outbox` row for the agent, commits — the relay's binding leg
   fans it into `channel_deliveries` for the Pipeline topic provisioned by
   the bot (`ensurePipelineTopic`). Failures are logged, never escalated.
+  Every task mention that has a `pr_url` carries the link — verdict
+  summaries (`notifyVerdict`), watchdog parks, and all merge-flow notes —
+  via `prLinkSuffix`; tasks without a PR keep the old linkless text
+  (MAQ-10: no null/empty links).
 - GitHub is behind `pipeline.GhRunner` (interface: `PRChecks` +
   `PRMergeSquash`); production uses the gh CLI (`internal/gh`).
 
