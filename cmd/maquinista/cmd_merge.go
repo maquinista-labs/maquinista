@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"text/tabwriter"
 	"time"
 
 	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/gh"
 	"github.com/maquinista-labs/maquinista/internal/git"
+	"github.com/maquinista-labs/maquinista/internal/pipeline"
 	"github.com/spf13/cobra"
 )
 
@@ -80,6 +83,22 @@ func mergeWatchLoop() error {
 
 func processMerge(entry *db.MergeQueueEntry) error {
 	fmt.Printf("Merging: %s (task %s, branch %s → %s)\n", fmt.Sprint(entry.ID), entry.TaskID, entry.Branch, entry.BaseBranch)
+
+	// gh mode: drive the remote PR through the pipeline's merge flow.
+	cfg := pipeline.MergeConfigFromEnv()
+	if cfg.Mode == pipeline.MergeModeGH {
+		tCfg := pipeline.FromEnv()
+		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
+		if perr != nil {
+			fmt.Printf("  warning: board sync disabled: %v\n", perr)
+			prov = nil
+		}
+		cfg.Gh = gh.New()
+		if err := pipeline.ProcessMergeGH(context.Background(), pool, cfg, prov, tCfg.TeamID, entry); err != nil {
+			return err
+		}
+		return nil
+	}
 
 	message := fmt.Sprintf("Merge %s: task %s", entry.Branch, entry.TaskID)
 	mergeSHA, err := git.MergeNoFF(".", entry.Branch, entry.BaseBranch, message)

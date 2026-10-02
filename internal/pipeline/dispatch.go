@@ -203,6 +203,9 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := watchdogPass(ctx, pool, cfg.ReviewTimeout, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: watchdog pass: %v", err)
 		}
+		if err := mergeEnqueuePass(ctx, pool); err != nil {
+			log.Printf("pipeline: dispatch: merge enqueue pass: %v", err)
+		}
 	}
 }
 
