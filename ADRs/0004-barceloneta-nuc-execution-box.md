@@ -2,6 +2,8 @@
 
 - **Status:** Proposto (pending Otavio's ok)
 - **Date:** 2026-10-01
+- **Amended:** 2026-10-02 — Phase 1/2: sandbox technology becomes a config knob
+  (template indirection), not a promotion event (Otavio, live discussion)
 - **Deciders:** Otavio
 - **Scope:** execution infrastructure locus (existing home NUC vs. new rental), Substrate sandbox technology choice (gVisor vs. microVM), ate-env integration surface
 - **Depends on:** ADR-0002 (`Executor` port), ADR-0003 (Substrate/AX integration plan — this ADR revises its hardware decision, not its adapter/tenant design)
@@ -120,6 +122,18 @@ design changes.
 All four gates falsifiable in one day; no-go on G-00a or G-00c parks this
 ADR and re-opens Robot rental (Option B) as written in 0003.
 
+Evidence status 2026-10-02 (substrate fork ADR-0001 outcome log): G-00a
+effectively evidenced — 4.7 GB RAM floor under a 7 G synthetic hog, zero
+OOM, ct101/102 + maquinista daemon intact through a real cold reboot.
+G-00c GO for per-runner egress with named exclusions (push ≈ 7 ms/line;
+NO-GO for whole-file polling and multi-tenant as-is). G-00d PASS at ~13×
+under target (suspend 0.45 s / resume 0.38 s), upgraded by reboot
+durability: snapshot bytes survive a cold host boot, recovery =
+`kubectl ate revert` → resume, proven on mc-e04 with continuous counters.
+One gate open: **G-00b streaming relay** — E-02's caveat (request/response
+`/process` exercised; the live follow-stream maquinista would wire to
+MonitorProfile scraping is not yet).
+
 ### Phase 1 — ate-env executor adapter (3–5 days, unchanged from 0003 Phase 1 in shape)
 
 `internal/executor/env.go` against the ate-env **Go client** (not raw REST):
@@ -128,12 +142,36 @@ Kill → environment delete; suspend/resume mapped when maquinista's reconcile
 moves from pane-respawn to snapshot-resume. Same seam, same shadow-mode
 rollout as 0003 planned.
 
-### Phase 2 — Sandbox technology default
+Config surface (amended 2026-10-02): the adapter's ONLY sandbox-aware knobs
+are `ATESPACE` + `ACTOR_TEMPLATE` (e.g. `sandbox-gvisor` / `sandbox-microvm`).
+Substrate routes sandbox technology at the template level (template → worker
+pool → SandboxConfig/RuntimeClass), so `Create(actor, template)` is identical
+either way — executor code never branches on sandbox tech. Both classes
+already coexist on the same node (e02-pty-1 gVisor, mc-e05 microvm).
+Switching or shadowing = a config edit, not a port; on a KVM-less host
+(Hetzner fallback) the microvm template simply doesn't exist and the
+adapter stays unchanged.
 
-Default sandbox = **gVisor** (mature, no KVM dependency, x86 comfortable);
-microVM promoted to default only after G-00d-grade evidence accumulates over
-≥ 2 weeks of pilot use. Per-tenant egress allowlists follow 0003's Gateway
-model verbatim.
+### Phase 2 — Sandbox technology as a permanent config knob (amended 2026-10-02)
+
+Start position: `ACTOR_TEMPLATE=sandbox-gvisor` (mature, no KVM dependency,
+and it keeps the Hetzner fallback alive — microVM can never run there). The
+microvm template stays warm behind the same knob; **there is no promotion
+event**. Evidence accrues by shadow A/B: the same agent task run against
+both templates, diffing transcript integrity, PTY stream quality and
+lifecycle latency — the G-00b open item collapses into "flip the knob, run
+the probe".
+
+Named prerequisite for the knob's second position: a microvm actor template
+whose guest image embeds `ate-env-guest` — ate-env fs/process ops are the
+transcript-egress path (E-03-proven), and the counter-microvm demo guest
+serves HTTP only. Small job: the demo's guest-build pipeline already exists
+in-repo. Per-tenant egress allowlists follow 0003's Gateway model verbatim.
+
+Evidence base already banked (substrate fork ADR-0001, 02/10): microvm
+suspend 0.45 s / resume 0.38 s; snapshot bytes survive cold host reboot
+(revert → resume, mc-e04 counters continuous); gVisor checkpoint/restore
+same-pids with the live PTY surviving the worker move (E-02).
 
 ### Scale-out trigger (when the NUC is no longer enough)
 
