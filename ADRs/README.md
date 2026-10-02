@@ -14,3 +14,4 @@ Status lifecycle: Proposto → Aceito → Depreciado/Substituído.
 | [0004](0004-barceloneta-nuc-execution-box.md) | Barceloneta NUC as execution box — owned silicon first, Robot as scale-out | Proposto |
 | [0005](0005-linear-pr-iteration-pipeline.md) | Linear-driven PR iteration pipeline — tlc-spec-lean execution via maquinista agent sessions | Proposto |
 | [0006](0006-ticket-provider-abstraction.md) | Ticket-provider abstraction — vendor-neutral pipeline core behind a TicketProvider seam | Proposto |
+| [0007](0007-kagent-benchmark.md) | kagent benchmark — stay the course; adopt OTel tracing, checkpoint/fork, temporal verdict guards | Proposto |
