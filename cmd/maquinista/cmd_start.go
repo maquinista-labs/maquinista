@@ -28,6 +28,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/scheduler"
 	"github.com/maquinista-labs/maquinista/internal/sidecar"
+	"github.com/maquinista-labs/maquinista/internal/taskscheduler"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
@@ -469,6 +470,18 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			spawner := pipelineReviewerSpawner{pool: pool, cfg: cfg, sidecars: sidecarMgr}
 			pipeline.RunDispatch(ctx, pool, pipeline.DispatchConfigFromEnv(cfg.TmuxSessionName), spawner, tmux.KillWindow)
 		}()
+
+		// Task-scheduler (EX-07): drains 'ready' tasks (created by the
+		// ticket bridge above) into task-bound implementor panes via
+		// ensureTaskWorker. Same liveness scope as the bridge/dispatch.
+		go func() {
+			if err := taskscheduler.Run(ctx, pool, taskscheduler.Config{
+				EnsureAgent: ensureTaskWorker(pool, cfg, sidecarMgr),
+			}); err != nil && ctx.Err() == nil {
+				log.Printf("task-scheduler: %v", err)
+			}
+		}()
+		log.Println("task-scheduler: started")
 		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
 		if perr != nil {
 			log.Printf("pipeline: %v", perr)

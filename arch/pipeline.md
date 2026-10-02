@@ -23,9 +23,39 @@ provider implementation (`linear.go` for Linear).
   - a `ticket_issue_map` row — `pending_state` = "In Progress"
 - the map row's primary key is the provider issue ID, so the INSERT **is**
   the claim: `ON CONFLICT DO NOTHING` + rollback makes re-claims no-ops
-- claimed tasks flow through the existing task-scheduler → EnsureAgent →
-  agent_inbox path; bridge tasks carry no `metadata.role` yet (the
-  pipeline-worker soul is seeded by migration 035 for future use)
+- claimed tasks flow through the task-scheduler → EnsureAgent → agent_inbox
+  path (wired in `orchestrator start` since EX-07, see "Task scheduler"
+  below); bridge tasks carry no `metadata.role` yet (default `implementor`,
+  the pipeline-worker soul from migration 035)
+
+## Task scheduler (EX-07)
+
+`taskscheduler.Run` runs inside `orchestrator start` (cmd_start.go), in the
+same tickets-enabled block as review dispatch. Wake triggers: LISTEN
+`task_events` + 30 s poll fallback. `DispatchOne` claims one `ready` task
+with no live agent (`FOR UPDATE SKIP LOCKED`, `uq_agents_task_live` keeps
+replicas honest), flips it to `claimed`, then the cmd-side
+`ensureTaskWorker` adapter spawns the implementor:
+
+- worktree guard: the task must have a usable `worktree_path` — SpawnFresh
+  does not stat; a bad path fails the spawn with a readable error and
+  DispatchOne reverts the task to `ready` for the next tick
+- id mint: `<role>-<taskID>[-rN]` via `pipeline.MintWorkerID` (same shape as
+  the reviewer mint; role default `implementor`, overridable via
+  `tasks.metadata->>'role'`)
+- exec contract: `pipeline.ResolveWorkerExec` reads the pipeline-worker
+  soul's frozen extras (`default_runner` + `reasoning_class`); on read
+  failure the spawn falls back to `cfg.DefaultRunner` (workers are cheap and
+  replaceable — review dispatch treats the same failure as hard)
+- everything else is `agentspawn.SpawnFresh`: soul clone (pipeline-worker),
+  memory seed, tmux window, sidecar inbox goroutine
+- the scheduler then enqueues `/work-on-task <id>` (external_msg_id
+  `task:<id>` dedup) and sets `tasks.claimed_by`; `HealMissingInbox` covers
+  the crash-between-claim-and-enqueue wedge
+
+The standalone `maquinista task-scheduler` subcommand keeps the
+orchestrator.EnsureAgent stub (row-only, no pty) for debugging alongside a
+running bot.
 
 ## Mirror (sync)
 
@@ -236,4 +266,6 @@ a new harness is an extras edit, not a soul rewrite.
 - merge mode: **shipped (EX-05)** — see "Merge mode: gh" above; enqueue
   pass, rebase + CI gate, approve-verb override included
 - Telegram plumbing: EX-06
+- worker spawn wiring: **shipped (EX-07)** — see "Task scheduler" above;
+  task-scheduler in `orchestrator start`, ensureTaskWorker → SpawnFresh
 
