@@ -15,6 +15,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/db"
@@ -50,20 +51,42 @@ type GhRunner interface {
 type MergeConfig struct {
 	Mode      string
 	AutoMerge bool // false: entries wait for the approve verb even in gh mode
-	Gh        GhRunner
+	// MaxAttempts caps how many times an auto-merged entry may reclaim a
+	// red PR before the task is parked needs-human (EX-06: the release-
+	// and-reclaim loop otherwise spams forever). 0 → default 5.
+	MaxAttempts int
+	Gh          GhRunner
 }
 
-// MergeConfigFromEnv reads PIPELINE_MERGE_MODE ("local"|"gh") and
-// PIPELINE_AUTO_MERGE ("0"/"1", default 0). The GhRunner is wired by the
+// defaultMergeAttempts is the CI retry cap when MAQUINISTA_MERGE_ATTEMPTS_MAX
+// is unset. A cap of 5 gives a flaky PR room to recover while bounding the
+// churn.
+const defaultMergeAttempts = 5
+
+// truthyEnv is the accepted spelling set for boolean env knobs (EX-06: the
+// reviewer nit — AUTO_MERGE used to accept only 1/TRUE spellings).
+var truthyEnv = map[string]bool{
+	"1": true, "t": true, "true": true, "y": true, "yes": true,
+}
+
+// MergeConfigFromEnv reads PIPELINE_MERGE_MODE ("local"|"gh"),
+// PIPELINE_AUTO_MERGE (1/true/yes…, default 0) and
+// MAQUINISTA_MERGE_ATTEMPTS_MAX (default 5). The GhRunner is wired by the
 // caller — env only selects behavior, never binaries.
 func MergeConfigFromEnv() MergeConfig {
-	cfg := MergeConfig{Mode: MergeModeLocal}
+	cfg := MergeConfig{Mode: MergeModeLocal, MaxAttempts: defaultMergeAttempts}
 	if v := os.Getenv("PIPELINE_MERGE_MODE"); v == MergeModeGH {
 		cfg.Mode = MergeModeGH
 	}
-	switch os.Getenv("PIPELINE_AUTO_MERGE") {
-	case "1", "true", "TRUE":
+	if truthyEnv[strings.ToLower(os.Getenv("PIPELINE_AUTO_MERGE"))] {
 		cfg.AutoMerge = true
+	}
+	if v := os.Getenv("MAQUINISTA_MERGE_ATTEMPTS_MAX"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.MaxAttempts = n
+		} else {
+			log.Printf("pipeline: invalid MAQUINISTA_MERGE_ATTEMPTS_MAX %q — using %d", v, cfg.MaxAttempts)
+		}
 	}
 	return cfg
 }
@@ -210,10 +233,10 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		// Bad/unset PR URL: the work is done but the merge machinery
 		// cannot run — record failed so the queue shows it instead of
 		// wedging the entry in 'merging'.
-		return failMerge(pool, entry.ID, taskID, fmt.Sprintf("cannot resolve PR: %v", err))
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("cannot resolve PR: %v", err))
 	}
 	if info.WorktreePath == "" {
-		return failMerge(pool, entry.ID, taskID, "task has no worktree to merge from")
+		return failMerge(ctx, pool, entry.ID, taskID, "task has no worktree to merge from")
 	}
 	wt := info.WorktreePath
 
@@ -223,39 +246,74 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		base = entry.BaseBranch
 	}
 	if err := git.Fetch(wt, "origin"); err != nil {
-		return failMerge(pool, entry.ID, taskID, fmt.Sprintf("git fetch failed: %v", err))
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("git fetch failed: %v", err))
 	}
 	if _, err := git.Rebase(wt, "origin/"+base); err != nil {
 		if conflictErr, ok := err.(*git.ConflictError); ok {
 			return parkMergeConflict(ctx, pool, taskID, entry, conflictErr)
 		}
-		return failMerge(pool, entry.ID, taskID, fmt.Sprintf("rebase onto %s failed: %v", base, err))
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("rebase onto %s failed: %v", base, err))
 	}
 
 	// 2. Publish the rebased branch (lease-guarded force push).
 	if err := git.PushForceWithLease(wt, entry.Branch, "origin"); err != nil {
-		return failMerge(pool, entry.ID, taskID, fmt.Sprintf("push failed: %v", err))
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("push failed: %v", err))
 	}
 
 	// 3. CI gate: pending → release for a later pass; failed → park needs-human.
 	checks, err := cfg.Gh.PRChecks(ctx, pr)
 	if err != nil {
-		return failMerge(pool, entry.ID, taskID, fmt.Sprintf("gh pr checks failed: %v", err))
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("gh pr checks failed: %v", err))
+	}
+	// Normalize the cap: struct-literal callers (tests, RunMergeOnApprove)
+	// leave MaxAttempts at the zero value, which must mean the default —
+	// a 0 cap would park a red PR on its first failure.
+	maxAttempts := cfg.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = defaultMergeAttempts
 	}
 	switch checks {
 	case ChecksPending:
+		// CI still running: release for a later pass; the worker keeps
+		// pushing (fail-forward).
+		db.AddObservation(pool, taskID, "merger",
+			fmt.Sprintf("PR #%d checks still running — merge deferred; work continues.", pr))
 		if err := db.ReleaseMergeEntry(pool, entry.ID); err != nil {
 			return fmt.Errorf("pipeline: releasing %d: %w", entry.ID, err)
 		}
 		log.Printf("pipeline: merge %s waiting for CI on PR #%d", taskID, pr)
 		return nil
 	case ChecksFailed:
-		db.AddObservation(pool, taskID, "merger",
-			fmt.Sprintf("CI failed on PR #%d — merge deferred; fix and re-push.", pr))
-		if err := db.ReleaseMergeEntry(pool, entry.ID); err != nil {
-			return fmt.Errorf("pipeline: releasing %d: %w", entry.ID, err)
+		// Cap the reclaim loop (EX-06): a red PR under AUTO_MERGE=1
+		// otherwise releases and re-claims forever. Below cap: silent
+		// release (the spam bug the cap exists for). At cap: entry
+		// failed, task parked needs-human, one question out.
+		attempts, err := db.BumpMergeAttempts(pool, entry.ID)
+		if err != nil {
+			return fmt.Errorf("pipeline: bumping attempts %d: %w", entry.ID, err)
 		}
-		log.Printf("pipeline: merge %s CI failed on PR #%d", taskID, pr)
+		if attempts < maxAttempts {
+			if err := db.ReleaseMergeEntry(pool, entry.ID); err != nil {
+				return fmt.Errorf("pipeline: releasing %d: %w", entry.ID, err)
+			}
+			log.Printf("pipeline: merge %s CI failed on PR #%d (attempt %d/%d) — will re-check", taskID, pr, attempts, cfg.MaxAttempts)
+			return nil
+		}
+		if err := db.FailMerge(pool, entry.ID, fmt.Sprintf("CI failed %d times on PR #%d", attempts, pr)); err != nil {
+			return fmt.Errorf("pipeline: failing %d: %w", entry.ID, err)
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE tasks
+			SET    status = 'pending_approval'
+			WHERE  id = $1 AND status = 'ready_to_merge'
+		`, taskID); err != nil {
+			return fmt.Errorf("pipeline: parking %s after CI cap: %w", taskID, err)
+		}
+		db.AddObservation(pool, taskID, "merger",
+			fmt.Sprintf("CI failed %d times on PR #%d — parked needs-human.", attempts, pr))
+		notifyf(ctx, pool, "🆘 %s: CI failed %d times on PR #%d — parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.",
+			taskTitle(ctx, pool, taskID), attempts, pr, taskID)
+		log.Printf("pipeline: merge %s CI failed %d times on PR #%d — parked needs-human", taskID, attempts, pr)
 		return nil
 	default:
 		// green / none — proceed.
@@ -263,7 +321,7 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 
 	// 4. Squash-merge on the remote.
 	if err := cfg.Gh.PRMergeSquash(ctx, pr); err != nil {
-		return failMerge(pool, entry.ID, taskID, fmt.Sprintf("gh pr merge failed: %v", err))
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("gh pr merge failed: %v", err))
 	}
 
 	// 5. Record the squash commit SHA (the merged tip of the default branch).
@@ -286,6 +344,8 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	}
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("PR #%d squash-merged into %s (%s).", pr, base, mergeSHA))
+	notifyf(ctx, pool, "✅ %s merged: PR #%d squash-merged into %s (%s).",
+		taskTitle(ctx, pool, taskID), pr, base, mergeSHA)
 
 	// 6. Board sync (best-effort — the sync loop self-heals on next tick).
 	if prov != nil && info.IssueID != "" {
@@ -337,17 +397,25 @@ func parkMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID string, e
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("Rebase conflict on branch %s: %s. Resolving requires human judgment.",
 			entry.Branch, conflictErr.Error()))
+	// EX-06: the needs-human question carries the conflict files so the
+	// human can decide without opening the worktree. (Conflict →
+	// merger-agent resolution stays deferred; the plan records why.)
+	notifyf(ctx, pool, "🆘 %s: rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.",
+		taskTitle(ctx, pool, taskID), entry.Branch, strings.Join(conflictErr.Files, "\n"))
 	log.Printf("pipeline: merge %s conflict: %v", taskID, conflictErr)
 	return nil
 }
 
 // failMerge records an infrastructure failure on the queue entry and leaves
 // the task in ready_to_merge (the work is done; only the merge machinery
-// failed, so a retry can succeed).
-func failMerge(pool *pgxpool.Pool, entryID int64, taskID, msg string) error {
+// failed, so a retry can succeed). The entry is terminal — the queue will
+// NOT retry it — so a human gets a note (EX-06); re-approving re-enqueues.
+func failMerge(ctx context.Context, pool *pgxpool.Pool, entryID int64, taskID, msg string) error {
 	if err := db.FailMerge(pool, entryID, msg); err != nil {
 		return fmt.Errorf("pipeline: failing merge %d: %w", entryID, err)
 	}
+	notifyf(ctx, pool, "⚠️ %s: merge failed — %s. The queue entry is failed; `maquinista approve %s` re-enqueues the merge.",
+		taskTitle(ctx, pool, taskID), msg, taskID)
 	log.Printf("pipeline: merge %s failed: %s", taskID, msg)
 	return nil
 }

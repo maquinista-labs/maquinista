@@ -154,7 +154,8 @@ is bounded the same way.
 | `MAQUINISTA_REVIEW_ROUNDS_MAX` | fixer-loop cap: the request_changes landing at/after this review round parks the task | `3` |
 | `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |
 | `PIPELINE_MERGE_MODE` | merge driver: `local` (MergeNoFF in repo) or `gh` (remote PR flow) | `local` |
-| `PIPELINE_AUTO_MERGE` | gh mode only: `1` lets the queue merge without the approve verb | `0` |
+| `PIPELINE_AUTO_MERGE` | gh mode only: truthy (`1`/`true`/`yes`/`t`/`y`) lets the queue merge without the approve verb | `0` |
+| `MAQUINISTA_MERGE_ATTEMPTS_MAX` | red-PR reclaim cap before the task parks needs-human | `5` |
 
 Without key + team the bridge is a logged no-op; nothing else in the
 orchestrator changes. The Linear provider additionally honors the legacy
@@ -180,15 +181,24 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   observation, a best-effort board push to Done, then worktree + local +
   remote branch cleanup.
 - **CI gate** — pending checks release the entry back to `pending` (a later
-  pass retries); failed checks release it and leave a `merger` observation.
-  No checks configured counts as green.
+  pass retries); failed checks bump `attempts` and release silently below
+  the cap, at the cap (default 5, `MAQUINISTA_MERGE_ATTEMPTS_MAX`) the entry
+  fails, the task parks `pending_approval`, and the Pipeline topic gets the
+  question (EX-06). No checks configured counts as green.
 - **Conflicts** — the rebase is aborted and the task parks at
   `pending_approval` (Needs Human on the board) with the conflicting files
-  in the observation; conflicts are never auto-resolved.
+  in the observation and in the Pipeline-topic note; conflicts are never
+  auto-resolved.
 - **Human gate** — `PIPELINE_AUTO_MERGE=0` (default) makes every processing
   pass release the entry untouched; `maquinista approve <task>` on a
   `ready_to_merge` task runs the full flow immediately, overriding the gate
   for that one merge.
+- **Telegram plumbing (EX-06)** — merge lifecycle notes (merged, conflict,
+  infra failure, CI-cap) ride the stock delivery path via the synthetic
+  `pipeline` notifier agent (migration `036`): `Notify` opens a tx, appends
+  one `agent_outbox` row for the agent, commits — the relay's binding leg
+  fans it into `channel_deliveries` for the Pipeline topic provisioned by
+  the bot (`ensurePipelineTopic`). Failures are logged, never escalated.
 - GitHub is behind `pipeline.GhRunner` (interface: `PRChecks` +
   `PRMergeSquash`); production uses the gh CLI (`internal/gh`).
 
