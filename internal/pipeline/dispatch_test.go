@@ -383,6 +383,9 @@ func TestWatchdog_StallTimeout(t *testing.T) {
 	ctx := context.Background()
 	seedReviewTask(t, pool, "tw", "uuid-w", "/tmp/wt")
 	seedReviewer(t, pool, "reviewer-tw", "tw")
+	// Backdate past the stall bound: the young-agent guard exempts agents
+	// younger than the timeout even with zero outbox activity.
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-tw'`)
 
 	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
@@ -424,6 +427,32 @@ func TestWatchdog_InsideTimeoutUntouched(t *testing.T) {
 	}
 	if status != "running" {
 		t.Fatalf("active reviewer status = %q, want running", status)
+	}
+}
+
+// TestWatchdog_YoungAgentUntouched pins the young-agent guard: a freshly
+// spawned reviewer with ZERO outbox activity (prompt delivery racing pi's
+// cold boot) must NOT be parked — the watchdog may only kill agents that
+// have lived past the stall bound. Regression: 2026-10-02, the watchdog
+// retired a 10-second-old reviewer in the same tick that spawned it.
+func TestWatchdog_YoungAgentUntouched(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "ty", "uuid-y", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-ty", "ty") // started_at = NOW()
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	if got := taskCol(t, pool, "ty", "status"); got != "review" {
+		t.Fatalf("young task status = %q, want review (no parking on sight)", got)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='reviewer-ty'`).Scan(&status); err != nil {
+		t.Fatalf("reviewer row: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("young reviewer status = %q, want running", status)
 	}
 }
 

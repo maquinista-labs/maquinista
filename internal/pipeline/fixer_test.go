@@ -297,6 +297,8 @@ func TestFixerWatchdog_StallParks(t *testing.T) {
 	ctx := context.Background()
 	seedFixEpisode(t, pool, "f9", "uuid-f9", "/tmp/wt-f9", 1)
 	seedFixer(t, pool, "fixer-f9", "f9")
+	// Backdate past the stall bound (young-agent guard exempts fresh agents).
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='fixer-f9'`)
 
 	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
