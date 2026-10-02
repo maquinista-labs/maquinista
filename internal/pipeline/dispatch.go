@@ -633,7 +633,10 @@ func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verd
 // watchdogPass parks stalled pipeline agents: a live reviewer (in 'review')
 // or fixer (in 'changes_requested') with NO outbox activity (the monitor
 // writes rows as the agent streams) for longer than the timeout flips the
-// task to pending_approval and retires the pane.
+// task to pending_approval and retires the pane. Agents younger than the
+// timeout are exempt: a freshly spawned reviewer has no outbox rows yet
+// (prompt delivery races pi's cold boot), and parking it on sight murders
+// every slow-booting spawn before its first streamed token.
 // liveReviewer is one live reviewer/fixer pane on a pipeline task. The
 // title/round columns feed the EX-06 Pipeline-topic summaries.
 type liveReviewer struct {
@@ -655,6 +658,7 @@ WHERE a.role = '` + fixerRole + `'
 
 func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
 	stallFilter := `
+  AND a.started_at < NOW() - make_interval(secs => $1)
   AND NOT EXISTS (
         SELECT 1 FROM agent_outbox o
         WHERE o.agent_id = a.id AND o.created_at > NOW() - make_interval(secs => $1))`

@@ -121,6 +121,8 @@ func TestWatchdog_NotifyOnStall(t *testing.T) {
 	ctx := context.Background()
 	seedReviewTask(t, pool, "tw", "uuid-w", "/tmp/wt")
 	seedReviewer(t, pool, "reviewer-tw", "tw")
+	// Backdate past the stall bound (young-agent guard exempts fresh agents).
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-tw'`)
 
 	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
