@@ -25,17 +25,27 @@ type pipelineReviewerSpawner struct {
 // review prompt) — the task stays in 'review' and retries next tick.
 var errNoSidecars = errors.New("sidecar manager unavailable, reviewer spawn skipped")
 
-// SpawnReviewer implements pipeline.ReviewSpawner.
+// SpawnReviewer implements pipeline.ReviewSpawner. Role/SoulTemplateID
+// default to the reviewer pair when empty (EX-03 callers); EX-04's fixer
+// pass sets both explicitly.
 func (s pipelineReviewerSpawner) SpawnReviewer(ctx context.Context, p pipeline.ReviewSpawnParams) error {
 	if s.sidecars == nil {
 		return errNoSidecars
 	}
+	role := p.Role
+	if role == "" {
+		role = "reviewer"
+	}
+	template := p.SoulTemplateID
+	if template == "" {
+		template = pipeline.ReviewerSoulTemplate
+	}
 	_, err := agentspawn.SpawnFresh(ctx, s.pool, s.cfg, agentspawn.FreshParams{
 		AgentID:        p.AgentID,
 		CWD:            p.WorktreePath,
-		SoulTemplateID: pipeline.ReviewerSoulTemplate,
+		SoulTemplateID: template,
 		RunnerType:     p.RunnerType,
-		Role:           "reviewer",
+		Role:           role,
 		TaskID:         p.TaskID,
 		ModelOverride:  p.Model,
 	}, s.sidecars)

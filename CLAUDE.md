@@ -90,7 +90,7 @@ Dashboard reads `agent_outbox` directly (no relay needed). Telegram reads via `c
 | `internal/inboxecho` | `agent_inbox` (non-Telegram) → `inbox_echoes` → Telegram (echo mirror) |
 | `internal/sidecar` | Per-agent goroutine: claims inbox rows, drives to tmux PTY |
 | `internal/monitor` | Tails agent transcript JSONL, writes `agent_outbox` rows |
-| `internal/pipeline` | Ticket-system bridge (intake + board mirror) + review dispatch (`dispatch.go`: reviewer spawn, verdict parsing, watchdog). See `arch/pipeline.md` |
+| `internal/pipeline` | Ticket-system bridge (intake + board mirror) + review dispatch (`dispatch.go`: reviewer/fixer spawn, verdict parsing + round cap, fixer loop, watchdog). See `arch/pipeline.md` |
 | `internal/routing` | Four-tier routing ladder, `writeOwnerBinding` |
 | `internal/bot/topic_provisioner.go` | Creates Telegram forum topics for dashboard agents |
 | `cmd/maquinista/spawn_topic_agent.go` | Tier-3 inline agent spawn + pre-bind race guard |

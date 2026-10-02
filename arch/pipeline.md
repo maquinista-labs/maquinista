@@ -103,17 +103,43 @@ line is logged loudly and never transitions. On a verdict, one tx:
 - task transition: `approve` → `ready_to_merge`,
   `request_changes` → `changes_requested`, `needs_human` →
   `pending_approval` (guarded on the task still being in `review` — a raced
-  row is left untouched)
+  row is left untouched). **Round cap (EX-04):** the transition is decided
+  atomically inside the guarded UPDATE — a `request_changes` landing when
+  `review_rounds` has already reached
+  `MAQUINISTA_REVIEW_ROUNDS_MAX` (default 3) parks the task in
+  `pending_approval` instead, with the verdict row noting the cap.
 - verdict recorded in `task_context` (kind `verdict`)
 - reviewer retired (`agents.status = 'dead'`) — frees the one-live-slot
   per task (`uq_agents_task_live`) for the next round's mint — and its
   tmux window is killed (best-effort)
 
-**Watchdog.** A live reviewer with NO outbox activity (the monitor writes
-rows as the agent streams) for longer than `MAQUINISTA_REVIEW_TIMEOUT`
-(default 2h) parks the task in `pending_approval` with a watchdog verdict
-row and retires the pane. The malformed-verdict case is deliberately left
-to the watchdog: the parser never guesses, the timeout is the backstop.
+**Fixer pass (EX-04).** A pipeline task parked in `changes_requested` with a
+worktree and a `request_changes` verdict row is re-claimed by a fresh fixer
+session in the SAME worktree/PR:
+
+- mints `fixer-<task>[-rN]` (role `fixer`), resolves exec from the
+  `pipeline-fixer` template's frozen extras (class `standard` →
+  `MAQUINISTA_PI_MODEL`), spawns via the same `ReviewSpawner`
+- the episode is keyed by `review_rounds` (frozen while parked — it only
+  bumps at the next reviewer spawn); a `task_context` fix row
+  (content `round <N>`) commits FIRST and stops re-spawning for the episode
+- the fix prompt (`external_msg_id = fix:<task>:<round>` dedup) embeds the
+  reviewer's newest message tail (≤6000 chars — the soul contract puts the
+  numbered findings at the top of the final reply); a prompt miss heals on
+  the next tick (same shape as the reviewer prompt heal)
+- **no zero-author guard by design** — a fixer continuing the previous
+  fixer's work is the point; the round N+1 reviewer is always a fresh mint
+- **loop closure needs no new transition code**: the fixer ends with
+  `maquinista-done` → `db.MarkDone` done-path branch → `review` → the
+  reviewer spawn pass mints a fresh reviewer and bumps the round
+
+**Watchdog.** A live reviewer (in `review`) or fixer (in
+`changes_requested`) with NO outbox activity (the monitor writes rows as the
+agent streams) for longer than `MAQUINISTA_REVIEW_TIMEOUT` (default 2h)
+parks the task in `pending_approval` with a watchdog verdict row and retires
+the pane. The malformed-verdict case is deliberately left to the watchdog:
+the parser never guesses, the timeout is the backstop — and a stalled fixer
+is bounded the same way.
 
 ## Env contract
 
@@ -124,7 +150,8 @@ to the watchdog: the parser never guesses, the timeout is the backstop.
 | `MAQUINISTA_TICKETS_TEAM_ID` | team/board id intake polls | required to enable |
 | `MAQUINISTA_TICKETS_PROJECT` | project_id stamped on claimed tasks | falls back to `MAQUINISTA_PROJECT` |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
-| `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound | `2h` |
+| `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound (reviewers + fixers) | `2h` |
+| `MAQUINISTA_REVIEW_ROUNDS_MAX` | fixer-loop cap: the request_changes landing at/after this review round parks the task | `3` |
 | `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |
 
 Without key + team the bridge is a logged no-op; nothing else in the
@@ -163,7 +190,8 @@ a new harness is an extras edit, not a soul rewrite.
 
 ## TODO
 
-- fixer re-claim loop: EX-04; merge mode: EX-05; Telegram plumbing: EX-06
-- the fixer (EX-04) consumes `changes_requested` back to `review`; the
-  merger (EX-05) consumes `ready_to_merge` → done/merged
+- fixer re-claim loop: **shipped (EX-04)** — see "Fixer pass" above; round
+  cap + fixer watchdog included
+- merge mode: EX-05; Telegram plumbing: EX-06
+- the merger (EX-05) consumes `ready_to_merge` → done/merged
 
