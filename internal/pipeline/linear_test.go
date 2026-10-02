@@ -85,7 +85,7 @@ func TestLinearProvider_FetchTodoDocument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TodoIssues: %v", err)
 	}
-	for _, want := range []string{`state:`, `"Todo"`, `labels:`, `"pipeline"`, `team:`} {
+	for _, want := range []string{`$t: ID!`, `state:`, `"Todo"`, `labels:`, `"pipeline"`, `team:`} {
 		if !strings.Contains(cap.query, want) {
 			t.Errorf("query missing %s in: %s", want, cap.query)
 		}
@@ -113,7 +113,7 @@ func TestLinearProvider_SetIssueState(t *testing.T) {
 	if name != "In Review" {
 		t.Errorf("resulting state = %q, want In Review (unwrapped envelope)", name)
 	}
-	for _, want := range []string{"issueUpdate", "stateId"} {
+	for _, want := range []string{`$i: String!`, `$s: String!`, "issueUpdate", "stateId"} {
 		if !strings.Contains(cap.query, want) {
 			t.Errorf("mutation missing %s in: %s", want, cap.query)
 		}
