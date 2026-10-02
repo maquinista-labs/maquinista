@@ -230,7 +230,8 @@ func Upsert(ctx context.Context, q Querier, s Soul) error {
 func Load(ctx context.Context, q Querier, agentID string) (*Soul, error) {
 	s := &Soul{AgentID: agentID}
 	var templateID any
-	var tagline, extras any
+	var tagline any
+	var extras []byte
 	err := q.QueryRow(ctx, `
 		SELECT template_id, name, tagline, role, goal,
 		       core_truths, boundaries, vibe, continuity,
@@ -251,13 +252,9 @@ func Load(ctx context.Context, q Querier, agentID string) (*Soul, error) {
 	if tagline != nil {
 		s.Tagline, _ = tagline.(string)
 	}
-	if b, ok := extras.([]byte); ok {
-		s.Extras, err = decodeExtras(b)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		s.Extras = map[string]string{}
+	s.Extras, err = decodeExtras(extras)
+	if err != nil {
+		return nil, err
 	}
 	return s, nil
 }
