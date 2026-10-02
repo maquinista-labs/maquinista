@@ -35,7 +35,8 @@ harness (postgres:16-alpine, per dispatch_test.go).
   `review`, done_at set, claimed_by NULL; then dispatch pass mints a fresh
   reviewer id (`reviewer-<task>` or `-rN`, ≠ any fixer id) and bumps
   review_rounds. TestMarkDone_FixerCompletedGoesToReview,
-  TestFixerLoop_NextRoundMintsFreshReviewer.
+  TestFixerSpawn_SecondEpisodeSpawns (re-pointed from the planned name
+  TestFixerLoop_NextRoundMintsFreshReviewer — same acceptance, real name).
 - C8 (AC 8) fixer watchdog. Live fixer on changes_requested, no outbox
   activity past timeout → task `pending_approval`, watchdog verdict row,
   fixer dead; inside timeout → untouched.
