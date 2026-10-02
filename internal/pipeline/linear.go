@@ -117,7 +117,10 @@ func (c *LinearClient) TodoIssues(ctx context.Context, teamID string) ([]linearI
 			Nodes []linearIssue `json:"nodes"`
 		} `json:"issues"`
 	}
-	doc := `query($t: String!) { issues(
+	// TeamFilter.id is a strict ID comparator (String! here 400s live);
+	// top-level args elsewhere in this file are String! — the asymmetry is
+	// real, verified against api.linear.app 02/10/2026.
+	doc := `query($t: ID!) { issues(
 	  filter: {
 	    team:   { id: { eq: $t } },
 	    state:  { name: { eq: "Todo" } },
@@ -165,6 +168,9 @@ func (c *LinearClient) UpdateIssueState(ctx context.Context, issueID, stateID st
 			} `json:"issue"`
 		} `json:"issueUpdate"`
 	}
+	// Top-level args are String! in Linear's schema; only filter comparators
+	// (TeamFilter.id) are strict ID — proven live against api.linear.app
+	// 02/10/2026 (ID! on team(id:) 400s; String! on TeamFilter.id.eq 400s).
 	doc := `mutation($i: String!, $s: String!) {
 	  issueUpdate(id: $i, input: { stateId: $s }) { issue { state { name } } }
 	}`
