@@ -423,3 +423,60 @@ func TestInsertAttachment_InlineAndLargeObject(t *testing.T) {
 		t.Errorf("large-object rows=%d, want 1", loCount)
 	}
 }
+
+// Regression: a task prompt whose (origin_channel, external_msg_id) key was
+// already consumed by a previous attempt (agent dead, row processed) must
+// still reach the fresh agent. EnqueueInbox collapses to a no-op here — this
+// was the EX-07 round-2 stall (worker spawned, never received its prompt).
+// UpsertInbox repoints the same physical row and resets it for redelivery.
+func TestUpsertInbox_RepointsAndResets(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+	exec(t, pool, `INSERT INTO agents (id, tmux_session, tmux_window) VALUES ('beta','s2','w2')`)
+
+	// Attempt 1: enqueue for alpha, then consume the row.
+	var firstID uuid.UUID
+	withTx(t, pool, func(tx pgx.Tx) {
+		id, _, err := EnqueueInbox(ctx, tx, InboxMessage{
+			AgentID:       "alpha",
+			FromKind:      "system",
+			OriginChannel: "task",
+			ExternalMsgID: "task:T1",
+			Content:       []byte(`{"type":"task","prompt":"/work-on-task T1"}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstID = id
+	})
+	exec(t, pool, `UPDATE agent_inbox SET status='processed', attempts=3, last_error='boom', processed_at=NOW() WHERE id=$1`, firstID)
+
+	// Attempt 2: upsert for beta must repoint the SAME row and reset it.
+	withTx(t, pool, func(tx pgx.Tx) {
+		id, err := UpsertInbox(ctx, tx, InboxMessage{
+			AgentID:       "beta",
+			FromKind:      "system",
+			OriginChannel: "task",
+			ExternalMsgID: "task:T1",
+			Content:       []byte(`{"type":"task","prompt":"/work-on-task T1"}`),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if id != firstID {
+			t.Errorf("upsert id=%s, want same row %s", id, firstID)
+		}
+	})
+
+	var agentID, status string
+	var attempts int
+	var lastErr *string
+	if err := pool.QueryRow(ctx, `
+		SELECT agent_id, status, attempts, last_error FROM agent_inbox WHERE id = $1
+	`, firstID).Scan(&agentID, &status, &attempts, &lastErr); err != nil {
+		t.Fatal(err)
+	}
+	if agentID != "beta" || status != "pending" || attempts != 0 || lastErr != nil {
+		t.Errorf("after upsert: agent=%q status=%q attempts=%d lastErr=%v, want beta/pending/0/nil", agentID, status, attempts, lastErr)
+	}
+}

@@ -55,6 +55,15 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		if err := drain(ctx, pool, cfg); err != nil {
 			log.Printf("taskscheduler: %v", err)
 		}
+		// Self-heal: a claimed task whose agent has no inbox row (spawn
+		// raced the enqueue, mailbox dropped it, crash mid-dispatch) would
+		// otherwise sit idle forever. Re-enqueue on each wake.
+		healed, herr := HealMissingInbox(ctx, pool)
+		if herr != nil {
+			log.Printf("taskscheduler: heal missing inbox: %v", herr)
+		} else if healed > 0 {
+			log.Printf("taskscheduler: healed %d task(s) with missing inbox prompt", healed)
+		}
 		waitCtx, cancel := context.WithTimeout(ctx, cfg.PollInterval)
 		_, nerr := listener.Conn().WaitForNotification(waitCtx)
 		cancel()
@@ -198,15 +207,18 @@ func enqueueWorkOnTask(ctx context.Context, pool *pgxpool.Pool, agentID, taskID 
 		return err
 	}
 	defer tx.Rollback(ctx)
-	_, _, err = mailbox.EnqueueInbox(ctx, tx, mailbox.InboxMessage{
+	// Upsert, not enqueue: the (origin_channel, external_msg_id) key is
+	// stable per task, so a previous attempt's processed row would make a
+	// plain insert collapse to a no-op (ON CONFLICT DO NOTHING) and the new
+	// agent would never receive its prompt. Repoint + reset for redelivery.
+	if _, err := mailbox.UpsertInbox(ctx, tx, mailbox.InboxMessage{
 		AgentID:       agentID,
 		FromKind:      "system",
 		FromID:        "task-scheduler",
 		OriginChannel: "task",
 		ExternalMsgID: "task:" + taskID,
 		Content:       content,
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
