@@ -35,6 +35,15 @@ type FreshParams struct {
 	SoulTemplateID string
 	// RunnerType overrides cfg.DefaultRunner when non-empty.
 	RunnerType string
+	// Role sets agents.role (default "user"). Review dispatch (EX-03) uses
+	// "reviewer"; the unique-live-per-task index (migration 011) applies.
+	Role string
+	// TaskID binds the agent to a tasks row (NULL when empty).
+	TaskID string
+	// ModelOverride, when non-empty, is injected into the pane environment as
+	// MAQUINISTA_PI_MODEL — the pi runner's per-instance resolution chain
+	// (instance > env > default) picks it up; other runners ignore it.
+	ModelOverride string
 }
 
 // SpawnFresh creates a fresh agent:
@@ -53,13 +62,21 @@ func SpawnFresh(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, p F
 	}
 
 	// 1. Pre-register agents row.
+	role := p.Role
+	if role == "" {
+		role = "user"
+	}
+	var taskID *string
+	if p.TaskID != "" {
+		taskID = &p.TaskID
+	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO agents
-			(id, tmux_session, tmux_window, role, status, runner_type,
+			(id, tmux_session, tmux_window, role, task_id, status, runner_type,
 			 cwd, window_name, started_at, last_seen, stop_requested)
-		VALUES ($1, $2, '', 'user', 'stopped', $3, $4, $1, NOW(), NOW(), FALSE)
+		VALUES ($1, $2, '', $3, $4, 'stopped', $5, $6, $1, NOW(), NOW(), FALSE)
 		ON CONFLICT (id) DO NOTHING
-	`, p.AgentID, cfg.TmuxSessionName, runnerType, p.CWD); err != nil {
+	`, p.AgentID, cfg.TmuxSessionName, role, taskID, runnerType, p.CWD); err != nil {
 		return "", fmt.Errorf("insert agent row: %w", err)
 	}
 
@@ -85,6 +102,9 @@ func SpawnFresh(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, p F
 
 	// 4. Build runner command.
 	runnerCmd, env := ResolveRunnerCmd(cfg, p.AgentID, p.CWD, true, "")
+	if p.ModelOverride != "" {
+		env["MAQUINISTA_PI_MODEL"] = p.ModelOverride
+	}
 
 	// 5. Open tmux window.
 	windowID, err = tmux.NewWindow(cfg.TmuxSessionName, p.AgentID, p.CWD, runnerCmd, env)

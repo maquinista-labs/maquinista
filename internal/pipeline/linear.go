@@ -36,6 +36,7 @@ var linearColumnNames = map[Column]string{
 	ColInReview:         "In Review",
 	ColChangesRequested: "Changes Requested",
 	ColNeedsHuman:       "Needs Human",
+	ColReadyToMerge:     "Ready to Merge",
 	ColDone:             "Done",
 }
 

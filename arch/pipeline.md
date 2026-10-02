@@ -24,8 +24,8 @@ provider implementation (`linear.go` for Linear).
 - the map row's primary key is the provider issue ID, so the INSERT **is**
   the claim: `ON CONFLICT DO NOTHING` + rollback makes re-claims no-ops
 - claimed tasks flow through the existing task-scheduler → EnsureAgent →
-  agent_inbox path; bridge tasks carry no `metadata.role` yet (EX-02 seeds
-  the pipeline-worker soul)
+  agent_inbox path; bridge tasks carry no `metadata.role` yet (the
+  pipeline-worker soul is seeded by migration 035 for future use)
 
 ## Mirror (sync)
 
@@ -40,6 +40,8 @@ Mapping (`DerivedState`), task status → canonical column:
 |---|---|
 | `ready`, `claimed` | In Progress |
 | `review` | In Review |
+| `changes_requested` | Changes Requested |
+| `ready_to_merge` | Ready to Merge |
 | `pending_approval`, `failed` | Needs Human |
 | `done` | Done |
 | anything else | (skipped) |
@@ -47,16 +49,71 @@ Mapping (`DerivedState`), task status → canonical column:
 Canonical names are the stored values; the provider maps them to its own
 column ids via `TicketProvider.Columns` before pushing (`SetIssueColumn`).
 
-- an explicit `pending_state` (written by future pipeline code — e.g.
-  "Changes Requested" from a review verdict, EX-03) **wins** over the
-  derived value; the derived value fills in only while nothing unsynced is
-  pending
+- the board mirror is **purely derived** from `tasks.status` — dispatch
+  (below) never writes board state, it only advances task statuses and
+  lets the sync loop mirror them. The explicit `pending_state` override
+  mechanism remains as an escape hatch for future manual interventions;
+  nothing in the automated loop writes it
 - failed pushes retry with exponential backoff: 15 s base, doubling, 10 min
   cap; `attempts`/`next_attempt_at` carry the state across restarts
 - diff-based reconcile is self-healing: a missed tick or an outage
   degrades to backoff, never to a lost transition
 - a state name missing from the team (operator renamed a column) backs off
   like any other failure instead of hot-looping
+
+## Review dispatch (EX-03)
+
+`pipeline.RunDispatch` (in `internal/pipeline/dispatch.go`) runs four passes
+per tick (default 10 s, same cadence as sync). It never talks to the ticket
+system — everything below is `tasks`/`agents` bookkeeping, and the board
+sees the results only through the sync mirror.
+
+**Entry.** `db.MarkDone` branches: a pipeline task (metadata
+`ticket_issue_id`) marked done by its worker goes to `review`, not `done` —
+review is part of the done path, not an optional extra. Plain tasks are
+unaffected.
+
+**Spawn pass.** For every pipeline task in `review` with a worktree and no
+live reviewer agent:
+
+- mints a fresh id `reviewer-<task>[-rN]` (never reuses an id)
+- **zero-author guard**: the task's author is the agent that recorded the
+  latest `task_context` result; a minted id equal to that author is
+  pathological — the task parks in `pending_approval` instead of spawning
+  (structural: fresh mints can't collide; the explicit check catches
+  identity corruption)
+- resolves runner + model from the `pipeline-reviewer` template's frozen
+  extras (`default_runner`, `reasoning_class`) — `ResolveExec`: class
+  `high` → `MAQUINISTA_PI_MODEL_HIGH`, else `MAQUINISTA_PI_MODEL`, empty
+  model = the runner's own chain
+- spawns via `ReviewSpawner` (wraps `agentspawn.SpawnFresh`: agents row
+  task-bound, soul clone, tmux pane, sidecar), then bumps
+  `tasks.review_rounds` and enqueues the round prompt in ONE tx
+  (`external_msg_id = review:<task>:<round>` dedups)
+
+**Prompt heal.** A crash between spawn and enqueue leaves a live reviewer
+with no prompt; the heal pass re-enqueues exactly one (dedup'd) on the next
+tick.
+
+**Verdict pass.** Scans each live reviewer's newest outbox rows for the
+contract verdict line (`ParseVerdict`, line-anchored, exact three-value
+vocabulary). The first well-formed line wins; a malformed `VERDICT:`-ish
+line is logged loudly and never transitions. On a verdict, one tx:
+
+- task transition: `approve` → `ready_to_merge`,
+  `request_changes` → `changes_requested`, `needs_human` →
+  `pending_approval` (guarded on the task still being in `review` — a raced
+  row is left untouched)
+- verdict recorded in `task_context` (kind `verdict`)
+- reviewer retired (`agents.status = 'dead'`) — frees the one-live-slot
+  per task (`uq_agents_task_live`) for the next round's mint — and its
+  tmux window is killed (best-effort)
+
+**Watchdog.** A live reviewer with NO outbox activity (the monitor writes
+rows as the agent streams) for longer than `MAQUINISTA_REVIEW_TIMEOUT`
+(default 2h) parks the task in `pending_approval` with a watchdog verdict
+row and retires the pane. The malformed-verdict case is deliberately left
+to the watchdog: the parser never guesses, the timeout is the backstop.
 
 ## Env contract
 
@@ -67,6 +124,8 @@ column ids via `TicketProvider.Columns` before pushing (`SetIssueColumn`).
 | `MAQUINISTA_TICKETS_TEAM_ID` | team/board id intake polls | required to enable |
 | `MAQUINISTA_TICKETS_PROJECT` | project_id stamped on claimed tasks | falls back to `MAQUINISTA_PROJECT` |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
+| `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound | `2h` |
+| `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |
 
 Without key + team the bridge is a logged no-op; nothing else in the
 orchestrator changes. The Linear provider additionally honors the legacy
@@ -104,8 +163,7 @@ a new harness is an extras edit, not a soul rewrite.
 
 ## TODO
 
-- dispatch + verdict parsing + zero-author check + review rounds: EX-03 of
-  ADR-0005 (`ADRs/0005-linear-pr-iteration-pipeline.md`)
 - fixer re-claim loop: EX-04; merge mode: EX-05; Telegram plumbing: EX-06
-- `tasks.review_rounds` accounting lands with the review loop (EX-03/EX-04)
+- the fixer (EX-04) consumes `changes_requested` back to `review`; the
+  merger (EX-05) consumes `ready_to_merge` → done/merged
 

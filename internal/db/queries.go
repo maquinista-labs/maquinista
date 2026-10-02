@@ -389,6 +389,9 @@ func ClaimByID(pool *pgxpool.Pool, taskID, agentID string) (*Task, error) {
 }
 
 // MarkDone marks a task as done after tests pass, recording the result summary.
+// Pipeline tasks (metadata ticket_issue_id, ADR-0005) branch to 'review'
+// instead — the review-dispatch loop (internal/pipeline EX-03) takes over
+// from there; the sync loop mirrors 'review' as In Review.
 func MarkDone(pool *pgxpool.Pool, taskID, agentID, summary string) error {
 	ctx := context.Background()
 	tx, err := pool.Begin(ctx)
@@ -407,7 +410,10 @@ func MarkDone(pool *pgxpool.Pool, taskID, agentID, summary string) error {
 
 	_, err = tx.Exec(ctx, `
 		UPDATE tasks
-		SET    status     = 'done',
+		SET    status     = CASE
+		                      WHEN metadata->>'ticket_issue_id' IS NOT NULL THEN 'review'
+		                      ELSE 'done'
+		                    END,
 		       done_at    = NOW(),
 		       claimed_by = NULL,
 		       claimed_at = NULL
