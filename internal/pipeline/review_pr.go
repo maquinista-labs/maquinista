@@ -29,7 +29,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/maquinista-labs/maquinista/internal/gh"
 )
 
 // reviewCommentMarker renders the dedup key stamped at the top of every
@@ -93,7 +92,7 @@ func postReviewVerdictComment(ctx context.Context, pool *pgxpool.Pool, g GhRunne
 	if !ok {
 		return // no PR — nothing to post to
 	}
-	comments, err := g.PRComments(ctx, pr)
+	comments, err := g.PRComments(ctx, pr, time.Time{})
 	if err != nil {
 		log.Printf("pipeline: dispatch: PR #%d comments for %s: %v — skipping verdict post", pr, taskID, err)
 		return
@@ -130,8 +129,8 @@ const (
 // comments, applies the cutoff (nil = no cutoff), trims oversized bodies,
 // and frames the section as input-not-verbs. Returns "" when nothing
 // survives (the prompt then ships without the section).
-func renderHumanComments(comments []gh.PRComment, cutoff *time.Time) string {
-	kept := make([]gh.PRComment, 0, len(comments))
+func renderHumanComments(comments []PRComment, cutoff *time.Time) string {
+	kept := make([]PRComment, 0, len(comments))
 	for _, c := range comments {
 		if c.IsBot || strings.Contains(c.Body, reviewMarkerPrefix) {
 			continue
@@ -165,7 +164,7 @@ func renderHumanComments(comments []gh.PRComment, cutoff *time.Time) string {
 	return b.String()
 }
 
-func humanCommentsLen(comments []gh.PRComment) int {
+func humanCommentsLen(comments []PRComment) int {
 	n := 0
 	for _, c := range comments {
 		n += len(c.Body) + len(c.Author) + 40 // body + author line overhead
@@ -207,7 +206,7 @@ func fetchHumanPRComments(ctx context.Context, pool *pgxpool.Pool, g GhRunner, t
 	if !ok {
 		return ""
 	}
-	comments, err := g.PRComments(ctx, pr)
+	comments, err := g.PRComments(ctx, pr, time.Time{})
 	if err != nil {
 		log.Printf("pipeline: dispatch: PR #%d comments for %s: %v — prompt ships without them", pr, taskID, err)
 		return ""

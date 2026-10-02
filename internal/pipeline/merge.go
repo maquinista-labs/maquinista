@@ -16,10 +16,10 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/db"
-	"github.com/maquinista-labs/maquinista/internal/gh"
 	"github.com/maquinista-labs/maquinista/internal/git"
 )
 
@@ -46,8 +46,10 @@ type GhRunner interface {
 	PRChecks(ctx context.Context, pr int) (string, error)
 	// PRMergeSquash squash-merges the PR via the API/CLI.
 	PRMergeSquash(ctx context.Context, pr int) error
-	// PRComments lists the PR's issue comments, oldest first.
-	PRComments(ctx context.Context, pr int) ([]gh.PRComment, error)
+	// PRComments lists the PR's issue comments created after since (zero
+	// since = all), oldest first. Same method serves the CommentSource
+	// poller (since-cursored) and the reviewer-prompt reader (zero since).
+	PRComments(ctx context.Context, pr int, since time.Time) ([]PRComment, error)
 	// PRPostComment posts body as a new comment on the PR.
 	PRPostComment(ctx context.Context, pr int, body string) error
 }

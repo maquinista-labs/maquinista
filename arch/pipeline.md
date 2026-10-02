@@ -247,6 +247,8 @@ the backstop — and a stalled fixer is bounded the same way.
 | `PIPELINE_MERGE_MODE` | merge driver: `local` (MergeNoFF in repo) or `gh` (remote PR flow) | `local` |
 | `PIPELINE_AUTO_MERGE` | gh mode only: truthy (`1`/`true`/`yes`/`t`/`y`) lets the queue merge without the approve verb | `0` |
 | `MAQUINISTA_MERGE_ATTEMPTS_MAX` | red-PR reclaim cap before the task parks needs-human | `5` |
+| `PIPELINE_GH_ALLOWED_LOGINS` | GitHub logins allowed to issue PR comment commands; unset = repo-collaborator check via gh | (collaborators) |
+| `PIPELINE_GH_COMMENTS_POLL` | comment-command poll interval (floor 30s) | `60s` |
 
 Without key + team the bridge is a logged no-op; nothing else in the
 orchestrator changes. The Linear provider additionally honors the legacy
@@ -283,7 +285,9 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
 - **Human gate** — `PIPELINE_AUTO_MERGE=0` (default) makes every processing
   pass release the entry untouched; `maquinista approve <task>` on a
   `ready_to_merge` task runs the full flow immediately, overriding the gate
-  for that one merge.
+  for that one merge. (MAQ-12 adds the id-less third surface: comment
+  `maquinista approve` on the PR itself — see "GitHub comment commands"
+  below; the Telegram/CLI id-carrying verbs are unchanged.)
 - **Telegram plumbing (EX-06)** — merge lifecycle notes (merged, conflict,
   infra failure, CI-cap) ride the stock delivery path via the synthetic
   `pipeline` notifier agent (migration `036`): `Notify` opens a tx, appends
@@ -299,6 +303,49 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   uses the gh CLI (`internal/gh`). The dispatch loop gets the same runner
   wired in `orchestrator start` (`DispatchConfig.Gh`) for the MAQ-16 PR
   surface; a nil runner disables it.
+
+## GitHub comment commands (MAQ-12)
+
+`pipeline.RunCommentCommands` (in `internal/pipeline/comments.go`, wired in
+`orchestrator start` next to dispatch/sync, **gh merge mode only**) turns
+the PR conversation into a control surface: an allowed GitHub login comments
+`maquinista <verb> [args...]` on a PR and the verb runs with the task
+resolved from the PR alone — no ids in the command (the PR maps 1:1 to the
+task via `tasks.pr_url`).
+
+- **Parser** (`ParseCommentCommand`) — first non-empty line, case-
+  insensitive, tolerant of a leading `/` and whitespace. Anything else is
+  prose and ignored entirely (never claimed, never counted).
+- **Dispatch table** — verb → `CommentVerbHandler` via
+  `RegisterCommentVerb`; `approve` ships first. Adding a verb is exactly one
+  registration call: parser, auth, resolution, idempotency and acks are
+  shared. Unknown verbs parse and record a `no_op`.
+- **Target resolution (id-less)** — primary: `tasks.pr_url` ending in
+  `/pull/<n>`; fallback: `merge_queue.branch` matching the PR head branch.
+  No task, or the verb not applicable to its state (`approve` wants
+  `ready_to_merge`) → one clean `no_op`, no state damage. Handlers re-check
+  state; the merge transitions themselves are status-guarded.
+- **Auth** — commenter login ∈ `PIPELINE_GH_ALLOWED_LOGINS`; unset →
+  repo-collaborator check via gh (cached 10 min per login). Non-allowed
+  logins are ignored silently — but claimed, so the silence is remembered.
+  Transient GitHub/DB errors claim nothing and retry next pass.
+- **Exactly-once** — `gh_comment_commands` (migration `037`): PK = the
+  globally unique GitHub comment id, `ON CONFLICT DO NOTHING` — the INSERT
+  is the claim, so a duplicate command comment never re-runs its verb and
+  can never double-merge (the merge_queue live-entry index is the second
+  guard). `disposition` audits the outcome (`ok` / `no_op` /
+  `unauthorized` / `error`).
+- **Polling, not webhooks** (home infra, no public endpoint) — one comments
+  fetch (`gh api`, `since=` cursor) per watched PR per tick; watched PRs =
+  open pipeline PRs (`review`/`changes_requested`/`ready_to_merge`/
+  `pending_approval`). Cadence 60 s default, 30 s floor. The cursor only
+  advances on a fetch-clean pass (a failed PR re-reads its window; claims
+  keep that exactly-once) and starts at now−10 min after a daemon restart.
+- **Ack** — accepted commands get a +1 reaction on the comment (best-effort)
+  and a note to the Pipeline topic via the EX-06 notify path.
+- GitHub specifics live behind `pipeline.CommentSource` (interface:
+  `PRComments` + `IsCollaborator` + `ReactToComment` + `PRHeadBranch`);
+  production is the same gh CLI wrapper (`internal/gh`).
 
 ## Role souls
 

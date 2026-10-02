@@ -1,0 +1,605 @@
+// GitHub comment commands (MAQ-12): the PR conversation as a control
+// surface. An allowed GitHub login comments `maquinista <verb> [args...]`
+// on a PR; the poller parses the command, resolves the target task from the
+// PR alone (id-less — the PR maps 1:1 to the task via tasks.pr_url), and
+// routes it through a verb dispatch table. `approve` ships first; adding a
+// verb is nothing more than a RegisterCommentVerb call — parser, auth,
+// resolution, exactly-once claiming and acks are all shared.
+//
+// Mechanics (MAQ-12 frame):
+//   - polling only, via the gh CLI behind CommentSource — no webhooks (the
+//     box is home infra, no public endpoint). One comments fetch per
+//     watched PR per tick; cadence default 60s, floor 30s; collaborator
+//     checks cached. Rate-limit safe by construction.
+//   - exactly-once: the gh_comment_commands INSERT (PK = the globally
+//     unique GitHub comment id) IS the claim — a duplicate command never
+//     re-runs its verb, so it can never double-merge (the merge_queue
+//     live-entry index is the second guard).
+//   - auth: PIPELINE_GH_ALLOWED_LOGINS, falling back to a repo-collaborator
+//     check via gh. Everyone else is ignored silently.
+//   - no-op discipline: not a command → ignored entirely; task not found or
+//     the verb not applicable to its state → one clean no-op, no state
+//     damage. Transient GitHub/DB errors are retried on the next pass
+//     (nothing is claimed until processing can proceed).
+package pipeline
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// PRComment is one PR conversation comment (a GitHub issue comment on the
+// pull request). Provider-neutral shape; gh.Runner fills it in.
+type PRComment struct {
+	ID        int64
+	Author    string // GitHub login
+	IsBot     bool   // author is a bot/app account
+	Body      string
+	CreatedAt time.Time
+}
+
+// CommentSource is the GitHub side of the comment-command surface (the gh
+// CLI in production, a fake in tests). Separate from GhRunner so the merge
+// interface stays minimal and the two surfaces evolve independently.
+type CommentSource interface {
+	// PRComments returns the PR's conversation comments created after
+	// since, oldest first.
+	PRComments(ctx context.Context, pr int, since time.Time) ([]PRComment, error)
+	// IsCollaborator reports whether login may push to the repo — the
+	// default allowlist when PIPELINE_GH_ALLOWED_LOGINS is unset.
+	IsCollaborator(ctx context.Context, login string) (bool, error)
+	// ReactToComment adds a +1 reaction to the comment (the ack).
+	ReactToComment(ctx context.Context, commentID int64) error
+	// PRHeadBranch returns the PR's head branch name (resolution fallback).
+	PRHeadBranch(ctx context.Context, pr int) (string, error)
+}
+
+// ---- config ----
+
+const (
+	// DefaultGhCommentsPoll is the poll cadence (MAQ-12: 30–60 s).
+	DefaultGhCommentsPoll = 60 * time.Second
+	// MinGhCommentsPoll is the enforced floor — a misconfigured sub-30 s
+	// cadence would burn the GitHub rate budget for nothing.
+	MinGhCommentsPoll = 30 * time.Second
+	// DefaultGhCommentsCatchup is the window the first pass after daemon
+	// start re-reads, so a command posted during a short outage is still
+	// seen. Claims make the overlap exactly-once.
+	DefaultGhCommentsCatchup = 10 * time.Minute
+	// DefaultGhAuthCacheTTL bounds how long collaborator verdicts are
+	// cached (membership changes take this long to notice).
+	DefaultGhAuthCacheTTL = 10 * time.Minute
+)
+
+// GhCommandsConfig carries the comment-command knobs.
+type GhCommandsConfig struct {
+	// AllowedLogins is the explicit allowlist (PIPELINE_GH_ALLOWED_LOGINS,
+	// comma/space separated). Empty → repo-collaborator check via gh.
+	AllowedLogins []string
+	// Interval between passes (default 60s, floor 30s,
+	// PIPELINE_GH_COMMENTS_POLL).
+	Interval time.Duration
+	// Catchup is the initial read window after start (default 10m).
+	Catchup time.Duration
+}
+
+// GhCommandsConfigFromEnv reads PIPELINE_GH_ALLOWED_LOGINS and
+// PIPELINE_GH_COMMENTS_POLL. The CommentSource is wired by the caller —
+// env only selects behavior, never binaries.
+func GhCommandsConfigFromEnv() GhCommandsConfig {
+	cfg := GhCommandsConfig{
+		Interval: DefaultGhCommentsPoll,
+		Catchup:  DefaultGhCommentsCatchup,
+	}
+	if v := os.Getenv("PIPELINE_GH_ALLOWED_LOGINS"); v != "" {
+		for _, f := range strings.FieldsFunc(v, func(r rune) bool {
+			return r == ',' || r == ' ' || r == ';' || r == '\t'
+		}) {
+			if f = strings.TrimSpace(f); f != "" {
+				cfg.AllowedLogins = append(cfg.AllowedLogins, f)
+			}
+		}
+	}
+	if v := os.Getenv("PIPELINE_GH_COMMENTS_POLL"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.Interval = d
+		} else {
+			log.Printf("pipeline: invalid PIPELINE_GH_COMMENTS_POLL %q — using %s", v, cfg.Interval)
+		}
+	}
+	if cfg.Interval < MinGhCommentsPoll {
+		cfg.Interval = MinGhCommentsPoll
+	}
+	return cfg
+}
+
+// ---- parser ----
+
+// commentCmdRe matches the FIRST non-empty line of a command comment:
+// optional leading `/`, the literal "maquinista" (case-insensitive), one or
+// more spaces, the verb, optional args. Anything else before the word makes
+// it prose, not a command.
+var commentCmdRe = regexp.MustCompile(`(?i)^[ \t]*/?[ \t]*maquinista[ \t]+(\S+)(?:[ \t]+(.+))?$`)
+
+// ParseCommentCommand parses `maquinista <verb> [args...]` out of a comment
+// body — case-insensitive, tolerant of leading `/` and whitespace, first
+// non-empty line only. ok=false for every non-command comment (which the
+// dispatcher then ignores entirely).
+func ParseCommentCommand(body string) (verb string, args []string, ok bool) {
+	for _, line := range strings.Split(body, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		m := commentCmdRe.FindStringSubmatch(trimmed)
+		if m == nil {
+			return "", nil, false
+		}
+		if m[2] != "" {
+			args = strings.Fields(m[2])
+		}
+		return strings.ToLower(m[1]), args, true
+	}
+	return "", nil, false
+}
+
+// ---- dispatch table ----
+
+// ErrNotApplicable: the verb does not apply to the resolved task's state.
+// The dispatcher records a clean single no-op — never an error, never state
+// damage (MAQ-12 AC 4).
+var ErrNotApplicable = errors.New("verb not applicable to task state")
+
+// CommentContext is everything a verb handler receives.
+type CommentContext struct {
+	Pool      *pgxpool.Pool
+	Source    CommentSource // acks / fallback lookups (may be nil in tests)
+	PR        int
+	CommentID int64
+	TaskID    string
+	Actor     string // GitHub login
+	Args      []string
+	// Merge plumbing for verbs that drive the PR merge flow.
+	Merge  MergeConfig
+	Prov   TicketProvider
+	TeamID string
+}
+
+// CommentVerbHandler processes one parsed command against its resolved PR
+// context. Return ErrNotApplicable for a clean no-op; any other error is
+// recorded as 'error' (the merge machinery transitions guarded, so a retry
+// is always safe).
+type CommentVerbHandler func(ctx context.Context, hc CommentContext) error
+
+var (
+	commentVerbsMu sync.Mutex
+	commentVerbs   = map[string]CommentVerbHandler{}
+)
+
+// RegisterCommentVerb registers a handler for a verb (lowercased on
+// registration). This call is the entire extension surface — parser, auth,
+// target resolution, idempotency and acks are shared (MAQ-12 AC 5).
+func RegisterCommentVerb(verb string, h CommentVerbHandler) {
+	commentVerbsMu.Lock()
+	defer commentVerbsMu.Unlock()
+	commentVerbs[strings.ToLower(verb)] = h
+}
+
+func unregisterCommentVerb(verb string) {
+	commentVerbsMu.Lock()
+	defer commentVerbsMu.Unlock()
+	delete(commentVerbs, strings.ToLower(verb))
+}
+
+func commentVerbHandler(verb string) CommentVerbHandler {
+	commentVerbsMu.Lock()
+	defer commentVerbsMu.Unlock()
+	return commentVerbs[strings.ToLower(verb)]
+}
+
+func init() {
+	RegisterCommentVerb("approve", approveCommentHandler)
+}
+
+// approveCommentHandler is the `approve` verb: merge the resolved task's PR
+// now — the same arm the id-carrying `maquinista approve <task-id>` CLI
+// takes in gh mode, but id-less: the PR context IS the target.
+func approveCommentHandler(ctx context.Context, hc CommentContext) error {
+	var status string
+	if err := hc.Pool.QueryRow(ctx,
+		`SELECT status FROM tasks WHERE id = $1`, hc.TaskID).Scan(&status); err != nil {
+		return fmt.Errorf("pipeline: approve comment: loading task %s: %w", hc.TaskID, err)
+	}
+	if status != "ready_to_merge" {
+		return fmt.Errorf("%w: task %s is %s, want ready_to_merge", ErrNotApplicable, hc.TaskID, status)
+	}
+	if hc.Merge.Mode != MergeModeGH {
+		return fmt.Errorf("%w: merge mode is %s, not gh", ErrNotApplicable, hc.Merge.Mode)
+	}
+	if err := RunMergeOnApprove(ctx, hc.Pool, hc.Merge, hc.Prov, hc.TeamID, hc.TaskID); err != nil {
+		return err
+	}
+	// The merge flow posts its own result note; this one attributes the
+	// approval to the GitHub commenter.
+	notifyf(ctx, hc.Pool, "👍 %s: approved via PR #%d comment by @%s — merge dispatched.",
+		taskTitle(ctx, hc.Pool, hc.TaskID), hc.PR, hc.Actor)
+	hc.ack(ctx)
+	return nil
+}
+
+// ack reacts +1 to the command comment — a cheap visible "accepted"
+// (MAQ-12 point 7). Best-effort; never fails the command.
+func (hc CommentContext) ack(ctx context.Context) {
+	if hc.Source == nil {
+		return
+	}
+	if err := hc.Source.ReactToComment(ctx, hc.CommentID); err != nil {
+		log.Printf("pipeline: ack reaction on comment %d: %v", hc.CommentID, err)
+	}
+}
+
+// ---- dispatcher ----
+
+// CommentDeps bundles what the comment-command dispatcher needs.
+type CommentDeps struct {
+	Pool   *pgxpool.Pool
+	Source CommentSource
+	Auth   GhCommandsConfig
+	Merge  MergeConfig
+	Prov   TicketProvider
+	TeamID string
+}
+
+// errNoTaskForPR: no task row matches the PR (id-less resolution missed).
+var errNoTaskForPR = errors.New("no task for PR")
+
+// Dispositions recorded in gh_comment_commands.
+const (
+	DispPending      = "pending"
+	DispOK           = "ok"
+	DispNoOp         = "no_op"
+	DispUnauthorized = "unauthorized"
+	DispError        = "error"
+)
+
+// DispatchCommentCommand handles one PR comment: parse → authorize →
+// resolve the target task (id-less) → claim exactly-once → route to the
+// verb handler. Returns the disposition recorded (or "" for non-command
+// comments, which are ignored entirely and never claimed). A transient
+// error ("", err) claims nothing so the next pass retries the comment.
+func DispatchCommentCommand(ctx context.Context, d CommentDeps, authz *commentAuthorizer, pr int, c PRComment) (string, error) {
+	verb, args, ok := ParseCommentCommand(c.Body)
+	if !ok {
+		return "", nil // non-command: ignored entirely
+	}
+
+	allowed, err := authorizeCommenter(ctx, d, authz, c.Author)
+	if err != nil {
+		return "", err // transient: retry next pass, nothing claimed
+	}
+	if !allowed {
+		// Claim so the silence is remembered — a non-allowed login never
+		// re-triggers parsing or gh calls (MAQ-12: ignored silently).
+		if _, err := claimCommentCommand(ctx, d.Pool, c, verb, ""); err != nil {
+			return "", err
+		}
+		if err := setCommentDisposition(ctx, d.Pool, c.ID, DispUnauthorized, "login not allowed"); err != nil {
+			log.Printf("pipeline: comment %d disposition: %v", c.ID, err)
+		}
+		return DispUnauthorized, nil
+	}
+
+	taskID, err := resolveTaskByPR(ctx, d.Pool, d.Source, pr)
+	if err != nil {
+		if !errors.Is(err, errNoTaskForPR) {
+			return "", err // transient
+		}
+		if _, cerr := claimCommentCommand(ctx, d.Pool, c, verb, ""); cerr != nil {
+			return "", cerr
+		}
+		if derr := setCommentDisposition(ctx, d.Pool, c.ID, DispNoOp,
+			fmt.Sprintf("no task maps to PR #%d", pr)); derr != nil {
+			log.Printf("pipeline: comment %d disposition: %v", c.ID, derr)
+		}
+		return DispNoOp, nil
+	}
+
+	handler := commentVerbHandler(verb)
+	if handler == nil {
+		if _, cerr := claimCommentCommand(ctx, d.Pool, c, verb, taskID); cerr != nil {
+			return "", cerr
+		}
+		if derr := setCommentDisposition(ctx, d.Pool, c.ID, DispNoOp,
+			fmt.Sprintf("unknown verb %q", verb)); derr != nil {
+			log.Printf("pipeline: comment %d disposition: %v", c.ID, derr)
+		}
+		return DispNoOp, nil
+	}
+
+	claimed, err := claimCommentCommand(ctx, d.Pool, c, verb, taskID)
+	if err != nil {
+		return "", err
+	}
+	if !claimed {
+		return "duplicate", nil // already processed — exactly-once holds
+	}
+
+	hc := CommentContext{
+		Pool: d.Pool, Source: d.Source, PR: pr, CommentID: c.ID,
+		TaskID: taskID, Actor: c.Author, Args: args,
+		Merge: d.Merge, Prov: d.Prov, TeamID: d.TeamID,
+	}
+	err = handler(ctx, hc)
+
+	disp, detail := DispOK, ""
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrNotApplicable):
+		disp, detail = DispNoOp, err.Error()
+	default:
+		disp, detail = DispError, err.Error()
+	}
+	if derr := setCommentDisposition(ctx, d.Pool, c.ID, disp, detail); derr != nil {
+		log.Printf("pipeline: comment %d disposition: %v", c.ID, derr)
+	}
+	if err != nil && !errors.Is(err, ErrNotApplicable) {
+		return disp, err
+	}
+	return disp, nil
+}
+
+// ---- auth ----
+
+type collabEntry struct {
+	allowed bool
+	at      time.Time
+}
+
+// commentAuthorizer resolves commenter authority: an explicit allowlist
+// first, else repo-collaborator checks via gh, cached per login (MAQ-12
+// point 4 + rate-limit safety).
+type commentAuthorizer struct {
+	cfg    GhCommandsConfig
+	ttl    time.Duration
+	mu     sync.Mutex
+	cached map[string]collabEntry
+}
+
+func newCommentAuthorizer(cfg GhCommandsConfig) *commentAuthorizer {
+	return &commentAuthorizer{cfg: cfg, ttl: DefaultGhAuthCacheTTL, cached: map[string]collabEntry{}}
+}
+
+// allowed reports whether login may issue commands. error = transient
+// (GitHub unreachable): the caller retries the comment next pass.
+func (a *commentAuthorizer) allowed(ctx context.Context, d CommentDeps, login string) (bool, error) {
+	if len(a.cfg.AllowedLogins) > 0 {
+		for _, l := range a.cfg.AllowedLogins {
+			if strings.EqualFold(l, login) {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	a.mu.Lock()
+	e, ok := a.cached[login]
+	a.mu.Unlock()
+	if ok && time.Since(e.at) < a.ttl {
+		return e.allowed, nil
+	}
+	if d.Source == nil {
+		return false, fmt.Errorf("pipeline: no allowlist and no CommentSource for collaborator check")
+	}
+	allowed, err := d.Source.IsCollaborator(ctx, login)
+	if err != nil {
+		return false, err
+	}
+	a.mu.Lock()
+	a.cached[login] = collabEntry{allowed: allowed, at: time.Now()}
+	a.mu.Unlock()
+	return allowed, nil
+}
+
+// authorizeCommenter is the nil-tolerant form used by the dispatcher.
+func authorizeCommenter(ctx context.Context, d CommentDeps, authz *commentAuthorizer, login string) (bool, error) {
+	if authz == nil {
+		authz = newCommentAuthorizer(d.Auth)
+	}
+	return authz.allowed(ctx, d, login)
+}
+
+// ---- target resolution (id-less) ----
+
+// resolveTaskByPR maps a PR number to its task with NO ids in the command:
+// primary via tasks.pr_url (the PR maps 1:1 to the task), fallback via the
+// merge_queue branch matching the PR head branch. errNoTaskForPR when
+// nothing matches (the dispatcher records one clean no-op).
+func resolveTaskByPR(ctx context.Context, pool *pgxpool.Pool, src CommentSource, pr int) (taskID string, err error) {
+	num := strconv.Itoa(pr)
+	qerr := pool.QueryRow(ctx, `
+		SELECT id FROM tasks
+		WHERE  pr_url LIKE '%/pull/' || $1
+		LIMIT 1
+	`, num).Scan(&taskID)
+	if qerr == nil {
+		return taskID, nil
+	}
+	if !errors.Is(qerr, pgx.ErrNoRows) {
+		return "", fmt.Errorf("pipeline: resolving task for PR #%d: %w", pr, qerr)
+	}
+	// Branch fallback: the merge_queue entry knows the task's branch; the
+	// PR head branch names the same line of work.
+	if src != nil {
+		branch, berr := src.PRHeadBranch(ctx, pr)
+		if berr != nil {
+			log.Printf("pipeline: PR #%d head branch (resolution fallback): %v", pr, berr)
+		} else if branch != "" {
+			ferr := pool.QueryRow(ctx, `
+				SELECT t.id
+				FROM   merge_queue q JOIN tasks t ON t.id = q.task_id
+				WHERE  q.branch = $1
+				ORDER  BY q.id DESC
+				LIMIT 1
+			`, branch).Scan(&taskID)
+			if ferr == nil {
+				return taskID, nil
+			}
+			if !errors.Is(ferr, pgx.ErrNoRows) {
+				return "", fmt.Errorf("pipeline: resolving task for PR #%d by branch: %w", pr, ferr)
+			}
+		}
+	}
+	return "", errNoTaskForPR
+}
+
+// ---- exactly-once claim ----
+
+// claimCommentCommand records the processed-comment memory: the INSERT
+// (PK = GitHub comment id, ON CONFLICT DO NOTHING) IS the claim. Returns
+// false when the comment was already processed.
+func claimCommentCommand(ctx context.Context, pool *pgxpool.Pool, c PRComment, verb, taskID string) (bool, error) {
+	tag, err := pool.Exec(ctx, `
+		INSERT INTO gh_comment_commands (comment_id, verb, task_id, actor, disposition)
+		VALUES ($1, $2, NULLIF($3, ''), $4, $5)
+		ON CONFLICT (comment_id) DO NOTHING
+	`, c.ID, verb, taskID, c.Author, DispPending)
+	if err != nil {
+		return false, fmt.Errorf("pipeline: claiming comment %d: %w", c.ID, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+func setCommentDisposition(ctx context.Context, pool *pgxpool.Pool, commentID int64, disposition, detail string) error {
+	_, err := pool.Exec(ctx, `
+		UPDATE gh_comment_commands SET disposition = $2, detail = $3
+		WHERE comment_id = $1
+	`, commentID, disposition, detail)
+	if err != nil {
+		return fmt.Errorf("pipeline: comment %d disposition: %w", commentID, err)
+	}
+	return nil
+}
+
+// ---- poller ----
+
+// watchedPR is a PR whose conversation is polled: any open pipeline PR —
+// states approve applies to today, plus the neighbors a future verb
+// (park, rerun, ...) will care about. Comments on PRs outside the set are
+// never fetched — the cheapest possible no-op.
+func watchedPRs(ctx context.Context, pool *pgxpool.Pool) ([]int, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT DISTINCT pr_url
+		FROM   tasks
+		WHERE  pr_url IS NOT NULL
+		  AND  status IN ('review', 'changes_requested', 'ready_to_merge', 'pending_approval')
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline: watching PRs: %w", err)
+	}
+	defer rows.Close()
+
+	seen := map[int]bool{}
+	var prs []int
+	for rows.Next() {
+		var url string
+		if err := rows.Scan(&url); err != nil {
+			return nil, fmt.Errorf("pipeline: watching PRs scan: %w", err)
+		}
+		pr, err := prFromPullURL(url)
+		if err != nil {
+			continue // not a GitHub pull URL — not ours to poll
+		}
+		if !seen[pr] {
+			seen[pr] = true
+			prs = append(prs, pr)
+		}
+	}
+	return prs, rows.Err()
+}
+
+// PollPRCommands runs one pass: fetch each watched PR's comments since,
+// dispatch commands, return the advanced cursor. The cursor only advances
+// on a fetch-clean pass — a failed PR re-reads the whole window next pass,
+// which the claims make exactly-once.
+func PollPRCommands(ctx context.Context, d CommentDeps, authz *commentAuthorizer, since time.Time) (time.Time, error) {
+	prs, err := watchedPRs(ctx, d.Pool)
+	if err != nil {
+		return since, err
+	}
+	cursor := since
+	var fetchErr error
+	for _, pr := range prs {
+		comments, err := d.Source.PRComments(ctx, pr, since)
+		if err != nil {
+			log.Printf("pipeline: comments PR #%d: %v", pr, err)
+			if fetchErr == nil {
+				fetchErr = err
+			}
+			continue
+		}
+		sort.Slice(comments, func(i, j int) bool { return comments[i].CreatedAt.Before(comments[j].CreatedAt) })
+		for _, c := range comments {
+			if !c.CreatedAt.After(since) {
+				continue // exact created_at filter (the API filters on updated)
+			}
+			if c.CreatedAt.After(cursor) {
+				cursor = c.CreatedAt
+			}
+			disp, err := DispatchCommentCommand(ctx, d, authz, pr, c)
+			switch {
+			case err != nil:
+				log.Printf("pipeline: comment %d on PR #%d by @%s: dispatch error: %v", c.ID, pr, c.Author, err)
+			case disp == "":
+				// non-command — ignored entirely
+			default:
+				log.Printf("pipeline: comment %d on PR #%d by @%s → %s", c.ID, pr, c.Author, disp)
+			}
+		}
+	}
+	if fetchErr != nil {
+		return since, fetchErr
+	}
+	return cursor, nil
+}
+
+// RunCommentCommands polls PR conversations for `maquinista <verb>`
+// comments and dispatches them until ctx is cancelled. gh merge mode only —
+// the verbs drive the PR merge flow (wired in orchestrator start).
+func RunCommentCommands(ctx context.Context, d CommentDeps) {
+	interval := d.Auth.Interval
+	if interval <= 0 {
+		interval = DefaultGhCommentsPoll
+	}
+	catchup := d.Auth.Catchup
+	if catchup <= 0 {
+		catchup = DefaultGhCommentsCatchup
+	}
+	authz := newCommentAuthorizer(d.Auth)
+	cursor := time.Now().UTC().Add(-catchup)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			next, err := PollPRCommands(ctx, d, authz, cursor)
+			if err != nil {
+				log.Printf("pipeline: comment commands pass: %v", err)
+				continue // cursor unchanged: the window is re-read next pass
+			}
+			cursor = next
+		}
+	}
+}

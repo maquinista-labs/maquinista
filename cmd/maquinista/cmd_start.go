@@ -520,6 +520,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			}
 		}()
 		log.Println("task-scheduler: started")
+
 		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
 		if perr != nil {
 			log.Printf("pipeline: %v", perr)
@@ -552,6 +553,23 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				}
 			}()
 			log.Printf("pipeline: ticket bridge started (%s)", tCfg.Provider)
+		}
+
+		// GitHub comment commands (MAQ-12): `maquinista <verb>` comments on
+		// PR conversations — approve ships first, resolving the task from
+		// the PR alone (id-less). gh merge mode only: the verbs drive the
+		// PR merge flow. Polling via gh (no webhooks), 30–60s cadence.
+		if mCfg := pipeline.MergeConfigFromEnv(); mCfg.Mode == pipeline.MergeModeGH {
+			mCfg.Gh = gh.New()
+			go pipeline.RunCommentCommands(ctx, pipeline.CommentDeps{
+				Pool:   pool,
+				Source: gh.New(),
+				Auth:   pipeline.GhCommandsConfigFromEnv(),
+				Merge:  mCfg,
+				Prov:   prov,
+				TeamID: tCfg.TeamID,
+			})
+			log.Println("pipeline: GitHub comment commands started (gh mode)")
 		}
 	}
 
