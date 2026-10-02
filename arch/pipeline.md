@@ -153,6 +153,8 @@ is bounded the same way.
 | `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound (reviewers + fixers) | `2h` |
 | `MAQUINISTA_REVIEW_ROUNDS_MAX` | fixer-loop cap: the request_changes landing at/after this review round parks the task | `3` |
 | `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |
+| `PIPELINE_MERGE_MODE` | merge driver: `local` (MergeNoFF in repo) or `gh` (remote PR flow) | `local` |
+| `PIPELINE_AUTO_MERGE` | gh mode only: `1` lets the queue merge without the approve verb | `0` |
 
 Without key + team the bridge is a logged no-op; nothing else in the
 orchestrator changes. The Linear provider additionally honors the legacy
@@ -160,6 +162,35 @@ orchestrator changes. The Linear provider additionally honors the legacy
 Core neutrality is enforced by check: under `internal/pipeline/` only
 `linear.go` + `linear_test.go` may mention linear; under `internal/db/` and
 `cmd/` none may.
+
+### Merge mode: gh (EX-05)
+
+`PIPELINE_MERGE_MODE=gh` extends the determinism boundary to merging. The
+driver is still the merge_queue entry — one row per merge attempt, same
+statuses (`pending → merging → merged|conflict|failed`) as the local flow:
+
+- **Enqueue pass** — each dispatch tick, tasks landing in `ready_to_merge`
+  with a PR URL and a worktree get an entry (branch derived from the
+  worktree's HEAD, base from `origin/HEAD`).
+- **Processing** — `maquinista merge` (or the approve verb, below) claims an
+  entry and drives the remote: `fetch` → `rebase origin/<base>` →
+  `push --force-with-lease` → CI gate (`gh pr view statusCheckRollup`) →
+  `gh pr merge --squash`. After the squash lands: entry `merged` with the
+  squash SHA, task `ready_to_merge → done` with `pr_state=merged`, one
+  observation, a best-effort board push to Done, then worktree + local +
+  remote branch cleanup.
+- **CI gate** — pending checks release the entry back to `pending` (a later
+  pass retries); failed checks release it and leave a `merger` observation.
+  No checks configured counts as green.
+- **Conflicts** — the rebase is aborted and the task parks at
+  `pending_approval` (Needs Human on the board) with the conflicting files
+  in the observation; conflicts are never auto-resolved.
+- **Human gate** — `PIPELINE_AUTO_MERGE=0` (default) makes every processing
+  pass release the entry untouched; `maquinista approve <task>` on a
+  `ready_to_merge` task runs the full flow immediately, overriding the gate
+  for that one merge.
+- GitHub is behind `pipeline.GhRunner` (interface: `PRChecks` +
+  `PRMergeSquash`); production uses the gh CLI (`internal/gh`).
 
 ## Role souls
 
@@ -192,6 +223,7 @@ a new harness is an extras edit, not a soul rewrite.
 
 - fixer re-claim loop: **shipped (EX-04)** — see "Fixer pass" above; round
   cap + fixer watchdog included
-- merge mode: EX-05; Telegram plumbing: EX-06
-- the merger (EX-05) consumes `ready_to_merge` → done/merged
+- merge mode: **shipped (EX-05)** — see "Merge mode: gh" above; enqueue
+  pass, rebase + CI gate, approve-verb override included
+- Telegram plumbing: EX-06
 

@@ -3,6 +3,7 @@ package git
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -23,6 +24,22 @@ func RepoRoot(dir string) (string, error) {
 		return "", fmt.Errorf("git rev-parse --show-toplevel in %s: %w", dir, err)
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// CommonDir returns the repository's main directory (the one holding .git)
+// for the given worktree or checkout — the right root for branch cleanup in
+// linked-worktree setups, where RepoRoot is the worktree itself.
+func CommonDir(dir string) (string, error) {
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "--git-common-dir")
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse --git-common-dir in %s: %w", dir, err)
+	}
+	p := strings.TrimSpace(string(out))
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(dir, p)
+	}
+	return filepath.Dir(p), nil
 }
 
 // CurrentBranch returns the current branch name for the given directory.
@@ -106,6 +123,79 @@ func DeleteBranch(repoRoot, branch string) error {
 	cmd := exec.Command("git", "-C", repoRoot, "branch", "-D", branch)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git branch -D %s: %s: %w", branch, string(out), err)
+	}
+	return nil
+}
+
+// Fetch updates remote-tracking branches from the given remote.
+func Fetch(dir, remote string) error {
+	cmd := exec.Command("git", "-C", dir, "fetch", remote)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git fetch %s in %s: %s: %w", remote, dir, string(out), err)
+	}
+	return nil
+}
+
+// SymbolicRefRemoteHead returns the default branch of the given remote
+// (via the remote's HEAD symbolic ref), e.g. "main".
+func SymbolicRefRemoteHead(dir, remote string) (string, error) {
+	ref := "refs/remotes/" + remote + "/HEAD"
+	cmd := exec.Command("git", "-C", dir, "symbolic-ref", ref)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git symbolic-ref %s in %s: %w", ref, dir, err)
+	}
+	return strings.TrimPrefix(strings.TrimSpace(string(out)), "refs/remotes/"+remote+"/"), nil
+}
+
+// RevParse returns the full SHA for a ref in the given directory.
+func RevParse(dir, ref string) (string, error) {
+	return revParse(dir, ref)
+}
+
+// Rebase rebases the current branch onto upstream (e.g. "origin/main").
+// Returns the new HEAD SHA on success, or a *ConflictError if the rebase
+// hits conflicts (the rebase is aborted before returning, leaving the
+// worktree clean on the original branch).
+func Rebase(dir, upstream string) (string, error) {
+	cmd := exec.Command("git", "-C", dir, "rebase", upstream)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		outStr := string(out)
+		if strings.Contains(outStr, "CONFLICT") || strings.Contains(outStr, "could not apply") {
+			files := conflictFiles(dir)
+			AbortRebase(dir)
+			return "", &ConflictError{Files: files}
+		}
+		return "", fmt.Errorf("git rebase %s in %s: %s: %w", upstream, dir, outStr, err)
+	}
+	return revParse(dir, "HEAD")
+}
+
+// AbortRebase aborts an in-progress rebase (no-op when none is running).
+func AbortRebase(dir string) error {
+	cmd := exec.Command("git", "-C", dir, "rebase", "--abort")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git rebase --abort: %s: %w", string(out), err)
+	}
+	return nil
+}
+
+// PushForceWithLease force-pushes branch to remote with --force-with-lease,
+// so the push fails if the remote moved underneath the rebase.
+func PushForceWithLease(dir, branch, remote string) error {
+	cmd := exec.Command("git", "-C", dir, "push", "--force-with-lease", remote, branch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git push --force-with-lease %s %s: %s: %w", remote, branch, string(out), err)
+	}
+	return nil
+}
+
+// DeleteRemoteBranch deletes a branch on the remote.
+func DeleteRemoteBranch(dir, branch, remote string) error {
+	cmd := exec.Command("git", "-C", dir, "push", remote, "--delete", branch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git push %s --delete %s: %s: %w", remote, branch, string(out), err)
 	}
 	return nil
 }

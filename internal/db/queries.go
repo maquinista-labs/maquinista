@@ -879,6 +879,76 @@ func FailMerge(pool *pgxpool.Pool, id int64, errMsg string) error {
 	return nil
 }
 
+// ReleaseMergeEntry returns a merge queue entry to 'pending' (clearing the
+// claim timestamp), so the processor picks it up again on a later pass.
+// Used when CI is still running or a human approval is required.
+func ReleaseMergeEntry(pool *pgxpool.Pool, id int64) error {
+	_, err := pool.Exec(context.Background(), `
+		UPDATE merge_queue
+		SET    status     = 'pending',
+		       started_at = NULL
+		WHERE  id = $1
+	`, id)
+	if err != nil {
+		return fmt.Errorf("releasing merge entry: %w", err)
+	}
+	return nil
+}
+
+// GetPendingMergeEntryByTask returns the oldest pending merge queue entry for
+// a task, or nil if none is queued.
+func GetPendingMergeEntryByTask(pool *pgxpool.Pool, taskID string) (*MergeQueueEntry, error) {
+	ctx := context.Background()
+	var e MergeQueueEntry
+	err := pool.QueryRow(ctx, `
+		SELECT id, task_id, agent_id, branch, worktree_dir, base_branch, status,
+		       commit_sha, merge_sha, conflict_files, error_msg,
+		       enqueued_at, started_at, completed_at
+		FROM   merge_queue
+		WHERE  task_id = $1 AND status = 'pending'
+		ORDER  BY enqueued_at ASC
+		LIMIT  1
+	`, taskID).Scan(
+		&e.ID, &e.TaskID, &e.AgentID, &e.Branch, &e.WorktreeDir, &e.BaseBranch, &e.Status,
+		&e.CommitSHA, &e.MergeSHA, &e.ConflictFiles, &e.ErrorMsg,
+		&e.EnqueuedAt, &e.StartedAt, &e.CompletedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("getting pending merge entry for %s: %w", taskID, err)
+	}
+	return &e, nil
+}
+
+// ClaimMergeEntryByID claims a specific merge queue entry (status →
+// 'merging'), for direct paths like the approve verb that target one task.
+// Returns nil if the entry is no longer pending.
+func ClaimMergeEntryByID(pool *pgxpool.Pool, id int64) (*MergeQueueEntry, error) {
+	ctx := context.Background()
+	var e MergeQueueEntry
+	err := pool.QueryRow(ctx, `
+		UPDATE merge_queue
+		SET    status = 'merging', started_at = NOW()
+		WHERE  id = $1 AND status = 'pending'
+		RETURNING id, task_id, agent_id, branch, worktree_dir, base_branch, status,
+		          commit_sha, merge_sha, conflict_files, error_msg,
+		          enqueued_at, started_at, completed_at
+	`, id).Scan(
+		&e.ID, &e.TaskID, &e.AgentID, &e.Branch, &e.WorktreeDir, &e.BaseBranch, &e.Status,
+		&e.CommitSHA, &e.MergeSHA, &e.ConflictFiles, &e.ErrorMsg,
+		&e.EnqueuedAt, &e.StartedAt, &e.CompletedAt,
+	)
+	if err == pgx.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("claiming merge entry %d: %w", id, err)
+	}
+	return &e, nil
+}
+
 // ListMergeQueue returns all merge queue entries, ordered by enqueue time.
 func ListMergeQueue(pool *pgxpool.Pool) ([]*MergeQueueEntry, error) {
 	rows, err := pool.Query(context.Background(), `
