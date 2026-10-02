@@ -1,7 +1,7 @@
-// Package pipeline implements the Linear ↔ maquinista bridge (ADR-0005):
-// intake (Linear Todo issues → task rows) and linearSync (Postgres task
-// state transitions → Linear board, with retry). Agents never call Linear
-// directly — the determinism boundary is the tasks state machine.
+// Linear ticket provider (ADR-0006): the only file in the pipeline package
+// that speaks Linear. Implements TicketProvider over the GraphQL transport
+// below; the canonical Column names happen to equal this board's Linear
+// column names, which keeps stored state readable and diff-compatible.
 package pipeline
 
 import (
@@ -11,13 +11,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"time"
 )
 
 const defaultLinearAPIURL = "https://api.linear.app/graphql"
 
-// Issue is the slice of a Linear issue the bridge needs.
-type Issue struct {
+// linearIssue mirrors the GraphQL issue shape.
+type linearIssue struct {
 	ID          string `json:"id"`
 	Identifier  string `json:"identifier"`
 	Title       string `json:"title"`
@@ -25,16 +26,22 @@ type Issue struct {
 	URL         string `json:"url"`
 }
 
-// LinearAPI is the surface the bridge and sync loops need; *LinearClient
-// implements it against the real API, tests substitute fakes.
-type LinearAPI interface {
-	TodoIssues(ctx context.Context, teamID string) ([]Issue, error)
-	WorkflowStates(ctx context.Context, teamID string) (map[string]string, error)
-	UpdateIssueState(ctx context.Context, issueID, stateID string) (string, error)
+func (i linearIssue) toIssue() Issue {
+	return Issue{ID: i.ID, Key: i.Identifier, Title: i.Title, Description: i.Description, URL: i.URL}
 }
 
-// LinearClient is a minimal Linear GraphQL client. APIURL is overridable for
-// tests (httptest stubs).
+// linearColumnNames maps canonical columns to the MAQ board's Linear columns.
+var linearColumnNames = map[Column]string{
+	ColInProgress:       "In Progress",
+	ColInReview:         "In Review",
+	ColChangesRequested: "Changes Requested",
+	ColNeedsHuman:       "Needs Human",
+	ColDone:             "Done",
+}
+
+// LinearClient is a minimal Linear GraphQL client (transport only — the
+// provider methods below are what the pipeline core consumes). APIURL is
+// overridable for tests (httptest stubs).
 type LinearClient struct {
 	HTTPClient *http.Client
 	APIURL     string
@@ -102,11 +109,11 @@ func (c *LinearClient) gql(ctx context.Context, doc string, vars map[string]any,
 }
 
 // TodoIssues returns the team's issues in workflow state "Todo" carrying the
-// "pipeline" label — the intake set for the claim loop.
-func (c *LinearClient) TodoIssues(ctx context.Context, teamID string) ([]Issue, error) {
+// "pipeline" label — the intake queue for the claim loop.
+func (c *LinearClient) TodoIssues(ctx context.Context, teamID string) ([]linearIssue, error) {
 	var out struct {
 		Issues struct {
-			Nodes []Issue `json:"nodes"`
+			Nodes []linearIssue `json:"nodes"`
 		} `json:"issues"`
 	}
 	doc := `query($t: String!) { issues(
@@ -164,4 +171,54 @@ func (c *LinearClient) UpdateIssueState(ctx context.Context, issueID, stateID st
 		return "", err
 	}
 	return out.IssueUpdate.Issue.State.Name, nil
+}
+
+// linearProvider implements TicketProvider over the Linear API.
+type linearProvider struct {
+	client *LinearClient
+}
+
+// newLinearProvider resolves the credential: callers pass
+// MAQUINISTA_TICKETS_API_KEY; an empty value falls back to Linear's
+// documented LINEAR_API_KEY so operator setups that predate ADR-0006 keep
+// working without reconfiguration.
+func newLinearProvider(apiKey string) *linearProvider {
+	if apiKey == "" {
+		apiKey = os.Getenv("LINEAR_API_KEY")
+	}
+	return &linearProvider{client: NewLinearClient(apiKey)}
+}
+
+// IntakeIssues implements TicketProvider.
+func (p *linearProvider) IntakeIssues(ctx context.Context, teamID string) ([]Issue, error) {
+	nodes, err := p.client.TodoIssues(ctx, teamID)
+	if err != nil {
+		return nil, err
+	}
+	issues := make([]Issue, 0, len(nodes))
+	for _, n := range nodes {
+		issues = append(issues, n.toIssue())
+	}
+	return issues, nil
+}
+
+// Columns implements TicketProvider: canonical → Linear workflow-state ID.
+func (p *linearProvider) Columns(ctx context.Context, teamID string) (map[Column]string, error) {
+	states, err := p.client.WorkflowStates(ctx, teamID)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[Column]string, len(linearColumnNames))
+	for col, name := range linearColumnNames {
+		if id, ok := states[name]; ok {
+			out[col] = id
+		}
+	}
+	return out, nil
+}
+
+// SetIssueColumn implements TicketProvider.
+func (p *linearProvider) SetIssueColumn(ctx context.Context, issueID, columnID string) error {
+	_, err := p.client.UpdateIssueState(ctx, issueID, columnID)
+	return err
 }

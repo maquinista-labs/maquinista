@@ -31,47 +31,11 @@ func execOK(t *testing.T, pool *pgxpool.Pool, sql string, args ...any) {
 func seedIssue(n int) Issue {
 	return Issue{
 		ID:          fmt.Sprintf("uuid-%d", n),
-		Identifier:  fmt.Sprintf("MAQ-%d", 100+n),
+		Key:         fmt.Sprintf("MAQ-%d", 100+n),
 		Title:       fmt.Sprintf("Do thing %d", n),
 		Description: "the body",
 		URL:         fmt.Sprintf("https://linear.app/maq/MAQ-%d", 100+n),
 	}
-}
-
-// updCall records one UpdateIssueState invocation.
-type updCall struct {
-	issueID, stateID string
-}
-
-// fakeLinear is the in-memory LinearAPI used by bridge and sync tests.
-type fakeLinear struct {
-	todo      []Issue
-	todoErr   error
-	states    map[string]string // state name -> id
-	statesErr error
-	updates   []updCall
-	updErr    error
-}
-
-func (f *fakeLinear) TodoIssues(ctx context.Context, teamID string) ([]Issue, error) {
-	return f.todo, f.todoErr
-}
-
-func (f *fakeLinear) WorkflowStates(ctx context.Context, teamID string) (map[string]string, error) {
-	return f.states, f.statesErr
-}
-
-func (f *fakeLinear) UpdateIssueState(ctx context.Context, issueID, stateID string) (string, error) {
-	f.updates = append(f.updates, updCall{issueID: issueID, stateID: stateID})
-	if f.updErr != nil {
-		return "", f.updErr
-	}
-	for name, id := range f.states {
-		if id == stateID {
-			return name, nil
-		}
-	}
-	return "", nil
 }
 
 func TestClaim_InsertsTaskRow(t *testing.T) {
@@ -91,7 +55,7 @@ func TestClaim_InsertsTaskRow(t *testing.T) {
 	var meta map[string]string
 	if err := pool.QueryRow(ctx, `
 		SELECT status, title, project_id, metadata FROM tasks
-		WHERE metadata->>'linear_issue_id' = $1`, iss.ID,
+		WHERE metadata->>'ticket_issue_id' = $1`, iss.ID,
 	).Scan(&status, &title, &project, &meta); err != nil {
 		t.Fatalf("task row: %v", err)
 	}
@@ -104,8 +68,8 @@ func TestClaim_InsertsTaskRow(t *testing.T) {
 	if project != "brisa" {
 		t.Errorf("project_id = %q, want brisa", project)
 	}
-	if meta["linear_url"] != iss.URL {
-		t.Errorf("metadata.linear_url = %q, want %q", meta["linear_url"], iss.URL)
+	if meta["ticket_url"] != iss.URL {
+		t.Errorf("metadata.ticket_url = %q, want %q", meta["ticket_url"], iss.URL)
 	}
 }
 
@@ -122,12 +86,12 @@ func TestClaim_InsertsMapRow(t *testing.T) {
 	var attempts int
 	if err := pool.QueryRow(ctx, `
 		SELECT pending_state, last_synced_state, attempts
-		FROM linear_issue_map WHERE linear_issue_id = $1`, iss.ID,
+		FROM ticket_issue_map WHERE issue_id = $1`, iss.ID,
 	).Scan(&pend, &last, &attempts); err != nil {
 		t.Fatalf("map row: %v", err)
 	}
-	if pend == nil || *pend != "In Progress" {
-		t.Errorf("pending_state = %v, want In Progress", pend)
+	if pend == nil || *pend != ColInProgress.String() {
+		t.Errorf("pending_state = %v, want %q", pend, ColInProgress.String())
 	}
 	if last != nil {
 		t.Errorf("last_synced_state = %v, want NULL on a fresh claim", last)
@@ -154,14 +118,14 @@ func TestClaim_Idempotent(t *testing.T) {
 	}
 
 	var tasks, maps int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE metadata->>'linear_issue_id' = $1`, iss.ID).Scan(&tasks); err != nil || tasks != 1 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE metadata->>'ticket_issue_id' = $1`, iss.ID).Scan(&tasks); err != nil || tasks != 1 {
 		t.Errorf("tasks rows for issue = %d (err=%v), want exactly 1", tasks, err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM linear_issue_map WHERE linear_issue_id = $1`, iss.ID).Scan(&maps); err != nil || maps != 1 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM ticket_issue_map WHERE issue_id = $1`, iss.ID).Scan(&maps); err != nil || maps != 1 {
 		t.Errorf("map rows for issue = %d (err=%v), want exactly 1", maps, err)
 	}
 	var pend string
-	if err := pool.QueryRow(ctx, `SELECT pending_state FROM linear_issue_map WHERE linear_issue_id = $1`, iss.ID).Scan(&pend); err != nil || pend != "In Progress" {
+	if err := pool.QueryRow(ctx, `SELECT pending_state FROM ticket_issue_map WHERE issue_id = $1`, iss.ID).Scan(&pend); err != nil || pend != ColInProgress.String() {
 		t.Errorf("map row changed on re-claim: pend=%q err=%v", pend, err)
 	}
 }
@@ -194,7 +158,7 @@ func TestClaim_SchedulerQueryMatches(t *testing.T) {
 		t.Fatalf("scheduler query did not match the claimed task: %v", err)
 	}
 	var want string
-	if err := pool.QueryRow(ctx, `SELECT id FROM tasks WHERE metadata->>'linear_issue_id' = $1`, iss.ID).Scan(&want); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT id FROM tasks WHERE metadata->>'ticket_issue_id' = $1`, iss.ID).Scan(&want); err != nil {
 		t.Fatalf("seeded task: %v", err)
 	}
 	if taskID != want {

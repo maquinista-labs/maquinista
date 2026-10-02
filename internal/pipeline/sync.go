@@ -1,10 +1,11 @@
 package pipeline
 
-// linearSync (ADR-0005): the mirror half of the bridge. Every tick derives
-// the target Linear column from tasks.status and pushes pending transitions
-// with exponential backoff. The bookkeeping is diff-based — pending_state is
-// the desired column, last_synced_state the last one successfully pushed —
-// so a missed tick or a Linear outage self-heals without losing transitions.
+// sync (ADR-0005/0006): the mirror half of the bridge. Every tick derives
+// the target canonical column from tasks.status and pushes pending
+// transitions with exponential backoff. The bookkeeping is diff-based —
+// pending_state is the desired canonical column, last_synced_state the last
+// one successfully pushed — so a missed tick or a provider outage self-heals
+// without losing transitions. Only canonical column names are ever stored.
 
 import (
 	"context"
@@ -17,22 +18,22 @@ import (
 
 const syncInterval = 10 * time.Second
 
-// DerivedState maps tasks.status → the MAQ Linear column it mirrors.
-// Unknown statuses return "" (skip). Future pipeline code (review loop,
-// EX-03+) writes explicit pending_state values — e.g. "Changes Requested" —
+// DerivedState maps tasks.status → the canonical column it mirrors. The bool
+// is false for unmapped statuses (skip). Future pipeline code (review loop,
+// EX-03+) writes explicit pending_state values — e.g. ColChangesRequested —
 // which take precedence over the derived value until synced.
-func DerivedState(status string) string {
+func DerivedState(status string) (Column, bool) {
 	switch status {
 	case "ready", "claimed":
-		return "In Progress"
+		return ColInProgress, true
 	case "review":
-		return "In Review"
+		return ColInReview, true
 	case "pending_approval", "failed":
-		return "Needs Human"
+		return ColNeedsHuman, true
 	case "done":
-		return "Done"
+		return ColDone, true
 	default:
-		return ""
+		return 0, false
 	}
 }
 
@@ -54,15 +55,15 @@ func backoffDelay(failures int) time.Duration {
 }
 
 // RunSync reconciles the map every syncInterval until ctx is cancelled.
-func RunSync(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, teamID string, interval time.Duration) error {
+func RunSync(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider, teamID string, interval time.Duration) error {
 	if interval <= 0 {
 		interval = syncInterval
 	}
-	log.Printf("pipeline: linearSync reconciling every %s (team %s)", interval, teamID)
+	log.Printf("pipeline: sync reconciling every %s (team %s)", interval, teamID)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
-		if n, err := ReconcileOnce(ctx, pool, client, teamID); err != nil {
+		if n, err := ReconcileOnce(ctx, pool, prov, teamID); err != nil {
 			log.Printf("pipeline: sync tick: %v", err)
 		} else if n > 0 {
 			log.Printf("pipeline: synced %d transition(s)", n)
@@ -79,11 +80,11 @@ func RunSync(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, teamID s
 // nothing unsynced is explicit, then push every due transition. Returns the
 // number of successful pushes; infra failures (reading rows) return an
 // error, per-row push failures are bookkept with backoff and logged.
-func ReconcileOnce(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, teamID string) (int, error) {
+func ReconcileOnce(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider, teamID string) (int, error) {
 	rows, err := pool.Query(ctx, `
-		SELECT m.linear_issue_id, COALESCE(m.pending_state, ''), COALESCE(m.last_synced_state, ''),
+		SELECT m.issue_id, COALESCE(m.pending_state, ''), COALESCE(m.last_synced_state, ''),
 		       m.attempts, m.next_attempt_at, t.status
-		FROM   linear_issue_map m
+		FROM   ticket_issue_map m
 		JOIN   tasks t ON t.id = m.task_id`)
 	if err != nil {
 		return 0, fmt.Errorf("pipeline: sync select: %w", err)
@@ -91,11 +92,12 @@ func ReconcileOnce(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, te
 	defer rows.Close()
 
 	type pushJob struct {
-		issueID, state string
-		attempts       int // failures seen before this push attempt
+		issueID  string
+		col      Column
+		attempts int // failures seen before this push attempt
 	}
 	var (
-		derivedUpdates [][2]string // issueID, derived state to write into pending_state
+		derivedUpdates [][2]string // issueID, derived canonical name → pending_state
 		pushes         []pushJob
 	)
 	for rows.Next() {
@@ -107,20 +109,28 @@ func ReconcileOnce(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, te
 		if err := rows.Scan(&issueID, &pend, &last, &attempts, &nextAttempt, &status); err != nil {
 			return 0, fmt.Errorf("pipeline: sync scan: %w", err)
 		}
-		want := pend
+		var wantCol Column
 		if pend == "" || pend == last {
 			// Nothing unsynced is pending: the derived value may fill in.
-			d := DerivedState(status)
-			if d == "" || d == last {
+			d, ok := DerivedState(status)
+			if !ok || d.String() == last {
 				continue // unmapped status, or already mirrored
 			}
-			want = d
-			derivedUpdates = append(derivedUpdates, [2]string{issueID, d})
+			wantCol = d
+			derivedUpdates = append(derivedUpdates, [2]string{issueID, d.String()})
+		} else {
+			// Explicit pending wins. A stored value that is not a canonical
+			// column name cannot be pushed — leave the row untouched.
+			c, ok := columnFromName(pend)
+			if !ok {
+				continue
+			}
+			wantCol = c
 		}
-		if want == last || time.Now().Before(nextAttempt) {
+		if wantCol.String() == last || time.Now().Before(nextAttempt) {
 			continue
 		}
-		pushes = append(pushes, pushJob{issueID: issueID, state: want, attempts: attempts})
+		pushes = append(pushes, pushJob{issueID: issueID, col: wantCol, attempts: attempts})
 	}
 	if err := rows.Err(); err != nil {
 		return 0, fmt.Errorf("pipeline: sync rows: %w", err)
@@ -129,8 +139,8 @@ func ReconcileOnce(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, te
 
 	for _, u := range derivedUpdates {
 		if _, err := pool.Exec(ctx, `
-			UPDATE linear_issue_map SET pending_state = $2, updated_at = NOW()
-			WHERE linear_issue_id = $1`, u[0], u[1]); err != nil {
+			UPDATE ticket_issue_map SET pending_state = $2, updated_at = NOW()
+			WHERE issue_id = $1`, u[0], u[1]); err != nil {
 			return 0, fmt.Errorf("pipeline: sync derived update: %w", err)
 		}
 	}
@@ -138,38 +148,38 @@ func ReconcileOnce(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, te
 		return 0, nil
 	}
 
-	states, err := client.WorkflowStates(ctx, teamID)
+	cols, err := prov.Columns(ctx, teamID)
 	if err != nil {
-		return 0, fmt.Errorf("pipeline: sync workflow states: %w", err)
+		return 0, fmt.Errorf("pipeline: sync provider columns: %w", err)
 	}
 
 	pushed := 0
 	for _, p := range pushes {
-		stateID, ok := states[p.state]
+		colID, ok := cols[p.col]
 		if !ok {
-			// Operator renamed/removed the column; treat as a failure so the
-			// row backs off instead of hot-looping.
-			log.Printf("pipeline: sync %s: state %q not found on team", p.issueID, p.state)
-			stateID = ""
-		} else if _, err := client.UpdateIssueState(ctx, p.issueID, stateID); err != nil {
-			log.Printf("pipeline: sync %s: push %q: %v", p.issueID, p.state, err)
-			stateID = ""
+			// The board lost this canonical column (renamed/removed); treat
+			// as a failure so the row backs off instead of hot-looping.
+			log.Printf("pipeline: sync %s: column %q not mapped by provider", p.issueID, p.col.String())
+			colID = ""
+		} else if err := prov.SetIssueColumn(ctx, p.issueID, colID); err != nil {
+			log.Printf("pipeline: sync %s: push %q: %v", p.issueID, p.col.String(), err)
+			colID = ""
 		}
-		if stateID == "" {
+		if colID == "" {
 			if _, err := pool.Exec(ctx, `
-				UPDATE linear_issue_map
+				UPDATE ticket_issue_map
 				SET    attempts = attempts + 1,
 				       next_attempt_at = NOW() + make_interval(secs => $2)
-				WHERE  linear_issue_id = $1`, p.issueID, backoffDelay(p.attempts+1).Seconds()); err != nil {
+				WHERE  issue_id = $1`, p.issueID, backoffDelay(p.attempts+1).Seconds()); err != nil {
 				return pushed, fmt.Errorf("pipeline: sync backoff update: %w", err)
 			}
 			continue
 		}
 		if _, err := pool.Exec(ctx, `
-			UPDATE linear_issue_map
+			UPDATE ticket_issue_map
 			SET    last_synced_state = $2, attempts = 0, next_attempt_at = NOW(),
 			       synced_at = NOW(), updated_at = NOW()
-			WHERE  linear_issue_id = $1`, p.issueID, p.state); err != nil {
+			WHERE  issue_id = $1`, p.issueID, p.col.String()); err != nil {
 			return pushed, fmt.Errorf("pipeline: sync success update: %w", err)
 		}
 		pushed++

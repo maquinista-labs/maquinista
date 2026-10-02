@@ -1,9 +1,10 @@
 package pipeline
 
-// Intake half of the linear-bridge (ADR-0005): Linear MAQ Todo issues
-// (label "pipeline") become maquinista task rows the task-scheduler can
-// claim. The linear_issue_map INSERT is the single-owner claim; workers
-// spawned for these rows are EX-02 scope and never talk to Linear.
+// Intake half of the ticket bridge (ADR-0005/0006): ticket-system issues in
+// the intake queue become maquinista task rows the task-scheduler can claim.
+// The ticket_issue_map INSERT is the single-owner claim; workers spawned for
+// these rows are EX-02 scope and never talk to the ticket system. All
+// provider specifics live behind TicketProvider.
 
 import (
 	"context"
@@ -16,8 +17,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// BridgeConfig is the operator env contract for the bridge (plan Landing).
-type BridgeConfig struct {
+// TicketsConfig is the operator env contract for the bridge (ADR-0006).
+type TicketsConfig struct {
+	Provider string
 	APIKey   string
 	TeamID   string
 	Project  string
@@ -26,23 +28,26 @@ type BridgeConfig struct {
 
 // Enabled reports whether the bridge should run: both the credential and the
 // team are required. Anything else is a logged no-op at startup.
-func (c BridgeConfig) Enabled() bool { return c.APIKey != "" && c.TeamID != "" }
+func (c TicketsConfig) Enabled() bool { return c.APIKey != "" && c.TeamID != "" }
 
-// FromEnv reads the env contract. LINEAR_API_KEY is Linear's documented
-// credential name (unprefixed on purpose — the same name other Linear
-// tooling on the operator's boxes already reads); the maquinista knobs are
-// MAQUINISTA_-prefixed to avoid collisions.
-func FromEnv() BridgeConfig {
-	cfg := BridgeConfig{
-		APIKey:  os.Getenv("LINEAR_API_KEY"),
-		TeamID:  os.Getenv("MAQUINISTA_LINEAR_TEAM_ID"),
-		Project: os.Getenv("MAQUINISTA_LINEAR_PROJECT"),
+// FromEnv reads the env contract. The MAQUINISTA_TICKETS_* namespace is
+// provider-neutral; the provider itself resolves its own credential
+// fallbacks (the Linear provider additionally honors LINEAR_API_KEY).
+func FromEnv() TicketsConfig {
+	cfg := TicketsConfig{
+		Provider: os.Getenv("MAQUINISTA_TICKETS_PROVIDER"),
+		APIKey:   os.Getenv("MAQUINISTA_TICKETS_API_KEY"),
+		TeamID:   os.Getenv("MAQUINISTA_TICKETS_TEAM_ID"),
+		Project:  os.Getenv("MAQUINISTA_TICKETS_PROJECT"),
+	}
+	if cfg.Provider == "" {
+		cfg.Provider = "linear"
 	}
 	if cfg.Project == "" {
 		cfg.Project = os.Getenv("MAQUINISTA_PROJECT")
 	}
 	cfg.Interval = 60 * time.Second // ADR-0005 intake bound
-	if v := os.Getenv("MAQUINISTA_LINEAR_POLL"); v != "" {
+	if v := os.Getenv("MAQUINISTA_TICKETS_POLL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			cfg.Interval = d
 		}
@@ -51,9 +56,9 @@ func FromEnv() BridgeConfig {
 }
 
 // ClaimIssue inserts, in one transaction, the task row (status "ready") and
-// the linear_issue_map row (pending_state "In Progress"). The map row's PK
-// makes the INSERT the claim: a conflict rolls the whole transaction back
-// and reports created=false.
+// the ticket_issue_map row (pending_state canonical "In Progress"). The map
+// row's PK makes the INSERT the claim: a conflict rolls the whole
+// transaction back and reports created=false.
 func ClaimIssue(ctx context.Context, pool *pgxpool.Pool, iss Issue, teamID, project string) (bool, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -65,16 +70,16 @@ func ClaimIssue(ctx context.Context, pool *pgxpool.Pool, iss Issue, teamID, proj
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO tasks (id, title, body, status, project_id, metadata)
 		VALUES ($1, $2, $3, 'ready', $4, $5::jsonb)`,
-		taskID, fmt.Sprintf("[%s] %s", iss.Identifier, iss.Title), iss.Description, project,
-		fmt.Sprintf(`{"linear_issue_id":%q,"linear_url":%q}`, iss.ID, iss.URL),
+		taskID, fmt.Sprintf("[%s] %s", iss.Key, iss.Title), iss.Description, project,
+		fmt.Sprintf(`{"ticket_issue_id":%q,"ticket_url":%q}`, iss.ID, iss.URL),
 	); err != nil {
 		return false, fmt.Errorf("pipeline: insert task: %w", err)
 	}
 	tag, err := tx.Exec(ctx, `
-		INSERT INTO linear_issue_map (linear_issue_id, identifier, team_id, task_id, pending_state)
-		VALUES ($1, $2, $3, $4, 'In Progress')
-		ON CONFLICT (linear_issue_id) DO NOTHING`,
-		iss.ID, iss.Identifier, teamID, taskID,
+		INSERT INTO ticket_issue_map (issue_id, issue_key, team_id, task_id, pending_state)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (issue_id) DO NOTHING`,
+		iss.ID, iss.Key, teamID, taskID, ColInProgress.String(),
 	)
 	if err != nil {
 		return false, fmt.Errorf("pipeline: insert map row: %w", err)
@@ -88,18 +93,18 @@ func ClaimIssue(ctx context.Context, pool *pgxpool.Pool, iss Issue, teamID, proj
 	return true, nil
 }
 
-// RunBridge polls Linear on cfg.Interval and claims every unmapped Todo
-// issue. Tick errors are logged and the loop continues; the process ctx
-// cancels it.
-func RunBridge(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, cfg BridgeConfig) error {
+// RunBridge polls the ticket system on cfg.Interval and claims every
+// unmapped intake issue. Tick errors are logged and the loop continues; the
+// process ctx cancels it.
+func RunBridge(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider, cfg TicketsConfig) error {
 	if cfg.Interval <= 0 {
 		cfg.Interval = 60 * time.Second
 	}
-	log.Printf("pipeline: bridge polling team %s every %s (project %q)", cfg.TeamID, cfg.Interval, cfg.Project)
+	log.Printf("pipeline: bridge polling team %s every %s (project %q, provider %s)", cfg.TeamID, cfg.Interval, cfg.Project, cfg.Provider)
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
-		if err := claimReady(ctx, pool, client, cfg); err != nil {
+		if err := claimReady(ctx, pool, prov, cfg); err != nil {
 			log.Printf("pipeline: claim tick: %v", err)
 		}
 		select {
@@ -110,20 +115,20 @@ func RunBridge(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, cfg Br
 	}
 }
 
-// claimReady is one intake tick: fetch Todo issues, claim the unmapped ones.
-func claimReady(ctx context.Context, pool *pgxpool.Pool, client LinearAPI, cfg BridgeConfig) error {
-	issues, err := client.TodoIssues(ctx, cfg.TeamID)
+// claimReady is one intake tick: fetch intake issues, claim the unmapped ones.
+func claimReady(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider, cfg TicketsConfig) error {
+	issues, err := prov.IntakeIssues(ctx, cfg.TeamID)
 	if err != nil {
-		return fmt.Errorf("fetching todo issues: %w", err)
+		return fmt.Errorf("fetching intake issues: %w", err)
 	}
 	for _, iss := range issues {
 		created, err := ClaimIssue(ctx, pool, iss, cfg.TeamID, cfg.Project)
 		if err != nil {
-			log.Printf("pipeline: claim %s: %v", iss.Identifier, err)
+			log.Printf("pipeline: claim %s: %v", iss.Key, err)
 			continue
 		}
 		if created {
-			log.Printf("pipeline: claimed %s (%s)", iss.Identifier, iss.Title)
+			log.Printf("pipeline: claimed %s (%s)", iss.Key, iss.Title)
 		}
 	}
 	return nil

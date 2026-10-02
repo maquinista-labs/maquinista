@@ -457,22 +457,27 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		}()
 	}
 
-	// Linear bridge (ADR-0005): MAQ Todo issues labeled "pipeline" become
-	// task rows the task-scheduler claims; linearSync mirrors task state
-	// back to the board. No-op unless LINEAR_API_KEY + MAQUINISTA_LINEAR_TEAM_ID.
-	if pCfg := pipeline.FromEnv(); pCfg.Enabled() && pool != nil {
-		lc := pipeline.NewLinearClient(pCfg.APIKey)
-		go func() {
-			if err := pipeline.RunBridge(ctx, pool, lc, pCfg); err != nil && ctx.Err() == nil {
-				log.Printf("pipeline: bridge: %v", err)
-			}
-		}()
-		go func() {
-			if err := pipeline.RunSync(ctx, pool, lc, pCfg.TeamID, 10*time.Second); err != nil && ctx.Err() == nil {
-				log.Printf("pipeline: sync: %v", err)
-			}
-		}()
-		log.Println("pipeline: linear bridge started")
+	// Ticket bridge (ADR-0005/0006): ticket-system issues labeled "pipeline"
+	// become task rows the task-scheduler claims; sync mirrors task state
+	// back to the board. Provider-neutral — no-op unless
+	// MAQUINISTA_TICKETS_API_KEY + MAQUINISTA_TICKETS_TEAM_ID.
+	if tCfg := pipeline.FromEnv(); tCfg.Enabled() && pool != nil {
+		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
+		if perr != nil {
+			log.Printf("pipeline: %v", perr)
+		} else {
+			go func() {
+				if err := pipeline.RunBridge(ctx, pool, prov, tCfg); err != nil && ctx.Err() == nil {
+					log.Printf("pipeline: bridge: %v", err)
+				}
+			}()
+			go func() {
+				if err := pipeline.RunSync(ctx, pool, prov, tCfg.TeamID, 10*time.Second); err != nil && ctx.Err() == nil {
+					log.Printf("pipeline: sync: %v", err)
+				}
+			}()
+			log.Printf("pipeline: ticket bridge started (%s)", tCfg.Provider)
+		}
 	}
 
 	err = b.Run(ctx)
