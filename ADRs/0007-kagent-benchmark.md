@@ -111,7 +111,16 @@ No new table: predicates query existing rows. `task_events` is a NOTIFY channel
   tool-sharing solves multi-agent reuse we don't have yet.
 - **celld as a state layer:** Postgres SoR already eliminates the JSON-file bug class
   celld makes structurally impossible; noted as the escape hatch for DO-shaped
-  multi-writer state on our k3s (reader note 10-02), not adopted.
+  multi-writer state on our k3s (reader note 10-02), not adopted. Not a Postgres
+  replacement either (10-02, re-examined as S3/WAL-backed storage): celld is per-cell
+  SQLite + LTX to an object bucket — strong consistency ends at the cell boundary, so
+  the merge guards (approve-newer-than-request_changes, cross-episode) become
+  hand-rolled cross-cell ordering. Its own numbers put durable writes at ~90 ms
+  (bucket round-trip) vs ~1 ms local PG, and our code leans on PG as bus, not just
+  store (rg 10-02: LISTEN/NOTIFY 189/256 hits, ON CONFLICT 49, FOR UPDATE 16,
+  JSONB 73). A v0.6.1 beta under the SoR also contradicts ADR-0002's stability
+  rationale. Revisit trigger: multi-box active-active state beyond one substrate box,
+  or a new actor-shaped app (per-entity counters, hibernating bot state).
 - **Tensorlake fork-and-fan-out:** batch "fix X for all" scaling belongs to substrate
   scale-out (ADR-0004's Robot trigger), not the pipeline.
 - **Full Dogwood policy language:** three temporal predicates cover the pipeline's
