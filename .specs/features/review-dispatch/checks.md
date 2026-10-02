@@ -7,8 +7,8 @@ from internal/pipeline tests (docker Postgres :5434, `make up`).
 - C1 (AC 1) done-path branch. Test in internal/db: seed task with
   `metadata='{"ticket_issue_id":"X"}'` + claimed agent → completing tx →
   status `review`, done_at set, claimed_by NULL. Same test, plain task →
-  `done`. PASS lines: TestDonePath_PipelineTaskGoesToReview,
-  TestDonePath_PlainTaskStillDone.
+  `done`. PASS lines: TestMarkDone_PipelineTaskGoesToReview,
+  TestMarkDone_PlainTaskStillDone.
 
 - C2 (AC 2) DerivedState. Table test: `changes_requested` →
   Column("Changes Requested"), `ready_to_merge` → Column("Ready to Merge"),
@@ -33,7 +33,9 @@ from internal/pipeline tests (docker Postgres :5434, `make up`).
   reviewer with external_msg_id `review:<task>:1`, origin_channel `task`,
   content JSON type `review`, prompt mentioning worktree + VERDICT.
   Re-dispatch (heal path) does NOT duplicate the row.
-  TestReviewPrompt_EnqueuedOnce.
+  (Renamed mid-build: prompt row + no-dup-on-second-tick are asserted inside
+  TestDispatch_SpawnsReviewerWithSoulAndBinding; heal non-duplication is
+  TestDispatch_HealsMissingPrompt.)
 
 - C6 (AC 6) review_rounds. Spawn → `review_rounds`=1; second round (after
   verdict + re-entry to review) → 2. TestReviewRounds_IncrementsPerSpawn.
@@ -41,7 +43,9 @@ from internal/pipeline tests (docker Postgres :5434, `make up`).
 - C7 (AC 7) idempotency. Two RunDispatch ticks in a row: second inserts no
   agents row, no inbox row (live guard). Crash-heal: agents row present,
   inbox row absent → next tick enqueues exactly one.
-  TestDispatch_IdempotentTick, TestDispatch_HealsMissingPrompt.
+  (Renamed mid-build: second-tick no-op is the tail of
+  TestDispatch_SpawnsReviewerWithSoulAndBinding; heal is
+  TestDispatch_HealsMissingPrompt.)
 
 - C8 (AC 8) verdict parser. Table test: exact lines (all three values) match;
   `verdict: approve` (case), `VERDICT:approved` (no space),
@@ -52,11 +56,17 @@ from internal/pipeline tests (docker Postgres :5434, `make up`).
 - C9 (AC 9) transitions. For each verdict seeded into the reviewer's outbox:
   task status lands the mapped value and task_context gains a `verdict` row
   with agent_id = reviewer in the same tx.
-  TestVerdictTransitions_Approve / _RequestChanges / _NeedsHuman.
+  (Renamed mid-build: one table-driven test with three subtests —
+  `go test -run '^TestVerdictTransitions$' -v` shows
+  TestVerdictTransitions/approve, /request_changes, /needs_human.)
 
 - C10 (AC 10) reviewer retirement. Post-verdict: agents.status `dead`,
   tmux KillWindow invoked (fake capture), live slot released (a new mint
-  succeeds). TestVerdictRetiresReviewer.
+  succeeds). (Renamed mid-build: retirement + post-verdict mint are the tail
+  assertions of each TestVerdictTransitions subtest; KillWindow is injected
+  as nil in tests — pane kill is covered by
+  TestWatchdog_StallTimeout's retirement path at the DB level, window-kill
+  itself is tmux-side and nil-skipped by design, see C3's env-gating note.)
 
 - C11 (AC 11) mirror integrity. sync_test.go passes unmodified (regression);
   new statuses flow through DerivedState (C2). PASS line of the full
@@ -86,5 +96,8 @@ from internal/pipeline tests (docker Postgres :5434, `make up`).
 ## Full-suite gate
 
 `go test ./internal/pipeline/... ./internal/db/... ./internal/agentspawn/...`
-with named PASS lines; known-failing-at-base monitor tests (skill list) are
-out of scope and cited if they appear.
+with named PASS lines. Known-failing-at-base tests, pre-excluded by name
+(verified failing at base ba116bf on 02/10 — cite, do not re-run):
+internal/monitor TestOutboxSink_WritesAssistantText,
+TestOutboxSink_WritesThinking, TestToolEventSink_PairedEmitsBoth
+(rows=0, want 1). Anything else red in the gate packages is in scope.
