@@ -57,7 +57,7 @@ func TestVerdict_NotifyPerOutcome(t *testing.T) {
 		bumpRounds    bool
 		wantSubstr    []string
 	}{
-		{"approve", VerdictApprove, false, []string{"✅", "approved (review round 0)", "ready_to_merge", "maquinista approve tv"}},
+		{"approve", VerdictApprove, false, []string{"✅", "approved (review round 0)", "ready_to_merge", "reply `approve tv-appro`", "comment `approve` on the ticket issue"}},
 		{"request-changes", VerdictRequestChanges, false, []string{"🔁", "request_changes (review round 0)", "fixer spawning"}},
 		{"needs-human", VerdictNeedsHuman, false, []string{"🆘", "needs-human", "maquinista approve tv", "maquinista reject tv"}},
 		{"round-cap", VerdictRequestChanges, true, []string{"🆘", "review round cap 3 reached", "parked needs-human"}},

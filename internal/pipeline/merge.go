@@ -414,8 +414,8 @@ func failMerge(ctx context.Context, pool *pgxpool.Pool, entryID int64, taskID, m
 	if err := db.FailMerge(pool, entryID, msg); err != nil {
 		return fmt.Errorf("pipeline: failing merge %d: %w", entryID, err)
 	}
-	notifyf(ctx, pool, "⚠️ %s: merge failed — %s. The queue entry is failed; `maquinista approve %s` re-enqueues the merge.%s",
-		taskTitle(ctx, pool, taskID), msg, taskID, prLinkSuffix(ctx, pool, taskID))
+	notifyf(ctx, pool, "⚠️ %s: merge failed — %s. The queue entry is failed; reply `approve %s` here (or comment `approve` on the ticket issue) to re-enqueue the merge.%s",
+		taskTitle(ctx, pool, taskID), msg, shortTaskID(taskID), prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s failed: %s", taskID, msg)
 	return nil
 }

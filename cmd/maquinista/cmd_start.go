@@ -17,6 +17,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/dispatcher"
+	"github.com/maquinista-labs/maquinista/internal/gh"
 	"github.com/maquinista-labs/maquinista/internal/inboxecho"
 	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/listener"
@@ -476,6 +477,27 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			pool = p
 		}
 	}
+	if pool != nil {
+		// MAQ-11 approve verbs: Telegram /approve + Pipeline-topic
+		// `approve <ref>` route into the shared pipeline.ApproveRef arm
+		// (gh-mode merge on ready_to_merge; no-op otherwise). The provider
+		// is optional — a failed NewProvider only degrades board sync.
+		aCfg := pipeline.FromEnv()
+		aProv, aErr := pipeline.NewProvider(aCfg.Provider, aCfg.APIKey)
+		if aErr != nil {
+			aProv = nil
+		}
+		b.SetApproveFunc(func(ctx context.Context, taskRef, actor string) (bool, string, error) {
+			mCfg := pipeline.MergeConfigFromEnv()
+			mCfg.Gh = gh.New()
+			out, err := pipeline.ApproveRef(ctx, pool, mCfg, aProv, aCfg.TeamID, taskRef,
+				fmt.Sprintf("approved via Telegram by %s", actor))
+			if err != nil {
+				return false, "", err
+			}
+			return out.Ran, out.Status, nil
+		})
+	}
 	if tCfg := pipeline.FromEnv(); tCfg.Enabled() && pool != nil {
 		// Review dispatch (EX-03): spawn zero-author reviewers for pipeline
 		// tasks in 'review', parse verdicts, transition tasks. Needs no
@@ -508,6 +530,23 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			go func() {
 				if err := pipeline.RunSync(ctx, pool, prov, tCfg.TeamID, 10*time.Second); err != nil && ctx.Err() == nil {
 					log.Printf("pipeline: sync: %v", err)
+				}
+			}()
+			// Comment approvals (MAQ-11): ticket-system `approve` comments on
+			// ready_to_merge tasks run the merge — same 10 s pass family as
+			// sync, exactly-once via ticket_comment_log.
+			go func() {
+				ca := pipeline.CommentApprover{
+					Approvers: tCfg.Approvers,
+					Approve: func(ctx context.Context, taskID, actor string) (*pipeline.ApproveOutcome, error) {
+						mCfg := pipeline.MergeConfigFromEnv()
+						mCfg.Gh = gh.New()
+						return pipeline.ApproveRef(ctx, pool, mCfg, prov, tCfg.TeamID, taskID,
+							fmt.Sprintf("approved via ticket comment by %s", actor))
+					},
+				}
+				if err := pipeline.RunCommentApprovals(ctx, pool, prov, tCfg.TeamID, 10*time.Second, ca); err != nil && ctx.Err() == nil {
+					log.Printf("pipeline: comment approvals: %v", err)
 				}
 			}()
 			log.Printf("pipeline: ticket bridge started (%s)", tCfg.Provider)

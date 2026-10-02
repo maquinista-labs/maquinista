@@ -45,6 +45,9 @@ All consumers use `LISTEN` + a poll fallback (10 s) so a missed `NOTIFY`
 | `agent_workspaces` | Per-agent git worktrees / workspace records |
 | `conversations` | Multi-turn conversation threads (A2A + human) |
 | `tasks` | Orchestrator task graph |
+| `ticket_issue_map` | Ticket issue ↔ task mirror; the row is the bridge claim |
+| `ticket_comment_log` | Consumed ticket-comment ids (comment-verb exactly-once) |
+| `merge_queue` | One row per merge attempt (pending → merging → merged\|conflict\|failed) |
 | `job_registry` | Scheduled jobs (cron + hooks) |
 | `soul_templates` | Reusable soul templates |
 

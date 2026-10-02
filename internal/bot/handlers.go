@@ -29,6 +29,13 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 	if b.handlePendingInput(msg) {
 		return
 	}
+	// Pipeline-topic comment verbs (MAQ-11): a bare `approve <ref>` in the
+	// Pipeline topic runs the merge-approve path. Must sit after the wizard
+	// input handlers and before the routing ladder — the synthetic pipeline
+	// agent has no sidecar, so the ladder would strand the message.
+	if b.handlePipelineApproveText(msg) {
+		return
+	}
 
 	cancelBashCapture(msg.From.ID, getThreadID(msg))
 

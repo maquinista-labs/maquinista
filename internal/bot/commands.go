@@ -106,6 +106,8 @@ func (b *Bot) handleCommand(msg *tgbotapi.Message) {
 		b.handleDashboardStop(msg)
 	case "dashboard_user":
 		b.handleDashboardUser(msg)
+	case "approve":
+		b.handleApproveCommand(msg)
 	default:
 		b.reply(msg.Chat.ID, getThreadID(msg), "Unknown command: /"+msg.Command())
 	}
