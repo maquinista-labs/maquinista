@@ -207,10 +207,13 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	}
 	pr, err := prFromPullURL(info.PRURL)
 	if err != nil {
-		return err
+		// Bad/unset PR URL: the work is done but the merge machinery
+		// cannot run — record failed so the queue shows it instead of
+		// wedging the entry in 'merging'.
+		return failMerge(pool, entry.ID, taskID, fmt.Sprintf("cannot resolve PR: %v", err))
 	}
 	if info.WorktreePath == "" {
-		return fmt.Errorf("pipeline: task %s has no worktree to merge from", taskID)
+		return failMerge(pool, entry.ID, taskID, "task has no worktree to merge from")
 	}
 	wt := info.WorktreePath
 
@@ -264,8 +267,12 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	}
 
 	// 5. Record the squash commit SHA (the merged tip of the default branch).
-	git.Fetch(wt, "origin") // best-effort; SHA comes back empty on failure
-	mergeSHA, _ := git.RevParse(wt, "origin/"+base)
+	mergeSHA := ""
+	if err := git.Fetch(wt, "origin"); err != nil {
+		log.Printf("pipeline: merge %s post-merge fetch failed, no SHA recorded: %v", taskID, err)
+	} else if sha, err := git.RevParse(wt, "origin/"+base); err == nil {
+		mergeSHA = sha
+	}
 
 	if err := db.CompleteMerge(pool, entry.ID, mergeSHA); err != nil {
 		return fmt.Errorf("pipeline: completing merge %d: %w", entry.ID, err)
