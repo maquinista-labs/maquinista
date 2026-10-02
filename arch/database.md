@@ -34,7 +34,7 @@ All consumers use `LISTEN` + a poll fallback (10 s) so a missed `NOTIFY`
 
 | Table | Purpose |
 |-------|---------|
-| `agents` | One row per agent; status, tmux_window, runner_type, workspace |
+| `agents` | One row per agent; status, tmux_window, runner_type, workspace, last_transcript_at (liveness, MAQ-9) |
 | `agent_souls` | Per-agent identity / system prompt fields |
 | `soul_templates` | Reusable soul blueprints |
 | `agent_memory` | Key/value memory blocks appended to soul render |

@@ -325,6 +325,30 @@ func TestFixerWatchdog_StallParks(t *testing.T) {
 	t.Log("PASS TestFixerWatchdog_StallParks")
 }
 
+// TestFixerWatchdog_TranscriptGrowthKeepsAlive pins the MAQ-9 liveness
+// signal on the fixer arm: a fixer past the age guard, zero outbox rows,
+// but with transcript growth inside the stall window (mid-command tool
+// events) is healthy — untouched. The stallFilter is shared by both arms;
+// this keeps the fixer side pinned in case the arms ever split.
+func TestFixerWatchdog_TranscriptGrowthKeepsAlive(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedFixEpisode(t, pool, "fb", "uuid-fb", "/tmp/wt-fb", 1)
+	seedFixer(t, pool, "fixer-fb", "fb")
+	execOK(t, pool, `
+		UPDATE agents SET started_at = NOW() - interval '31 minutes',
+		                   last_transcript_at = NOW() - interval '5 minutes'
+		WHERE id='fixer-fb'`)
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	if got := taskCol(t, pool, "fb", "status"); got != "changes_requested" {
+		t.Fatalf("PASS-check: growing-transcript fix task = %q, want changes_requested (untouched)", got)
+	}
+	t.Log("PASS TestFixerWatchdog_TranscriptGrowthKeepsAlive")
+}
+
 func TestFixerWatchdog_InsideTimeoutUntouched(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
