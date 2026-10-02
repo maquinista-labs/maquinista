@@ -462,6 +462,13 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	// back to the board. Provider-neutral — no-op unless
 	// MAQUINISTA_TICKETS_API_KEY + MAQUINISTA_TICKETS_TEAM_ID.
 	if tCfg := pipeline.FromEnv(); tCfg.Enabled() && pool != nil {
+		// Review dispatch (EX-03): spawn zero-author reviewers for pipeline
+		// tasks in 'review', parse verdicts, transition tasks. Needs no
+		// provider — runs even if NewProvider fails below.
+		go func() {
+			spawner := pipelineReviewerSpawner{pool: pool, cfg: cfg, sidecars: sidecarMgr}
+			pipeline.RunDispatch(ctx, pool, pipeline.DispatchConfigFromEnv(cfg.TmuxSessionName), spawner, tmux.KillWindow)
+		}()
 		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
 		if perr != nil {
 			log.Printf("pipeline: %v", perr)

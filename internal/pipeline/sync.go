@@ -19,17 +19,23 @@ import (
 const syncInterval = 10 * time.Second
 
 // DerivedState maps tasks.status → the canonical column it mirrors. The bool
-// is false for unmapped statuses (skip). Future pipeline code (review loop,
-// EX-03+) writes explicit pending_state values — e.g. ColChangesRequested —
-// which take precedence over the derived value until synced.
+// is false for unmapped statuses (skip). Review-loop statuses (EX-03) derive
+// directly: `changes_requested` and `ready_to_merge` are written by the
+// dispatch loop's verdict transitions, `review` by the done-path branch. An
+// operator's explicit pending_state (set via the map row) still wins over
+// every derived value until synced.
 func DerivedState(status string) (Column, bool) {
 	switch status {
 	case "ready", "claimed":
 		return ColInProgress, true
 	case "review":
 		return ColInReview, true
+	case "changes_requested":
+		return ColChangesRequested, true
 	case "pending_approval", "failed":
 		return ColNeedsHuman, true
+	case "ready_to_merge":
+		return ColReadyToMerge, true
 	case "done":
 		return ColDone, true
 	default:

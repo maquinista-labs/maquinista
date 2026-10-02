@@ -22,6 +22,7 @@ const (
 	ColInReview
 	ColChangesRequested
 	ColNeedsHuman
+	ColReadyToMerge
 	ColDone
 )
 
@@ -37,6 +38,8 @@ func (c Column) String() string {
 		return "Changes Requested"
 	case ColNeedsHuman:
 		return "Needs Human"
+	case ColReadyToMerge:
+		return "Ready to Merge"
 	case ColDone:
 		return "Done"
 	default:
