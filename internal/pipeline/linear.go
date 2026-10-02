@@ -180,6 +180,21 @@ func (c *LinearClient) UpdateIssueState(ctx context.Context, issueID, stateID st
 	return out.IssueUpdate.Issue.State.Name, nil
 }
 
+// CommentOnIssue posts a comment on the issue. Used by AddIssueLink: a
+// comment is one atomic write (no read-modify-write of the description),
+// which keeps the sync loop's exactly-once bookkeeping honest.
+func (c *LinearClient) CommentOnIssue(ctx context.Context, issueID, body string) error {
+	var out struct {
+		CommentCreate struct {
+			Success bool `json:"success"`
+		} `json:"commentCreate"`
+	}
+	doc := `mutation($i: String!, $b: String!) {
+	  commentCreate(input: { issueId: $i, body: $b }) { success }
+	}`
+	return c.gql(ctx, doc, map[string]any{"i": issueID, "b": body}, &out)
+}
+
 // linearProvider implements TicketProvider over the Linear API.
 type linearProvider struct {
 	client *LinearClient
@@ -228,4 +243,10 @@ func (p *linearProvider) Columns(ctx context.Context, teamID string) (map[Column
 func (p *linearProvider) SetIssueColumn(ctx context.Context, issueID, columnID string) error {
 	_, err := p.client.UpdateIssueState(ctx, issueID, columnID)
 	return err
+}
+
+// AddIssueLink implements TicketProvider: the PR link lands as a comment —
+// one atomic write per call, deduped upstream by pr_url_synced.
+func (p *linearProvider) AddIssueLink(ctx context.Context, issueID, url string) error {
+	return p.client.CommentOnIssue(ctx, issueID, "🔗 PR: "+url)
 }

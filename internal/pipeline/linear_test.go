@@ -165,3 +165,37 @@ func TestLinearProvider_KeyFallback(t *testing.T) {
 		t.Errorf("explicit key overridden, want MAQUINISTA_TICKETS_API_KEY to win")
 	}
 }
+
+func TestLinearProvider_CommentOnIssue(t *testing.T) {
+	var cap captured
+	c := stubLinear(t, http.StatusOK, `{"data": {"commentCreate": {"success": true}}}`, &cap)
+	if err := c.CommentOnIssue(context.Background(), "u1", "🔗 PR: https://github.com/x/y/pull/1"); err != nil {
+		t.Fatalf("CommentOnIssue: %v", err)
+	}
+	for _, want := range []string{`$i: String!`, `$b: String!`, "commentCreate", "issueId", "body"} {
+		if !strings.Contains(cap.query, want) {
+			t.Errorf("mutation missing %s in: %s", want, cap.query)
+		}
+	}
+	if cap.vars["i"] != "u1" {
+		t.Errorf("issue variable = %v, want u1", cap.vars["i"])
+	}
+	if b, _ := cap.vars["b"].(string); !strings.Contains(b, "pull/1") {
+		t.Errorf("body variable = %q, want the PR link", b)
+	}
+}
+
+// TestLinearProvider_AddIssueLink pins the comment shape the sync loop
+// writes: a single line carrying the raw URL (clickable on mobile).
+func TestLinearProvider_AddIssueLink(t *testing.T) {
+	var cap captured
+	c := stubLinear(t, http.StatusOK, `{"data": {"commentCreate": {"success": true}}}`, &cap)
+	p := &linearProvider{client: c}
+	const url = "https://github.com/maquinista-labs/maquinista/pull/42"
+	if err := p.AddIssueLink(context.Background(), "u1", url); err != nil {
+		t.Fatalf("AddIssueLink: %v", err)
+	}
+	if b, _ := cap.vars["b"].(string); !strings.Contains(b, url) {
+		t.Errorf("comment body = %q, want it to contain %q", b, url)
+	}
+}

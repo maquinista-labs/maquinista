@@ -59,6 +59,10 @@ func (f *fakeProvider) SetIssueColumn(ctx context.Context, issueID, columnID str
 	return nil
 }
 
+func (f *fakeProvider) AddIssueLink(ctx context.Context, issueID, url string) error {
+	return nil
+}
+
 // ---- git harness ----
 
 func gitRun(t *testing.T, dir string, args ...string) string {
@@ -171,6 +175,12 @@ func observationCount(t *testing.T, pool *pgxpool.Pool, taskID, agentID string) 
 // ---- config ----
 
 func TestMergeConfigFromEnv(t *testing.T) {
+	// Hermetic defaults: the operator's shell may export PIPELINE_* (this
+	// pane runs with MERGE_MODE=gh + AUTO_MERGE=1), so pin the ambient
+	// knobs to their unset spellings before asserting defaults.
+	t.Setenv("PIPELINE_MERGE_MODE", "")
+	t.Setenv("PIPELINE_AUTO_MERGE", "")
+	t.Setenv("MAQUINISTA_MERGE_ATTEMPTS_MAX", "")
 	cfg := MergeConfigFromEnv()
 	if cfg.Mode != MergeModeLocal {
 		t.Errorf("default mode = %q, want local", cfg.Mode)

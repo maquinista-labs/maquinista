@@ -46,6 +46,11 @@ type updCall struct {
 	issueID, columnID string
 }
 
+// linkCall records one AddIssueLink invocation.
+type linkCall struct {
+	issueID, url string
+}
+
 // fakeTickets is the in-memory TicketProvider used by bridge and sync tests.
 type fakeTickets struct {
 	todo    []Issue
@@ -54,6 +59,8 @@ type fakeTickets struct {
 	colsErr error
 	updates []updCall
 	updErr  error
+	links   []linkCall
+	linkErr error
 }
 
 func (f *fakeTickets) IntakeIssues(ctx context.Context, teamID string) ([]Issue, error) {
@@ -67,6 +74,11 @@ func (f *fakeTickets) Columns(ctx context.Context, teamID string) (map[Column]st
 func (f *fakeTickets) SetIssueColumn(ctx context.Context, issueID, columnID string) error {
 	f.updates = append(f.updates, updCall{issueID: issueID, columnID: columnID})
 	return f.updErr
+}
+
+func (f *fakeTickets) AddIssueLink(ctx context.Context, issueID, url string) error {
+	f.links = append(f.links, linkCall{issueID: issueID, url: url})
+	return f.linkErr
 }
 
 // fullCols is the canonical → provider-id map a working board returns.

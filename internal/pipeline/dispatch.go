@@ -674,7 +674,9 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration
 		}
 		if applied {
 			log.Printf("pipeline: dispatch: watchdog retired stalled reviewer %s on %s → needs_human", r.agentID, r.taskID)
-			notifyf(ctx, pool, "🆘 %s: %s", r.taskTitle, fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout))
+			notifyf(ctx, pool, "🆘 %s: %s%s", r.taskTitle,
+				fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout),
+				prLinkSuffix(ctx, pool, r.taskID))
 			killReviewerPane(sessionName, r.session, r.window, killWindow)
 		}
 	}
@@ -691,7 +693,9 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration
 		}
 		if applied {
 			log.Printf("pipeline: dispatch: watchdog retired stalled fixer %s on %s → needs_human", r.agentID, r.taskID)
-			notifyf(ctx, pool, "🆘 %s: %s", r.taskTitle, fmt.Sprintf("watchdog: fix stalled past %s — needs human", timeout))
+			notifyf(ctx, pool, "🆘 %s: %s%s", r.taskTitle,
+				fmt.Sprintf("watchdog: fix stalled past %s — needs human", timeout),
+				prLinkSuffix(ctx, pool, r.taskID))
 			killReviewerPane(sessionName, r.session, r.window, killWindow)
 		}
 	}
