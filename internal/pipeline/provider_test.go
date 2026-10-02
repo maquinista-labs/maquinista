@@ -30,7 +30,6 @@ func TestColumn_String(t *testing.T) {
 }
 
 func TestNewProvider(t *testing.T) {
-	t.Setenv("LINEAR_API_KEY", "") // unset: no legacy fallback in play
 	for _, name := range []string{"linear", ""} {
 		p, err := NewProvider(name, "k")
 		if err != nil || p == nil {

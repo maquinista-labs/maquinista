@@ -32,7 +32,7 @@ func (c TicketsConfig) Enabled() bool { return c.APIKey != "" && c.TeamID != "" 
 
 // FromEnv reads the env contract. The MAQUINISTA_TICKETS_* namespace is
 // provider-neutral; the provider itself resolves its own credential
-// fallbacks (the Linear provider additionally honors LINEAR_API_KEY).
+// fallbacks (the Linear provider additionally honors the legacy Linear env key).
 func FromEnv() TicketsConfig {
 	cfg := TicketsConfig{
 		Provider: os.Getenv("MAQUINISTA_TICKETS_PROVIDER"),
