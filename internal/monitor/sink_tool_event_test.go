@@ -113,12 +113,12 @@ func TestToolEventSink_NotifiesToolResult(t *testing.T) {
 	}
 }
 
-func TestToolEventSink_PairedEmitsBoth(t *testing.T) {
+func TestToolEventSink_PairedEmitsResultOnly(t *testing.T) {
 	s := setupToolEventSink(t)
 
 	done := make(chan []map[string]any, 1)
 	go func() {
-		done <- collectNotifications(t, s, 2, 5*time.Second)
+		done <- collectNotifications(t, s, 1, 5*time.Second)
 	}()
 	time.Sleep(50 * time.Millisecond)
 
@@ -127,18 +127,25 @@ func TestToolEventSink_PairedEmitsBoth(t *testing.T) {
 		AgentID:   "win-1",
 		ToolName:  "bash",
 		ToolUseID: "toolu_03",
+		ToolInput: "ls -la",
+		Text:      "total 0",
 		ChatID:    0,
 	})
 
 	notifs := <-done
-	if len(notifs) != 2 {
-		t.Fatalf("got %d notifications, want 2 (tool_use then tool_result)", len(notifs))
+	// Paired events emit ONLY tool_result (tool_input included): a separate
+	// tool_use would duplicate the live entry emitted in the prior cycle.
+	if len(notifs) != 1 {
+		t.Fatalf("got %d notifications, want 1 (tool_result only)", len(notifs))
 	}
-	if notifs[0]["type"] != "tool_use" {
-		t.Errorf("first notification type = %v, want tool_use", notifs[0]["type"])
+	if notifs[0]["type"] != "tool_result" {
+		t.Errorf("notification type = %v, want tool_result", notifs[0]["type"])
 	}
-	if notifs[1]["type"] != "tool_result" {
-		t.Errorf("second notification type = %v, want tool_result", notifs[1]["type"])
+	if notifs[0]["tool_input"] != "ls -la" {
+		t.Errorf("tool_input = %v, want ls -la", notifs[0]["tool_input"])
+	}
+	if notifs[0]["text"] != "total 0" {
+		t.Errorf("text = %v, want total 0", notifs[0]["text"])
 	}
 }
 

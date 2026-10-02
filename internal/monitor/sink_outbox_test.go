@@ -28,12 +28,16 @@ func TestOutboxSink_WritesAssistantText(t *testing.T) {
 	s := setupOutboxSink(t)
 
 	s.Handle(AgentEvent{
-		Kind:    AgentEventText,
-		AgentID: "win-1",
-		Role:    "assistant",
-		Text:    "hello world",
-		ChatID:  0, // DB-only pass
+		Kind:     AgentEventText,
+		AgentID:  "win-1",
+		WindowID: "win-1",
+		Role:     "assistant",
+		Text:     "hello world",
+		ChatID:   0, // DB-only pass
 	})
+	// The sink buffers per window; the row is written by FlushSession,
+	// which the monitor loop calls after each session's pass-2 entries.
+	s.FlushSession("win-1")
 
 	var count int
 	s.pool.QueryRow(context.Background(),
@@ -60,12 +64,14 @@ func TestOutboxSink_SkipsWhenChatIDNonZero(t *testing.T) {
 	s := setupOutboxSink(t)
 
 	s.Handle(AgentEvent{
-		Kind:    AgentEventText,
-		AgentID: "win-1",
-		Role:    "assistant",
-		Text:    "should be skipped",
-		ChatID:  5, // non-zero → skip
+		Kind:     AgentEventText,
+		AgentID:  "win-1",
+		WindowID: "win-1",
+		Role:     "assistant",
+		Text:     "should be skipped",
+		ChatID:   5, // non-zero → skip
 	})
+	s.FlushSession("win-1")
 
 	var count int
 	s.pool.QueryRow(context.Background(),
@@ -79,12 +85,14 @@ func TestOutboxSink_SkipsNonAssistant(t *testing.T) {
 	s := setupOutboxSink(t)
 
 	s.Handle(AgentEvent{
-		Kind:    AgentEventText,
-		AgentID: "win-1",
-		Role:    "user", // not assistant
-		Text:    "hi",
-		ChatID:  0,
+		Kind:     AgentEventText,
+		AgentID:  "win-1",
+		WindowID: "win-1",
+		Role:     "user", // not assistant
+		Text:     "hi",
+		ChatID:   0,
 	})
+	s.FlushSession("win-1")
 
 	var count int
 	s.pool.QueryRow(context.Background(),
@@ -100,12 +108,14 @@ func TestOutboxSink_SkipsToolEvents(t *testing.T) {
 	s.Handle(AgentEvent{
 		Kind:      AgentEventToolUse,
 		AgentID:   "win-1",
+		WindowID:  "win-1",
 		Role:      "assistant",
 		Text:      "**bash**(ls)",
 		ToolName:  "bash",
 		ToolUseID: "toolu_01",
 		ChatID:    0,
 	})
+	s.FlushSession("win-1")
 
 	var count int
 	s.pool.QueryRow(context.Background(),
@@ -119,12 +129,14 @@ func TestOutboxSink_WritesThinking(t *testing.T) {
 	s := setupOutboxSink(t)
 
 	s.Handle(AgentEvent{
-		Kind:    AgentEventThinking,
-		AgentID: "win-1",
-		Role:    "assistant",
-		Text:    "pondering...",
-		ChatID:  0,
+		Kind:     AgentEventThinking,
+		AgentID:  "win-1",
+		WindowID: "win-1",
+		Role:     "assistant",
+		Text:     "pondering...",
+		ChatID:   0,
 	})
+	s.FlushSession("win-1")
 
 	var count int
 	s.pool.QueryRow(context.Background(),
@@ -138,12 +150,14 @@ func TestOutboxSink_SkipsEmptyAgentID(t *testing.T) {
 	s := setupOutboxSink(t)
 
 	s.Handle(AgentEvent{
-		Kind:    AgentEventText,
-		AgentID: "", // empty
-		Role:    "assistant",
-		Text:    "hi",
-		ChatID:  0,
+		Kind:     AgentEventText,
+		AgentID:  "", // empty
+		WindowID: "win-1",
+		Role:     "assistant",
+		Text:     "hi",
+		ChatID:   0,
 	})
+	s.FlushSession("win-1")
 
 	var count int
 	s.pool.QueryRow(context.Background(),
@@ -156,14 +170,16 @@ func TestOutboxSink_SkipsEmptyAgentID(t *testing.T) {
 func TestOutboxSink_SkipsUnknownAgent(t *testing.T) {
 	s := setupOutboxSink(t)
 
-	// "ghost" has no row in agents table — resolveAgentFromWindow returns "".
+	// "ghost" has no row in agents table — flush resolves no agent and skips.
 	s.Handle(AgentEvent{
-		Kind:    AgentEventText,
-		AgentID: "ghost",
-		Role:    "assistant",
-		Text:    "hi",
-		ChatID:  0,
+		Kind:     AgentEventText,
+		AgentID:  "ghost",
+		WindowID: "ghost",
+		Role:     "assistant",
+		Text:     "hi",
+		ChatID:   0,
 	})
+	s.FlushSession("ghost")
 
 	var count int
 	s.pool.QueryRow(context.Background(),
