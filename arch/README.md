@@ -17,7 +17,7 @@ sections are stubs waiting to be filled in once the plan lands.
 | [soul-and-identity.md](soul-and-identity.md) | Soul schema, rendering, memory blocks, identity across restarts |
 | [workspaces.md](workspaces.md) | Shared / agent / task scopes, git worktrees, workspace switching |
 | [orchestration.md](orchestration.md) | Three-agent trio, task graph, orchestrator engine, job registry |
-| [pipeline.md](pipeline.md) | Linear↔task bridge: intake claim loop, linearSync board mirror |
+| [pipeline.md](pipeline.md) | Ticket-system↔task bridge: intake claim loop, sync board mirror (provider-neutral, ADR-0006) |
 | [sidecar.md](sidecar.md) | Per-agent supervisor design, current transitional state, migration path |
 | [dashboard.md](dashboard.md) | Next.js + Go architecture, embedding, API routes, tunnel, auth |
 | [database.md](database.md) | Postgres as single source of truth, migrations, NOTIFY channels, key tables |
