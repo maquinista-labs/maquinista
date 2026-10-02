@@ -462,6 +462,20 @@ func runOrchestratorSupervised(ctx context.Context) error {
 	// become task rows the task-scheduler claims; sync mirrors task state
 	// back to the board. Provider-neutral — no-op unless
 	// MAQUINISTA_TICKETS_API_KEY + MAQUINISTA_TICKETS_TEAM_ID.
+	//
+	// The pipeline goroutines need a pool even when the orchestrator engine
+	// is off — deployments run without --orchestrate, and the pool creation
+	// above only happens under that flag. Without this, the whole block
+	// silently skipped on such deployments (barceloneta, 02/10: task sat
+	// 'ready' forever, no bridge/dispatch/scheduler logs).
+	if pool == nil && cfg.DatabaseURL != "" {
+		p, dbErr := db.Connect(cfg.DatabaseURL)
+		if dbErr != nil {
+			log.Printf("Warning: failed to connect DB for pipeline: %v", dbErr)
+		} else {
+			pool = p
+		}
+	}
 	if tCfg := pipeline.FromEnv(); tCfg.Enabled() && pool != nil {
 		// Review dispatch (EX-03): spawn zero-author reviewers for pipeline
 		// tasks in 'review', parse verdicts, transition tasks. Needs no
