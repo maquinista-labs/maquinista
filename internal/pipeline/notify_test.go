@@ -215,6 +215,10 @@ func TestWatchdog_PRLink(t *testing.T) {
 	execOK(t, pool, `UPDATE tasks SET pr_url = $2 WHERE id = $1`, "twpr",
 		"https://github.com/maquinista-labs/maquinista/pull/7")
 	seedReviewer(t, pool, "reviewer-twpr", "twpr")
+	// Backdate past the stall bound: the young-agent guard exempts agents
+	// younger than the timeout even with zero outbox activity (same shape
+	// as TestWatchdog_StallTimeout).
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-twpr'`)
 
 	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
