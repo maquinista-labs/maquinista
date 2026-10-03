@@ -295,6 +295,26 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   the cap, at the cap (default 5, `MAQUINISTA_MERGE_ATTEMPTS_MAX`) the entry
   fails, the task parks `pending_approval`, and the Pipeline topic gets the
   question (EX-06). No checks configured counts as green.
+- **Build gate (MAQ-20)** — between the CI gate and the squash: the branch is
+  never merged uncompiled. The gate materializes `origin/<branch>` — the
+  exact tree a squash-merge takes, rebase included — in a detached throwaway
+  worktree under `os.TempDir()` (`maquinista-mergegate-*`) and runs
+  `go build ./...` there (`internal/pipeline/mergegate.go`). Deterministic
+  compile failure: entry `failed` (terminal — the branch must change;
+  re-approval after a fix enqueues a fresh one), task parks
+  `pending_approval`, and both the Pipeline-topic question and a `merger`
+  observation carry the first ~20 compiler lines (MAQ-20: duplicate consts
+  across files are invisible in a per-file diff read but loud in build
+  output). Infra trouble (toolchain missing, worktree add failure, >10 min
+  build) fails the entry without blaming the branch — re-approve retries.
+  A branch root without `go.mod` passes vacuously (non-Go repos unchanged).
+  The worktree is removed on every outcome; there is deliberately NO config
+  knob — a skippable gate would reintroduce the PR-#21 failure. All merge
+  surfaces gate: the approve verb (Telegram, ticket comment, CLI) and
+  auto-merge converge on `ProcessMergeGH`, as does the merger-agent re-run
+  after a MAQ-15 conflict resolution. Added latency is one warm
+  `go build ./...` (~60-90s on the box, inside the approve fast-path
+  budget).
 - **Conflicts — merger-agent leg (MAQ-15)** — under `PIPELINE_MERGE_AGENT=1`, a
   rebase conflict no longer parks immediately: the processor bumps the
   entry's `attempts` (the same budget as the CI cap), parks a

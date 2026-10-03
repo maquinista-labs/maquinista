@@ -109,6 +109,27 @@ func WorktreeAdd(repoRoot, worktreeDir, branch string) error {
 	return nil
 }
 
+// WorktreeAddDetached creates a detached worktree checked out at ref (a
+// commit-ish like "origin/main"), for throwaway verification builds — no
+// branch is created or checked out anywhere.
+func WorktreeAddDetached(repoRoot, worktreeDir, ref string) error {
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", "--detach", worktreeDir, ref)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add --detach %s %s: %s: %w", worktreeDir, ref, string(out), err)
+	}
+	return nil
+}
+
+// WorktreePrune drops stale worktree administrative entries (e.g. after a
+// worktree directory was removed behind git's back).
+func WorktreePrune(repoRoot string) error {
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "prune")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree prune in %s: %s: %w", repoRoot, string(out), err)
+	}
+	return nil
+}
+
 // WorktreeRemove removes a worktree directory.
 func WorktreeRemove(repoRoot, worktreeDir string) error {
 	cmd := exec.Command("git", "-C", repoRoot, "worktree", "remove", "--force", worktreeDir)
