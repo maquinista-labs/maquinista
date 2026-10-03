@@ -126,8 +126,12 @@ live reviewer agent:
   model = the runner's own chain
 - spawns via `ReviewSpawner` (wraps `agentspawn.SpawnFresh`: agents row
   task-bound, soul clone, tmux pane, sidecar), then bumps
-  `tasks.review_rounds` and enqueues the round prompt in ONE tx
-  (`external_msg_id = review:<task>:<round>` dedups)
+  `tasks.review_rounds` (autocommit — its presence makes the next tick a
+  no-op for the spawn pass), builds the round prompt (see **Human PR
+  comments**, below — deliberately with NO transaction open, so the gh
+  comment fetch never holds a DB tx), and enqueues the prompt in its own
+  tx (`external_msg_id = review:<task>:<round>` dedups). A crash between
+  bump and enqueue heals via the prompt pass
 - on a `uq_agents_task_live` spawn failure, runs the **stuck-implementor
   self-heal (MAQ-14)**: if the blocking live row is the task's implementor
   whose last outbox activity is older than
@@ -139,13 +143,46 @@ live reviewer agent:
 
 **Prompt heal.** A crash between spawn and enqueue leaves a live reviewer
 with no prompt; the heal pass re-enqueues exactly one (dedup'd) on the next
-tick.
+tick. The heal builds the prompt through the same code as the spawn pass,
+so it carries the human-comment section too.
+
+**Human PR comments (MAQ-16).** When a round prompt is built, dispatch
+fetches the PR's issue comments (`GhRunner.PRComments` — `gh pr view --json
+comments` in production) and folds the human ones into the prompt as
+verdict INPUT:
+
+- **cutoff** — the start time of the previous round's reviewer agent
+  (newest `agents` row with role reviewer, other than the current one;
+  `started_at` is the row's creation time). No prior reviewer row (round 1)
+  = the PR-open baseline: every human comment counts.
+- **filters** — bot authors (all three spellings: `is_bot`, `__typename
+  Bot`, `[bot]` login suffix), the pipeline's own `[review round N]`
+  comments (the gh CLI may be authenticated as a human account, so the
+  marker — not the author — identifies them), blank bodies, and everything
+  at/before the cutoff.
+- **framing** — the section is rendered explicitly as INPUT ONLY (never
+  approve/request_changes verbs; the verb surface stays MAQ-11's
+  Telegram/Linear/comments path). Oversized bodies are trimmed per comment
+  (1000 chars) and the section as a whole (4000 chars) keeps the newest
+  comments.
+- **degradation** — no `GhRunner` wired, no `pr_url`, or any gh failure →
+  the prompt ships without the section; nothing else changes.
 
 **Verdict pass.** Scans each live reviewer's newest outbox rows for the
 contract verdict line (`ParseVerdict`, line-anchored, exact three-value
 vocabulary). The first well-formed line wins; a malformed `VERDICT:`-ish
-line is logged loudly and never transitions. On a verdict, one tx:
+line is logged loudly and never transitions. On a verdict:
 
+- **PR verdict comment (MAQ-16)** — BEFORE the guarded transition, dispatch
+  posts one `[review round N]` comment on the PR (`GhRunner.PRPostComment`):
+  marker + the verdict line + the reviewer's findings tail — the PR page is
+  self-describing. Posting runs first so a crash between post and
+  transition heals on the next tick (verdict re-parsed; the round marker
+  dedups the repost — exactly one comment per round across
+  requeue/prompt-heal paths), whereas the other order would lose the
+  comment (the transition retires the reviewer). Everything is best-effort:
+  no `pr_url`, a gh outage, or an unreadable findings tail logs and falls
+  through — the verdict transition is never blocked.
 - task transition: `approve` → `ready_to_merge`,
   `request_changes` → `changes_requested`, `needs_human` →
   `pending_approval` (guarded on the task still being in `review` — a raced
@@ -257,8 +294,11 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   summaries (`notifyVerdict`), watchdog parks, and all merge-flow notes —
   via `prLinkSuffix`; tasks without a PR keep the old linkless text
   (MAQ-10: no null/empty links).
-- GitHub is behind `pipeline.GhRunner` (interface: `PRChecks` +
-  `PRMergeSquash`); production uses the gh CLI (`internal/gh`).
+- GitHub is behind `pipeline.GhRunner` (interface: `PRChecks`,
+  `PRMergeSquash`, plus MAQ-16's `PRComments` + `PRPostComment`); production
+  uses the gh CLI (`internal/gh`). The dispatch loop gets the same runner
+  wired in `orchestrator start` (`DispatchConfig.Gh`) for the MAQ-16 PR
+  surface; a nil runner disables it.
 
 ## Role souls
 

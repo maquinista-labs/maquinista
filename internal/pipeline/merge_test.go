@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/gh"
 	"github.com/maquinista-labs/maquinista/internal/git"
 )
 
@@ -27,6 +28,11 @@ type fakeGh struct {
 	checksErr  error
 	mergeCalls int
 	mergeErr   error
+
+	comments     []gh.PRComment // returned by PRComments
+	commentsErr  error
+	postedBodies []string // bodies passed to PRPostComment, in order
+	postErr      error
 }
 
 func (f *fakeGh) PRChecks(ctx context.Context, pr int) (string, error) {
@@ -35,6 +41,16 @@ func (f *fakeGh) PRChecks(ctx context.Context, pr int) (string, error) {
 func (f *fakeGh) PRMergeSquash(ctx context.Context, pr int) error {
 	f.mergeCalls++
 	return f.mergeErr
+}
+func (f *fakeGh) PRComments(ctx context.Context, pr int) ([]gh.PRComment, error) {
+	return f.comments, f.commentsErr
+}
+func (f *fakeGh) PRPostComment(ctx context.Context, pr int, body string) error {
+	if f.postErr != nil {
+		return f.postErr
+	}
+	f.postedBodies = append(f.postedBodies, body)
+	return nil
 }
 
 type fakeProvider struct {

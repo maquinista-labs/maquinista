@@ -214,7 +214,7 @@ func TestZeroAuthor_RejectsSelfReview(t *testing.T) {
 	`)
 
 	sp := &fakeSpawner{t: t, pool: pool}
-	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if len(sp.spawns) != 0 {
@@ -238,7 +238,7 @@ func TestDispatch_SpawnsReviewerWithSoulAndBinding(t *testing.T) {
 	`)
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if len(sp.spawns) != 1 {
@@ -274,7 +274,7 @@ func TestDispatch_SpawnsReviewerWithSoulAndBinding(t *testing.T) {
 
 	// Second tick: everything already in place → strict no-op.
 	before := len(sp.spawns)
-	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass 2: %v", err)
 	}
 	if len(sp.spawns) != before {
@@ -296,7 +296,7 @@ func TestDispatch_HealsMissingPrompt(t *testing.T) {
 	seedReviewer(t, pool, "reviewer-tb", "tb")
 
 	for i := 0; i < 2; i++ {
-		if err := promptPass(ctx, pool); err != nil {
+		if err := promptPass(ctx, pool, nil); err != nil {
 			t.Fatalf("promptPass %d: %v", i, err)
 		}
 	}
@@ -314,7 +314,7 @@ func TestReviewRounds_IncrementsPerSpawn(t *testing.T) {
 	seedReviewTask(t, pool, "tc", "uuid-c", "/tmp/wt-tc")
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 
@@ -327,7 +327,7 @@ func TestReviewRounds_IncrementsPerSpawn(t *testing.T) {
 
 	// EX-04 fixer requeue (simulated): task returns to review.
 	execOK(t, pool, `UPDATE tasks SET status = 'review' WHERE id = 'tc'`)
-	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass round 2: %v", err)
 	}
 	if len(sp.spawns) != 2 {
@@ -368,7 +368,7 @@ func TestVerdictTransitions(t *testing.T) {
 				VALUES ('reviewer-`+taskID+`', $1::jsonb)
 			`, `{"text":"findings...\nVERDICT: `+c.verdict+`\n"}`)
 
-			if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
+			if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
 				t.Fatalf("verdictPass: %v", err)
 			}
 
@@ -415,7 +415,7 @@ func TestVerdict_MalformedWaits(t *testing.T) {
 		VALUES ('reviewer-tm', '{"text":"VERDICT: approved-ish"}'::jsonb)
 	`)
 
-	if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if got := taskCol(t, pool, "tm", "status"); got != "review" {
@@ -614,7 +614,7 @@ func TestDispatch_StuckImplementor_AutoRetireThenReviewerSpawns(t *testing.T) {
 
 	// Tick 1: spawn dies on the unique-live index → self-heal retires.
 	sp := &fakeSpawner{t: t, pool: pool, failUniqueLive: true}
-	if err := dispatchPass(ctx, pool, sp, 10*time.Minute); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, 10*time.Minute); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if len(sp.spawns) != 0 {
@@ -632,7 +632,7 @@ func TestDispatch_StuckImplementor_AutoRetireThenReviewerSpawns(t *testing.T) {
 
 	// Tick 2: blocker gone → reviewer spawns; no second notification.
 	sp2 := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := dispatchPass(ctx, pool, sp2, 10*time.Minute); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp2, 10*time.Minute); err != nil {
 		t.Fatalf("dispatchPass 2: %v", err)
 	}
 	if len(sp2.spawns) != 1 || sp2.spawns[0].AgentID != "reviewer-ts" {
@@ -656,7 +656,7 @@ func TestDispatch_StuckImplementor_NeverStreamed(t *testing.T) {
 	seedImplementor(t, pool, "implementor-tn", "tn", `NOW() - interval '1 hour'`)
 
 	sp := &fakeSpawner{t: t, pool: pool, failUniqueLive: true}
-	if err := dispatchPass(ctx, pool, sp, 10*time.Minute); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, 10*time.Minute); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if got := agentStatus(t, pool, "implementor-tn"); got != "dead" {
@@ -681,7 +681,7 @@ func TestDispatch_FreshImplementor_KeepsWaiting(t *testing.T) {
 	seedOutboxRow(t, pool, "implementor-tf", "1 minute")
 
 	sp := &fakeSpawner{t: t, pool: pool, failUniqueLive: true}
-	if err := dispatchPass(ctx, pool, sp, 10*time.Minute); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, 10*time.Minute); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if got := agentStatus(t, pool, "implementor-tf"); got != "running" {
@@ -702,7 +702,7 @@ func TestDispatch_NonImplementorBlocker_NotRetired(t *testing.T) {
 	seedOutboxRow(t, pool, "reviewer-tr", "30 minutes")
 
 	sp := &fakeSpawner{t: t, pool: pool, failUniqueLive: true}
-	if err := dispatchPass(ctx, pool, sp, 10*time.Minute); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, 10*time.Minute); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if got := agentStatus(t, pool, "reviewer-tr"); got != "running" {
