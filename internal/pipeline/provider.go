@@ -10,6 +10,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"time"
 )
 
 // Column is a canonical pipeline column (ADR-0006): the provider-free name
@@ -89,6 +90,28 @@ type TicketProvider interface {
 	// sync loop dedups on ticket_issue_map.pr_url_synced, so the provider
 	// implementation must be safe to call again after a failure.
 	AddIssueLink(ctx context.Context, issueID, url string) error
+}
+
+// IssueComment is the slice of a ticket-system comment the comment verbs
+// need (MAQ-11). Author is the best identity the provider exposes — email
+// when public, else the display name.
+type IssueComment struct {
+	ID        string
+	IssueID   string
+	Body      string
+	Author    string
+	CreatedAt time.Time
+}
+
+// CommentFetcher is the optional TicketProvider extension powering comment
+// actions (MAQ-11: approve a ready_to_merge task from a ticket comment).
+// Providers that cannot surface comments simply don't implement it; the
+// comment-approve pass probes for the capability at runtime.
+type CommentFetcher interface {
+	// RecentComments returns comments created after `since` on the given
+	// issues. Returning a subset (or comments outside the window) is safe —
+	// the caller consumes by comment id and ignores what it cannot act on.
+	RecentComments(ctx context.Context, issueIDs []string, since time.Time) ([]IssueComment, error)
 }
 
 // NewProvider resolves a provider by name (MAQUINISTA_TICKETS_PROVIDER).

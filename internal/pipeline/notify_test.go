@@ -57,7 +57,7 @@ func TestVerdict_NotifyPerOutcome(t *testing.T) {
 		bumpRounds    bool
 		wantSubstr    []string
 	}{
-		{"approve", VerdictApprove, false, []string{"✅", "approved (review round 0)", "ready_to_merge", "maquinista approve tv"}},
+		{"approve", VerdictApprove, false, []string{"✅", "approved (review round 0)", "ready_to_merge", "reply `approve tv-appro`", "comment `approve` on the ticket issue"}},
 		{"request-changes", VerdictRequestChanges, false, []string{"🔁", "request_changes (review round 0)", "fixer spawning"}},
 		{"needs-human", VerdictNeedsHuman, false, []string{"🆘", "needs-human", "maquinista approve tv", "maquinista reject tv"}},
 		{"round-cap", VerdictRequestChanges, true, []string{"🆘", "review round cap 3 reached", "parked needs-human"}},
@@ -215,6 +215,10 @@ func TestWatchdog_PRLink(t *testing.T) {
 	execOK(t, pool, `UPDATE tasks SET pr_url = $2 WHERE id = $1`, "twpr",
 		"https://github.com/maquinista-labs/maquinista/pull/7")
 	seedReviewer(t, pool, "reviewer-twpr", "twpr")
+	// Backdate past the stall bound: the young-agent guard exempts agents
+	// younger than the timeout even with zero outbox activity (same shape
+	// as TestWatchdog_StallTimeout).
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-twpr'`)
 
 	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)

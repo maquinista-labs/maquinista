@@ -195,6 +195,7 @@ is bounded the same way.
 | `MAQUINISTA_TICKETS_API_KEY` | ticket-system API key | required to enable |
 | `MAQUINISTA_TICKETS_TEAM_ID` | team/board id intake polls | required to enable |
 | `MAQUINISTA_TICKETS_PROJECT` | project_id stamped on claimed tasks | falls back to `MAQUINISTA_PROJECT` |
+| `MAQUINISTA_TICKETS_APPROVERS` | ticket-system identities (email or display name, comma-separated) allowed to drive comment verbs; empty = fail-closed | (nobody) |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
 | `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound (reviewers + fixers) | `2h` |
 | `MAQUINISTA_IMPLEMENTOR_IDLE_AFTER` | stuck-implementor self-heal bound: outbox idleness past this retires a `uq_agents_task_live`-blocking implementor row | `10m` |
@@ -280,13 +281,61 @@ on these literals):
 Souls stay runner-agnostic (ADR-0005 revisit triggers): re-binding a role to
 a new harness is an extras edit, not a soul rewrite.
 
+## Comment actions (MAQ-11)
+
+The human release authority is a comment from an allowed approver on a
+surface he already has open — the Telegram Pipeline topic or the ticket
+issue. Both surfaces route into ONE verb arm, `pipeline.ApproveRef`
+(`approve.go`): resolve the task reference (full uuid or unambiguous
+prefix), no-op unless the task is `ready_to_merge` (approve never forces a
+transition), then `RunMergeOnApprove` — the same queue flow the CLI uses,
+overriding the auto-merge gate for that one merge. No new merge code path.
+The verb arms a merge audit observation (`approved via … by <who>`).
+
+- **Telegram** — `/approve <task-ref>` as a bot command (any topic,
+  `ALLOWED_USERS` gate is the stock one in `handleUpdate`), or a bare
+  `approve <task-ref>` typed in the Pipeline topic
+  (`handlePipelineApproveText` intercepts BEFORE the routing ladder — the
+  synthetic pipeline agent has no sidecar, so the ladder would strand the
+  message in its inbox). The in-topic form is regex-strict (`approve <one
+  ref>`) and gated on the thread's owner binding being the `pipeline`
+  agent, so ordinary agent conversations are never hijacked. The ack is
+  immediate; the merge runs async and its outcome rides the standard
+  notifier notes into the same topic.
+- **Ticket comments** — `RunCommentApprovals` polls at the sync cadence
+  (10 s, same pass family). Each pass: ready_to_merge tasks with a
+  `ticket_issue_map` row → `CommentFetcher.RecentComments` (optional
+  provider extension; Linear implements it, providers without comments are
+  a logged no-op) → verb parse (whole body must be `approve` or
+  `maquinista approve`, punctuation-tolerant — prose mentioning the word
+  never merges) → approver gate (`MAQUINISTA_TICKETS_APPROVERS`, email or
+  display name, case-insensitive, empty = fail-closed) → consume →
+  approve.
+- **Exactly-once** — the comment id is consumed into `ticket_comment_log`
+  (INSERT ON CONFLICT DO NOTHING + RETURNING) BEFORE the verb runs, so a
+  second identical comment or a pagination overlap loses the race and never
+  reaches the merge; `merge_queue`'s partial live index is the second
+  guard. A failing verb still consumes its comment — the operator
+  re-approves with a new comment or the CLI.
+- **Notifier verbs** — the merge-proposal note teaches the comment forms
+  (short id, typeable from a phone): reply `approve <short-id>` in the
+  Pipeline topic or comment `approve` on the ticket issue. The CLI verb
+  (`maquinista approve`, now routed through `ApproveRef` too) keeps working.
+  Notes about `pending_approval` tasks (round cap, needs-human escalation,
+  CI-cap) keep the CLI-only form — the comment verb deliberately does not
+  act on `pending_approval`.
+
 ## TODO
 
 - fixer re-claim loop: **shipped (EX-04)** — see "Fixer pass" above; round
   cap + fixer watchdog included
 - merge mode: **shipped (EX-05)** — see "Merge mode: gh" above; enqueue
   pass, rebase + CI gate, approve-verb override included
-- Telegram plumbing: EX-06
+- Telegram plumbing: **shipped (EX-06)** — synthetic notifier agent,
+  Pipeline topic, merge lifecycle notes; approve comment verbs (MAQ-11)
+  extend it, see "Comment actions" above
+- comment actions: **shipped (MAQ-11)** — see "Comment actions" above;
+  park/rerun/retry verbs are follow-ups once approve proves the pattern
 - worker spawn wiring: **shipped (EX-07)** — see "Task scheduler" above;
   task-scheduler in `orchestrator start`, ensureTaskWorker → SpawnFresh
 

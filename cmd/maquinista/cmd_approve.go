@@ -35,23 +35,24 @@ var approveCmd = &cobra.Command{
 			actor = "cli"
 		}
 
-		// gh-mode merge arm: approving a ready_to_merge task runs the
-		// PR merge flow now (bypasses the auto-merge gate for this one
-		// merge). The pending_approval path below is untouched.
-		if t, gerr := db.GetTask(pool, resolvedID); gerr == nil && t.Status == "ready_to_merge" {
-			if mCfg := pipeline.MergeConfigFromEnv(); mCfg.Mode == pipeline.MergeModeGH {
-				tCfg := pipeline.FromEnv()
-				prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
-				if perr != nil {
-					prov = nil
-				}
-				mCfg.Gh = gh.New()
-				if err := pipeline.RunMergeOnApprove(context.Background(), pool, mCfg, prov, tCfg.TeamID, resolvedID); err != nil {
-					return err
-				}
-				fmt.Printf("Merged: %s (PR squash-merged, by %s)\n", resolvedID, actor)
-				return nil
-			}
+		// Shared verb arm (MAQ-11): approving a ready_to_merge task under
+		// gh merge mode runs the PR merge flow now (bypasses the auto-merge
+		// gate for this one merge). Every other shape falls through to the
+		// legacy pending_approval approve below, unchanged.
+		tCfg := pipeline.FromEnv()
+		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
+		if perr != nil {
+			prov = nil
+		}
+		mCfg := pipeline.MergeConfigFromEnv()
+		mCfg.Gh = gh.New()
+		out, err := pipeline.ApproveRef(context.Background(), pool, mCfg, prov, tCfg.TeamID, resolvedID, "")
+		if err != nil {
+			return err
+		}
+		if out.Ran {
+			fmt.Printf("Merged: %s (PR squash-merged, by %s)\n", resolvedID, actor)
+			return nil
 		}
 
 		if err := db.ApproveTask(pool, resolvedID, actor); err != nil {

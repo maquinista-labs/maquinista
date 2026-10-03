@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -24,6 +25,10 @@ type TicketsConfig struct {
 	TeamID   string
 	Project  string
 	Interval time.Duration
+	// Approvers lists the ticket-system identities (email or display name,
+	// case-insensitive) allowed to drive comment verbs (MAQ-11). Empty is
+	// fail-closed: no comment ever approves.
+	Approvers []string
 }
 
 // Enabled reports whether the bridge should run: both the credential and the
@@ -50,6 +55,13 @@ func FromEnv() TicketsConfig {
 	if v := os.Getenv("MAQUINISTA_TICKETS_POLL"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			cfg.Interval = d
+		} else {
+			log.Printf("pipeline: invalid MAQUINISTA_TICKETS_POLL %q — using %s", v, cfg.Interval)
+		}
+	}
+	for _, a := range strings.Split(os.Getenv("MAQUINISTA_TICKETS_APPROVERS"), ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			cfg.Approvers = append(cfg.Approvers, a)
 		}
 	}
 	return cfg

@@ -97,8 +97,11 @@ func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdi
 		notifyf(ctx, pool, "🆘 %s: review round cap %d reached (%s) — parked needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
 			label, maxRounds, verdict, taskID, taskID, pr)
 	case verdict == VerdictApprove:
-		notifyf(ctx, pool, "✅ %s approved (review round %d) → ready_to_merge. Merge proposal: `maquinista approve %s` — or set PIPELINE_AUTO_MERGE=1 for autonomous merges.%s",
-			label, round, taskID, pr)
+		// MAQ-11: the proposal teaches the comment verbs (short id — typeable
+		// from a phone) instead of the CLI-only form. MAQ-10: the PR link
+		// rides along on every verdict.
+		notifyf(ctx, pool, "✅ %s approved (review round %d) → ready_to_merge. Merge proposal: reply `approve %s` here or comment `approve` on the ticket issue — or set PIPELINE_AUTO_MERGE=1 for autonomous merges.%s",
+			label, round, shortTaskID(taskID), pr)
 	case verdict == VerdictRequestChanges:
 		notifyf(ctx, pool, "🔁 %s: request_changes (review round %d) — fixer spawning.%s",
 			label, round, pr)
