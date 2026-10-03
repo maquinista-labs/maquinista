@@ -195,6 +195,87 @@ func TestRunMergeDrainPass_AttemptsCapParksNeedsHuman(t *testing.T) {
 	}
 }
 
+// ---- startup reconcile: a dead executor's stale 'merging' claims are recovered ----
+
+// TestReconcileStaleMerging: at drain startup, entries stuck in 'merging'
+// past the threshold (daemon killed mid-pass — claims are not leased) go
+// back to 'pending' with the claim timestamp cleared, while an in-flight
+// claim (fresh started_at) and terminal entries are untouched.
+func TestReconcileStaleMerging(t *testing.T) {
+	pool := testPool(t)
+	_, worktree := initRemoteTrio(t, "stalemerge")
+	stale := seedReadyTaskPending(t, pool, worktree, 2*time.Minute)
+	_, wt2 := initRemoteTrio(t, "stalemerge2")
+	inflight := seedReadyTaskPending(t, pool, wt2, 0)
+
+	// Claim both (drain order: stale first, then inflight).
+	claimed, err := db.ClaimMergeEntry(pool)
+	if err != nil || claimed == nil || claimed.ID != stale.ID {
+		t.Fatalf("claim 1: got %v err %v, want entry %d", claimed, err, stale.ID)
+	}
+	claimed2, err := db.ClaimMergeEntry(pool)
+	if err != nil || claimed2 == nil || claimed2.ID != inflight.ID {
+		t.Fatalf("claim 2: got %v err %v, want entry %d", claimed2, err, inflight.ID)
+	}
+	// Simulate the crash: the stale claim's started_at predates the
+	// threshold; the in-flight one stays fresh.
+	execOK(t, pool, `UPDATE merge_queue SET started_at = NOW() - interval '2 hours' WHERE id = $1`, stale.ID)
+	// A terminal entry must never be resurrected by the reconcile.
+	execOK(t, pool, `UPDATE merge_queue SET status = 'failed', completed_at = NOW() WHERE id = $1`, inflight.ID)
+
+	reconcileStaleMerging(pool)
+
+	if got := entryStatus(t, pool, stale.ID); got != "pending" {
+		t.Errorf("stale claim = %q, want released to pending", got)
+	}
+	var startedAt *time.Time
+	if err := pool.QueryRow(context.Background(),
+		`SELECT started_at FROM merge_queue WHERE id = $1`, stale.ID).Scan(&startedAt); err != nil {
+		t.Fatal(err)
+	}
+	if startedAt != nil {
+		t.Errorf("released claim keeps started_at=%v — a later pass could not re-claim cleanly", startedAt)
+	}
+	if got := entryStatus(t, pool, inflight.ID); got != "failed" {
+		t.Errorf("terminal entry = %q, want untouched failed", got)
+	}
+
+	// And the recovered entry is drainable again: the next pass claims and
+	// processes it end to end (no 'vanished after enqueue' dead-end).
+	gh := &fakeGh{checks: ChecksGreen}
+	processed, err := RunMergeDrainPass(context.Background(), pool,
+		MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}, &fakeProvider{}, "team-1")
+	if err != nil || !processed {
+		t.Fatalf("pass after reconcile: processed=%v err=%v", processed, err)
+	}
+	if got := entryStatus(t, pool, stale.ID); got != "merged" {
+		t.Errorf("recovered entry = %q, want merged by the next pass", got)
+	}
+}
+
+// TestReleaseStaleMergeEntries_ThresholdHonored: a claim inside the
+// threshold (an in-flight pass) must not be released — the reconcile
+// steals no live work.
+func TestReleaseStaleMergeEntries_ThresholdHonored(t *testing.T) {
+	pool := testPool(t)
+	_, worktree := initRemoteTrio(t, "stalethresh")
+	entry := seedReadyTaskPending(t, pool, worktree, 0)
+	if _, err := db.ClaimMergeEntry(pool); err != nil {
+		t.Fatal(err)
+	}
+
+	ids, err := db.ReleaseStaleMergeEntries(pool, mergeStaleClaimThreshold)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("released %v — a fresh in-flight claim must be untouched", ids)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "merging" {
+		t.Errorf("entry = %q, want still merging", got)
+	}
+}
+
 // ---- integration: the TEST gate leg blocks a red branch (AC 2 + AC 5) ----
 
 func TestRunMergeDrainPass_TestGateParksRedBranch(t *testing.T) {

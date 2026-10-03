@@ -305,7 +305,9 @@ func TestRunTestGate_PassingTestPasses(t *testing.T) {
 // TestRunTestGate_PackageSelection: only touched Go packages run; docs-only
 // branches are vacuous; go.mod/go.sum shifts widen to the whole module; a
 // package the branch DELETES drops out of the selection (testing a vanished
-// directory would red-flag a legitimate removal).
+// directory would red-flag a legitimate removal), as does a directory kept
+// alive by a non-Go file after its last .go file is deleted (`go test`
+// there hard-fails "no Go files" — the round-2 false-red shape).
 func TestRunTestGate_PackageSelection(t *testing.T) {
 	t.Run("docs only is vacuous", func(t *testing.T) {
 		repo, base := gateRepoAtBase(t,
@@ -352,6 +354,33 @@ func TestRunTestGate_PackageSelection(t *testing.T) {
 		passed, gateCmd, _, err := runTestGate(context.Background(), repo, "HEAD", base)
 		if err != nil || !passed {
 			t.Fatalf("deleting a package must not red-flag the branch: %v", err)
+		}
+		if gateCmd != "go test ." {
+			t.Errorf("gateCmd = %q, want only the surviving package", gateCmd)
+		}
+		assertNoGateLeak(t, repo)
+	})
+
+	t.Run("directory kept alive by a non-Go file drops out", func(t *testing.T) {
+		repo, base := gateRepoAtBase(t,
+			map[string]string{
+				"go.mod":        gateGoMod,
+				"main.go":       gateMain,
+				"sub/sub.go":    gateSub,
+				"sub/README.md": "# survives the deletion\n",
+			},
+			map[string]string{"ok_test.go": gatePassingTest})
+		// The branch deletes the package's LAST .go file but the directory
+		// survives on the README: os.Stat on the directory would keep ./sub
+		// selected and `go test ./sub` would hard-fail [setup failed] — a
+		// permanent false red on a legitimate removal. The selection must
+		// shrink to the surviving package instead.
+		gitRun(t, repo, "rm", "-q", "sub/sub.go")
+		gitRun(t, repo, "commit", "-q", "-m", "delete last go file, keep dir")
+
+		passed, gateCmd, _, err := runTestGate(context.Background(), repo, "HEAD", base)
+		if err != nil || !passed {
+			t.Fatalf("emptying a package must not red-flag the branch: %v", err)
 		}
 		if gateCmd != "go test ." {
 			t.Errorf("gateCmd = %q, want only the surviving package", gateCmd)

@@ -119,10 +119,12 @@ func tick(ctx context.Context, cfg Config) error {
 	// (spawn agent → db.AtomicClaim → send keys into the pane) is gone.
 	_ = executorCount // slot-bookkeeping preserved for future policy hooks
 
-	// 4. MERGE: process merge queue.
-	if err := processMergeQueue(cfg); err != nil {
-		log.Printf("Merge queue error: %v", err)
-	}
+	// 4. MERGE: retired (MAQ-21). The tick used to claim-and-forget the
+	// oldest pending merge_queue entry into 'merging' — a second claimer
+	// beside the daemon merge executor, exactly what the drain forbids, and
+	// a wedged entry in every other mode (nothing ever processed the claim;
+	// the approve verb only claims 'pending'). Merging is owned by
+	// pipeline.RunMergeDrain (gh+auto-merge) or the approve verb.
 
 	// 5. LOG status.
 	logStatus(cfg, agents)
@@ -153,21 +155,6 @@ func reconcile(cfg Config) error {
 // not a direct tmux spawn-and-claim. Runtimes that still want to cap
 // concurrent agents should do so in the task-scheduler's EnsureAgent
 // callback (a future follow-up on this package).
-
-func processMergeQueue(cfg Config) error {
-	entry, err := db.ClaimMergeEntry(cfg.Pool)
-	if err != nil {
-		return err
-	}
-	if entry == nil {
-		return nil
-	}
-
-	log.Printf("Processing merge: task=%s branch=%s", entry.TaskID, entry.Branch)
-	// Merge processing is handled by the existing merge command infrastructure.
-	// The orchestrator just claims entries to signal they should be processed.
-	return nil
-}
 
 func notify(cfg Config, message string) {
 	if cfg.NotifyFunc != nil {

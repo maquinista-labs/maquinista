@@ -294,9 +294,14 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   `~/.local/bin/merge-watcher.sh`), which re-ran `maquinista approve` in a
   polling loop, could not reuse the daemon's guarded transitions, and
   caused the 03/10 attempt-counter flood (128 duplicate notifies) — with
-  the daemon draining, no second executor may poll beside it. Inert in
-  local mode and when auto-merge is off (those merges belong to the
-  approve verb). `maquinista merge` remains as a manual one-shot on the
+  the daemon draining, no second executor may poll beside it (the
+  orchestrator tick's legacy claim-and-forget hook retired with the
+  drain). At startup the drain also releases `merging` entries whose claim
+  is older than 30 min — a dead executor's unreleased claim would
+  otherwise wedge forever (claims are not leased; the threshold clears a
+  full gate pass with margin, so no in-flight pass is ever stolen).
+  Inert in local mode and when auto-merge is off (those merges belong to
+  the approve verb). `maquinista merge` remains as a manual one-shot on the
   same code path.
 - **Processing** — `maquinista merge` (or the approve verb, below, or the
   drain above) claims an entry and drives the remote: `fetch` →
@@ -325,8 +330,10 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
      test or a removed test-only dependency slips past the build leg).
      Package selection (`touchedPackages`): the directory of every changed
      `.go` file vs the merge-base with the base branch — base drift never
-     widens the set; a package the branch DELETES drops out (testing a
-     vanished directory would red-flag a legitimate removal);
+     widens the set; a package the branch DELETES drops out, as does a
+     directory kept alive by a non-Go file after its last `.go` file is
+     deleted (testing either would red-flag a legitimate removal — the
+     directory case hard-fails `go test` with `no Go files`);
      `go.mod`/`go.sum` changes widen to the whole module (dependency
      shifts can break any package's tests while the build stays green);
      non-Go changes (docs, CI configs) select nothing.

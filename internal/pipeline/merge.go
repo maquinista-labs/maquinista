@@ -283,6 +283,31 @@ func RunMergeDrainPass(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig,
 	return true, nil
 }
 
+// mergeStaleClaimThreshold bounds how old a 'merging' claim may get before
+// the drain's startup reconcile releases it. A legitimate hold is one full
+// pass — fetch/rebase + CI check + quality gate (10m build + 10m test
+// budgets) — so the threshold must clear that with margin: a reconcile
+// must never steal an in-flight pass out from under its executor.
+const mergeStaleClaimThreshold = 30 * time.Minute
+
+// reconcileStaleMerging recovers entries a dead executor left in 'merging'
+// (daemon or approve CLI killed mid-pass — claims are not leased, so
+// without this the entry wedges forever: approve's enqueue dedups on
+// pending/merging and every claimer only picks 'pending'). Runs once at
+// drain startup: below the threshold no in-flight pass can be touched, and
+// at startup the only possible concurrent claimer is a manual `maquinista
+// approve`, which the same threshold covers.
+func reconcileStaleMerging(pool *pgxpool.Pool) {
+	ids, err := db.ReleaseStaleMergeEntries(pool, mergeStaleClaimThreshold)
+	if err != nil {
+		log.Printf("pipeline: merge drain: stale-claim reconcile: %v", err)
+		return
+	}
+	if len(ids) > 0 {
+		log.Printf("pipeline: merge drain: released stale 'merging' claims %v — previous executor died mid-pass", ids)
+	}
+}
+
 // RunMergeDrain runs the daemon merge executor until ctx is cancelled: one
 // merge attempt per tick, oldest entry first. Runs only in gh mode with
 // auto-merge on; otherwise it exits immediately (the approve verb owns
@@ -293,6 +318,7 @@ func RunMergeDrain(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pro
 		log.Printf("pipeline: merge drain: inert (mode=%q auto_merge=%v) — merges wait for the approve verb", cfg.Mode, cfg.AutoMerge)
 		return
 	}
+	reconcileStaleMerging(pool)
 	ticker := time.NewTicker(mergeDrainInterval)
 	defer ticker.Stop()
 	for {

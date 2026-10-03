@@ -235,14 +235,17 @@ func runTestGate(ctx context.Context, worktreeDir, ref, baseRef string) (passed 
 }
 
 // touchedPackages maps the branch's changed files onto the Go packages the
-// test leg must run: the directory of every changed .go file that still
-// exists in the tree (a package the branch DELETES drops out — testing a
-// vanished directory would red-flag a legitimate removal), or the whole
-// module (`./...`) when go.mod/go.sum changed — dependency shifts can break
-// any package's tests while `go build ./...` stays green (test-only deps).
-// Non-Go changes (docs, CI configs) select nothing. Pure file mapping; the
-// diff runs against the merge-base with baseRef so only the branch's own
-// commits count, never base drift.
+// test leg must run: the directory of every changed .go file whose package
+// still contains Go source in the tree, or the whole module (`./...`) when
+// go.mod/go.sum changed — dependency shifts can break any package's tests
+// while `go build ./...` stays green (test-only deps). Non-Go changes
+// (docs, CI configs) select nothing. A package the branch DELETES drops
+// out — testing a vanished directory would red-flag a legitimate removal —
+// and so does a directory the branch emptied of its last .go file while a
+// non-Go file keeps the directory alive: `go test` there hard-fails with
+// "no Go files", a false deterministic red on a legitimate removal. Pure
+// file mapping; the diff runs against the merge-base with baseRef so only
+// the branch's own commits count, never base drift.
 func touchedPackages(dir, baseRef string) ([]string, error) {
 	mb, err := git.MergeBase(dir, baseRef, "HEAD")
 	if err != nil {
@@ -261,8 +264,11 @@ func touchedPackages(dir, baseRef string) ([]string, error) {
 			if pkg != "." {
 				pkg = "./" + filepath.ToSlash(pkg)
 			}
-			// Only packages that still exist (deleted packages drop out).
-			if _, serr := os.Stat(filepath.Join(dir, filepath.FromSlash(strings.TrimPrefix(pkg, "./")))); serr == nil {
+			// Only packages that still hold Go source (see above: a fully
+			// deleted package drops out, and so does a directory whose last
+			// .go file is gone but that a non-Go file keeps alive — the
+			// directory surviving is NOT enough).
+			if hasGoSource(dir, pkg) {
 				seen[pkg] = true
 			}
 		case f == "go.mod" || f == "go.sum":
@@ -278,6 +284,15 @@ func touchedPackages(dir, baseRef string) ([]string, error) {
 	}
 	sort.Strings(pkgs)
 	return pkgs, nil
+}
+
+// hasGoSource reports whether pkg (as selected: "." or "./rel") still
+// contains at least one .go file in the checked-out tree — the survival
+// test for package selection in touchedPackages.
+func hasGoSource(dir, pkg string) bool {
+	pkgDir := filepath.Join(dir, filepath.FromSlash(strings.TrimPrefix(pkg, "./")))
+	matches, err := filepath.Glob(filepath.Join(pkgDir, "*.go"))
+	return err == nil && len(matches) > 0
 }
 
 // renderGateCmd renders the failing-step command for human payloads: the
