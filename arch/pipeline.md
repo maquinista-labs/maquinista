@@ -32,10 +32,19 @@ provider implementation (`linear.go` for Linear).
 
 `taskscheduler.Run` runs inside `orchestrator start` (cmd_start.go), in the
 same tickets-enabled block as review dispatch. Wake triggers: LISTEN
-`task_events` + 30 s poll fallback. `DispatchOne` claims one `ready` task
-with no live agent (`FOR UPDATE SKIP LOCKED`, `uq_agents_task_live` keeps
-replicas honest), flips it to `claimed`, then the cmd-side
-`ensureTaskWorker` adapter spawns the implementor:
+`task_events` + 30 s poll fallback. "Live" for task-scoped agent rows means
+`status IN ('running','idle','working','spawning')` — `stopped` does NOT
+block a claim (MAQ-18): SpawnFresh pre-registers rows as `stopped`, the
+sidecar marks vanished windows `stopped`, and `maquinista stop` parks rows
+that way; a task wedged behind such a row would be silently unclaimable.
+The dashboard "stopped + empty tmux_window = needs provisioning" state is
+role=`user`/task_id NULL only, so it never collides with this.
+`DispatchOne` claims one `ready` task with no live agent (`FOR UPDATE SKIP
+LOCKED`, `uq_agents_task_live` keeps replicas honest), releases stale
+`stopped`/`archived` rows of previous attempts to `dead` inside the claim
+TX (freeing the unique-live slot for the fresh spawn), flips the task to
+`claimed`, then the cmd-side `ensureTaskWorker` adapter spawns the
+implementor:
 
 - worktree guard: the task must have a usable `worktree_path` — SpawnFresh
   does not stat; a bad path fails the spawn with a readable error and
@@ -52,6 +61,13 @@ replicas honest), flips it to `claimed`, then the cmd-side
 - the scheduler then enqueues `/work-on-task <id>` (external_msg_id
   `task:<id>` dedup) and sets `tasks.claimed_by`; `HealMissingInbox` covers
   the crash-between-claim-and-enqueue wedge
+- two MAQ-18 safety nets run each wake: `LogBlockedReadyTasks` journals
+  every `ready` task skipped because a live agent still holds it (no
+  silent skips), and `ReapStaleClaims` releases `claimed` tasks back to
+  `ready` when all their task-scoped agent rows are non-live and the
+  claim is older than 5 min (mid-flight implementor death; the bound
+  protects fresh claims whose agent row is still in SpawnFresh's stopped
+  pre-registration phase)
 
 The standalone `maquinista task-scheduler` subcommand keeps the
 orchestrator.EnsureAgent stub (row-only, no pty) for debugging alongside a
