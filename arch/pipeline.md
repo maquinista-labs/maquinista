@@ -246,6 +246,7 @@ the backstop — and a stalled fixer is bounded the same way.
 | `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |
 | `PIPELINE_MERGE_MODE` | merge driver: `local` (MergeNoFF in repo) or `gh` (remote PR flow) | `local` |
 | `PIPELINE_AUTO_MERGE` | gh mode only: truthy (`1`/`true`/`yes`/`t`/`y`) lets the queue merge without the approve verb | `0` |
+| `PIPELINE_MERGE_AGENT` | gh mode only: truthy arms the merger-agent conflict leg (MAQ-15) — rebase conflicts spawn a `pipeline-merger` agent instead of parking needs-human | `0` |
 | `MAQUINISTA_MERGE_ATTEMPTS_MAX` | red-PR reclaim cap before the task parks needs-human | `5` |
 | `PIPELINE_GH_ALLOWED_LOGINS` | GitHub logins allowed to issue PR comment commands; unset = repo-collaborator check via gh | (collaborators) |
 | `PIPELINE_GH_COMMENTS_POLL` | comment-command poll interval (floor 30s) | `60s` |
@@ -278,10 +279,30 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   the cap, at the cap (default 5, `MAQUINISTA_MERGE_ATTEMPTS_MAX`) the entry
   fails, the task parks `pending_approval`, and the Pipeline topic gets the
   question (EX-06). No checks configured counts as green.
-- **Conflicts** — the rebase is aborted and the task parks at
-  `pending_approval` (Needs Human on the board) with the conflicting files
-  in the observation and in the Pipeline-topic note; conflicts are never
-  auto-resolved.
+- **Conflicts — merger-agent leg (MAQ-15)** — under `PIPELINE_MERGE_AGENT=1`, a
+  rebase conflict no longer parks immediately: the processor bumps the
+  entry's `attempts` (the same budget as the CI cap), parks a
+  `merge_conflict` marker row (`task_context`, JSON: entry/attempt/base/
+  branch/files) and releases the entry back to `pending` in ONE tx. The
+  dispatch loop's merger pass spawns a fresh `pipeline-merger` agent in the
+  task worktree (prompt dedup id `merger:<task>:<entry>:<attempt>`), the
+  merger rebases, resolves conflicts PRESERVING both sides' semantics,
+  proves the resolution (`go build ./...` + `go test` on touched packages)
+  and ends with exactly `VERDICT: merged` or `VERDICT: needs_human`. On
+  `merged` the verdict pass consumes the episode and the released entry
+  re-runs the normal path unchanged (fetch → rebase → lease push → CI gate
+  → squash). On `needs_human` (or a stalled merger past
+  `MAQUINISTA_REVIEW_TIMEOUT`, or a marker left unconsumed for 2h) the task
+  parks `pending_approval` and the entry goes `conflict` with the marker's
+  files — the pre-MAQ-15 landing, unchanged. Below the attempts cap the
+  episode arms; at the cap the conflict parks directly. Episode identity is
+  `(entry_id, attempt)` — attempts reset on freshly enqueued entries, so
+  re-approved tasks run the merger path exactly once per entry. Processors
+  guard on task status and on in-flight episodes (live merger or unconsumed
+  marker → release untouched), so no merge can complete behind a
+  needs-human verdict and no worktree is touched mid-resolution. With
+  `PIPELINE_MERGE_AGENT=0` (default) conflicts park needs-human exactly as
+  before.
 - **Human gate** — `PIPELINE_AUTO_MERGE=0` (default) makes every processing
   pass release the entry untouched; `maquinista approve <task>` on a
   `ready_to_merge` task runs the full flow immediately, overriding the gate
@@ -374,14 +395,15 @@ dispatcher clones them per spawn):
 | `pipeline-reviewer` | independent diff review — fresh per round, zero-author | `high` |
 | `pipeline-arbiter` | adjudication of contested / repeated `request_changes` | `high` |
 | `pipeline-fixer` | reviewer-findings resolution in the same worktree/PR | `standard` |
-| `pipeline-merger` | rebase + `gh pr checks` gate + propose/merge | `standard` |
+| `pipeline-merger` | rebase-conflict resolution in the task worktree — keep both sides, prove build+test green, one verdict (pivoted by MAQ-15, migration 038) | `standard` |
 
 Cross-exercise contracts frozen here (EX-03 dispatch + verdict parsing build
 on these literals):
 
 - **Verdict line** — reviewer/arbiter sessions end their output with exactly
   one line: `VERDICT: approve` / `VERDICT: request_changes` /
-  `VERDICT: needs_human`.
+  `VERDICT: needs_human`. Merger sessions (MAQ-15) end with exactly
+  `VERDICT: merged` / `VERDICT: needs_human` (`ParseMergeVerdict`).
 - **Dispatch hints** — every pipeline template carries `extras` keys
   `default_runner` (all `pi`) and `reasoning_class`; EX-03 resolves them to
   runner + model at dispatch.
@@ -439,6 +461,8 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   cap + fixer watchdog included
 - merge mode: **shipped (EX-05)** — see "Merge mode: gh" above; enqueue
   pass, rebase + CI gate, approve-verb override included
+- merger conflict leg: **shipped (MAQ-15)** — merger-agent episodes on
+  rebase conflicts; see the Conflicts bullet in "Merge mode: gh"
 - Telegram plumbing: **shipped (EX-06)** — synthetic notifier agent,
   Pipeline topic, merge lifecycle notes; approve comment verbs (MAQ-11)
   extend it, see "Comment actions" above

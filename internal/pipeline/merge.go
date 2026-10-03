@@ -59,9 +59,16 @@ type GhRunner interface {
 type MergeConfig struct {
 	Mode      string
 	AutoMerge bool // false: entries wait for the approve verb even in gh mode
+	// MergeAgent arms the merger-agent conflict leg (MAQ-15): a rebase
+	// conflict parks an episode marker and releases the entry for the
+	// dispatch loop's merger agent instead of parking needs-human
+	// immediately. false (default): conflicts park needs-human as before.
+	MergeAgent bool
 	// MaxAttempts caps how many times an auto-merged entry may reclaim a
 	// red PR before the task is parked needs-human (EX-06: the release-
-	// and-reclaim loop otherwise spams forever). 0 → default 5.
+	// and-reclaim loop otherwise spams forever). 0 → default 5. The merger
+	// conflict leg consumes the SAME budget (MAQ-15): each armed merger
+	// episode is one attempt.
 	MaxAttempts int
 	Gh          GhRunner
 }
@@ -78,7 +85,8 @@ var truthyEnv = map[string]bool{
 }
 
 // MergeConfigFromEnv reads PIPELINE_MERGE_MODE ("local"|"gh"),
-// PIPELINE_AUTO_MERGE (1/true/yes…, default 0) and
+// PIPELINE_AUTO_MERGE (1/true/yes…, default 0), PIPELINE_MERGE_AGENT
+// (truthy → merger-agent conflict leg, default 0) and
 // MAQUINISTA_MERGE_ATTEMPTS_MAX (default 5). The GhRunner is wired by the
 // caller — env only selects behavior, never binaries.
 func MergeConfigFromEnv() MergeConfig {
@@ -88,6 +96,9 @@ func MergeConfigFromEnv() MergeConfig {
 	}
 	if truthyEnv[strings.ToLower(os.Getenv("PIPELINE_AUTO_MERGE"))] {
 		cfg.AutoMerge = true
+	}
+	if truthyEnv[strings.ToLower(os.Getenv("PIPELINE_MERGE_AGENT"))] {
+		cfg.MergeAgent = true
 	}
 	if v := os.Getenv("MAQUINISTA_MERGE_ATTEMPTS_MAX"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -113,21 +124,23 @@ func prFromPullURL(url string) (int, error) {
 // taskMergeInfo is the slice of the task row the merge flow needs (the
 // shared Task struct does not carry the pipeline columns).
 type taskMergeInfo struct {
+	Status       string
 	PRURL        string
 	WorktreePath string
 	IssueID      string
 }
 
 func loadTaskMergeInfo(pool *pgxpool.Pool, taskID string) (*taskMergeInfo, error) {
+	var status string
 	var prURL, worktree *string
 	var metadata []byte
 	err := pool.QueryRow(context.Background(), `
-		SELECT pr_url, worktree_path, metadata FROM tasks WHERE id = $1
-	`, taskID).Scan(&prURL, &worktree, &metadata)
+		SELECT status, pr_url, worktree_path, metadata FROM tasks WHERE id = $1
+	`, taskID).Scan(&status, &prURL, &worktree, &metadata)
 	if err != nil {
 		return nil, fmt.Errorf("pipeline: loading merge info for %s: %w", taskID, err)
 	}
-	info := &taskMergeInfo{}
+	info := &taskMergeInfo{Status: status}
 	if prURL != nil {
 		info.PRURL = *prURL
 	}
@@ -236,6 +249,35 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	if err != nil {
 		return err
 	}
+	// Status guard: only merge ready_to_merge tasks. The merger episode
+	// flips the task to pending_approval atomically with its queue-entry
+	// landing — a processor that claimed the entry just before that must
+	// release, not merge a parked task behind a needs-human verdict.
+	if info.Status != "ready_to_merge" {
+		if err := db.ReleaseMergeEntry(pool, entry.ID); err != nil {
+			return fmt.Errorf("pipeline: releasing %d: %w", entry.ID, err)
+		}
+		log.Printf("pipeline: merge %s skipped — task status %q (entry released)", taskID, info.Status)
+		return nil
+	}
+	// Merger-episode guard (MAQ-15): while a merger agent is resolving a
+	// conflict — live pane, or an armed marker no verdict consumed yet —
+	// the entry is released untouched. Rebasing a worktree the merger is
+	// mid-resolution in would corrupt the episode; re-processing would
+	// double-arm it.
+	if cfg.MergeAgent {
+		pending, err := mergerEpisodePending(ctx, pool, taskID)
+		if err != nil {
+			log.Printf("pipeline: merge %s: merger episode check: %v", taskID, err)
+		}
+		if pending {
+			if err := db.ReleaseMergeEntry(pool, entry.ID); err != nil {
+				return fmt.Errorf("pipeline: releasing %d: %w", entry.ID, err)
+			}
+			log.Printf("pipeline: merge %s: merger episode in flight — entry released for a later pass", taskID)
+			return nil
+		}
+	}
 	pr, err := prFromPullURL(info.PRURL)
 	if err != nil {
 		// Bad/unset PR URL: the work is done but the merge machinery
@@ -257,10 +299,17 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("git fetch failed: %v", err))
 	}
 	if _, err := git.Rebase(wt, "origin/"+base); err != nil {
-		if conflictErr, ok := err.(*git.ConflictError); ok {
-			return parkMergeConflict(ctx, pool, taskID, entry, conflictErr)
+		conflictErr, ok := err.(*git.ConflictError)
+		if !ok {
+			return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("rebase onto %s failed: %v", base, err))
 		}
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("rebase onto %s failed: %v", base, err))
+		// MAQ-15: under PIPELINE_MERGE_AGENT the conflict arms a merger
+		// episode (marker + released entry; the dispatch loop spawns the
+		// agent) instead of parking needs-human immediately.
+		if cfg.MergeAgent {
+			return armMergeConflictAgent(ctx, pool, cfg, entry, base, conflictErr)
+		}
+		return parkMergeConflict(ctx, pool, taskID, entry, conflictErr)
 	}
 
 	// 2. Publish the rebased branch (lease-guarded force push).
