@@ -138,6 +138,43 @@ func (Runner) PRPostComment(ctx context.Context, pr int, body string) error {
 	return nil
 }
 
+// PRPostCommentURL posts body as a new PR comment and returns the comment's
+// URL (gh prints it on success) — the delivery confirmation the MAQ-24
+// Telegram-reply path quotes back into the Pipeline topic.
+func (r Runner) PRPostCommentURL(ctx context.Context, pr int, body string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "comment", fmt.Sprint(pr), "--body", body)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr comment %d: %w", pr, err)
+	}
+	return parsePRCommentURL(out)
+}
+
+// parsePRCommentURL extracts the comment URL from `gh pr comment` stdout
+// (e.g. https://github.com/o/r/pull/7#issuecomment-123456).
+func parsePRCommentURL(out []byte) (string, error) {
+	url := strings.TrimSpace(string(out))
+	if url == "" {
+		return "", fmt.Errorf("gh pr comment: empty output — no comment url")
+	}
+	if !strings.Contains(url, "#issuecomment-") {
+		return "", fmt.Errorf("gh pr comment: unexpected output %q — no comment url", url)
+	}
+	return url, nil
+}
+
+// PRState returns the PR's state: "OPEN", "CLOSED" or "MERGED" (the MAQ-24
+// reply-comment guard: only an open PR accepts comments that a review round
+// will weigh).
+func (Runner) PRState(ctx context.Context, pr int) (string, error) {
+	out, err := exec.CommandContext(ctx, "gh", "pr", "view", fmt.Sprint(pr),
+		"--json", "state", "--jq", ".state").Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr view %d state: %w", pr, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // IsCollaborator reports whether login is a repo collaborator — the default
 // allowlist when PIPELINE_GH_ALLOWED_LOGINS is unset. gh api exits non-zero
 // on the 404 (not a collaborator); any other failure is an error so the

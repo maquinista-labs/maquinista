@@ -343,7 +343,7 @@ func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, ent
 	}
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("%s gate failed on branch %s — `%s` %s:\n%s", stepHead, entry.Branch, gateCmd, cause, output))
-	notifyf(ctx, pool, "🆘 %s: %s gate failed on branch %s — `%s` %s. %s (first %d lines):\n%s\nTask parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s gate failed on branch %s — `%s` %s. %s (first %d lines):\n%s\nTask parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
 		taskTitle(ctx, pool, taskID), step, entry.Branch, gateCmd, cause, outLabel, maxBuildErrLines, output, taskID, prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s %s gate failed on branch %s", taskID, step, entry.Branch)
 	return nil

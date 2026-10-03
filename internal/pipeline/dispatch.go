@@ -390,7 +390,7 @@ func retireStuckImplementor(ctx context.Context, pool *pgxpool.Pool, taskID stri
 	if tag.RowsAffected() == 0 {
 		return false, true, nil // raced to dead elsewhere — no notification
 	}
-	notifyf(ctx, pool, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.%s",
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.%s",
 		taskTitle(ctx, pool, taskID), agentID, idleAfter, prLinkSuffix(ctx, pool, taskID))
 	return true, true, nil
 }
@@ -834,7 +834,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration
 		}
 		if applied {
 			log.Printf("pipeline: dispatch: watchdog retired stalled reviewer %s on %s → needs_human", r.agentID, r.taskID)
-			notifyf(ctx, pool, "🆘 %s: %s%s", r.taskTitle,
+			notifyTaskf(ctx, pool, r.taskID, "🆘 %s: %s%s", r.taskTitle,
 				fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout),
 				prLinkSuffix(ctx, pool, r.taskID))
 			killReviewerPane(sessionName, r.session, r.window, killWindow)
@@ -853,7 +853,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration
 		}
 		if applied {
 			log.Printf("pipeline: dispatch: watchdog retired stalled fixer %s on %s → needs_human", r.agentID, r.taskID)
-			notifyf(ctx, pool, "🆘 %s: %s%s", r.taskTitle,
+			notifyTaskf(ctx, pool, r.taskID, "🆘 %s: %s%s", r.taskTitle,
 				fmt.Sprintf("watchdog: fix stalled past %s — needs human", timeout),
 				prLinkSuffix(ctx, pool, r.taskID))
 			killReviewerPane(sessionName, r.session, r.window, killWindow)

@@ -21,3 +21,4 @@ sections are stubs waiting to be filled in once the plan lands.
 | [sidecar.md](sidecar.md) | Per-agent supervisor design, current transitional state, migration path |
 | [dashboard.md](dashboard.md) | Next.js + Go architecture, embedding, API routes, tunnel, auth |
 | [database.md](database.md) | Postgres as single source of truth, migrations, NOTIFY channels, key tables |
+| [deploy.md](deploy.md) | `maquinista deploy` verb: preflight guards, §9 binary swap, health-checked restarts |

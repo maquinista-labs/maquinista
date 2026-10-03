@@ -508,6 +508,11 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   agent, so ordinary agent conversations are never hijacked. The ack is
   immediate; the merge runs async and its outcome rides the standard
   notifier notes into the same topic.
+- **Reply comments (MAQ-24)** — a plain reply to a pipeline notification in
+  the Pipeline topic is posted verbatim as a PR comment on that task's open
+  PR (`internal/bot/pipeline_reply.go` intercept, after the verb arm;
+  `internal/pipeline/telegram_comment.go` for resolution/claim/post). See
+  "Telegram reply → PR comment" below.
 - **Ticket comments** — `RunCommentApprovals` polls at the sync cadence
   (10 s, same pass family). Each pass: ready_to_merge tasks with a
   `ticket_issue_map` row → `CommentFetcher.RecentComments` (optional
@@ -530,6 +535,40 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   Notes about `pending_approval` tasks (round cap, needs-human escalation,
   CI-cap) keep the CLI-only form — the comment verb deliberately does not
   act on `pending_approval`.
+
+## Telegram reply → PR comment (MAQ-24)
+
+Feedback no longer requires a browser: a non-verb reply to a pipeline
+notification in the Pipeline topic lands as a PR comment on that task's
+open PR, and the next review round weighs it through MAQ-16's existing
+human-comment machinery (the comment is authored by the gh CLI account and
+carries no `[review round N]` marker, so it counts as human INPUT
+unchanged).
+
+- **Target resolution, no prose parsing** — task-aware notifications stamp
+  their task id into the outbox content (`NotifyTask`/`notifyTaskf`; every
+  verdict/merge/watchdog note uses them). The bot resolves a replied-to
+  Telegram message via `channel_deliveries.external_msg_id` (the message id
+  the dispatcher recorded) → `agent_outbox` → `content->>'task_id'`. A miss
+  (not a notification, or a legacy row without the stamp) falls through to
+  the routing ladder exactly as before.
+- **Exactly-once** — `telegram_pr_comments` (migration `039`): PK
+  `(chat_id, message_id)`, the INSERT is the claim made BEFORE posting, so
+  a retried/redelivered update of the same reply never double-posts.
+  `disposition` audits the outcome (`ok` / `no_op` / `error`), and the
+  comment URL is stored + quoted back into the topic as the delivery
+  confirmation.
+- **Open-PR guard** — `pipeline.PostPRComment` gates on `tasks.pr_url`
+  being a GitHub pull URL and the PR state being OPEN (`gh pr view
+  --json state`); anything else is `ErrNoOpenPR` → one graceful "no open
+  PR" reply, nothing posted (AC: no-PR tasks are safe). gh specifics live
+  behind `pipeline.PRCommentPoster` (`PRState` + `PRPostCommentURL`);
+  production is the shared gh CLI wrapper (`internal/gh`), which captures
+  the comment URL `gh pr comment` prints.
+- **Verbs stay MAQ-11's** — the in-topic `approve <ref>` intercept runs
+  first (handlers.go ordering), and `maquinista <verb>`-shaped replies are
+  refused here: posting them would arm the MAQ-12 GitHub comment-command
+  surface from chat text. approve/reject/resolve behavior is unchanged.
 
 ## TODO
 
