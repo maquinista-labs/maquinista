@@ -128,6 +128,14 @@ live reviewer agent:
   task-bound, soul clone, tmux pane, sidecar), then bumps
   `tasks.review_rounds` and enqueues the round prompt in ONE tx
   (`external_msg_id = review:<task>:<round>` dedups)
+- on a `uq_agents_task_live` spawn failure, runs the **stuck-implementor
+  self-heal (MAQ-14)**: if the blocking live row is the task's implementor
+  whose last outbox activity is older than
+  `MAQUINISTA_IMPLEMENTOR_IDLE_AFTER` (default 10m), it is auto-retired
+  (`status='dead'`, guarded UPDATE — fires once, which is also the
+  exactly-once Pipeline-topic notification dedup) and the reviewer spawns
+  next tick. Fresh implementors are left alone (silent retry); the same
+  heal guards the fixer pass.
 
 **Prompt heal.** A crash between spawn and enqueue leaves a live reviewer
 with no prompt; the heal pass re-enqueues exactly one (dedup'd) on the next
@@ -189,6 +197,7 @@ is bounded the same way.
 | `MAQUINISTA_TICKETS_PROJECT` | project_id stamped on claimed tasks | falls back to `MAQUINISTA_PROJECT` |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
 | `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound (reviewers + fixers) | `2h` |
+| `MAQUINISTA_IMPLEMENTOR_IDLE_AFTER` | stuck-implementor self-heal bound: outbox idleness past this retires a `uq_agents_task_live`-blocking implementor row | `10m` |
 | `MAQUINISTA_REVIEW_ROUNDS_MAX` | fixer-loop cap: the request_changes landing at/after this review round parks the task | `3` |
 | `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |
 | `PIPELINE_MERGE_MODE` | merge driver: `local` (MergeNoFF in repo) or `gh` (remote PR flow) | `local` |

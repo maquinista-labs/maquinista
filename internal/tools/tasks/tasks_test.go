@@ -149,3 +149,52 @@ func TestMarkClosed_FailsTask(t *testing.T) {
 		t.Errorf("status=%q pr_state=%q", status, pr)
 	}
 }
+
+func TestRelease_RetiresImplementorOnly(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+	if err := CreateTask(ctx, pool, Task{ID: "R", Title: "R"}); err != nil {
+		t.Fatal(err)
+	}
+	seedAgent := func(id, role, status, taskID string) {
+		t.Helper()
+		_, err := pool.Exec(ctx, `
+			INSERT INTO agents (id, tmux_session, tmux_window, role, task_id, status,
+			                    runner_type, cwd, window_name, started_at, last_seen, stop_requested)
+			VALUES ($1, 'sess', $1, $2, $4, $3, 'pi', '/tmp/wt', $1, NOW(), NOW(), FALSE)
+		`, id, role, status, taskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	// uq_agents_task_live is per-task: the decoy reviewer lives on its own task.
+	if err := CreateTask(ctx, pool, Task{ID: "R2", Title: "R2"}); err != nil {
+		t.Fatal(err)
+	}
+	seedAgent("implementor-R", "implementor", "running", "R")
+	seedAgent("reviewer-R", "reviewer", "running", "R2")
+
+	n, err := Release(ctx, pool, "R")
+	if err != nil || n != 1 {
+		t.Fatalf("Release = (%d,%v), want (1,nil)", n, err)
+	}
+	var implStatus, revStatus string
+	pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='implementor-R'`).Scan(&implStatus)
+	pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='reviewer-R'`).Scan(&revStatus)
+	if implStatus != "dead" {
+		t.Errorf("implementor status = %q, want dead", implStatus)
+	}
+	if revStatus != "running" {
+		t.Errorf("reviewer status = %q, want running (untouched)", revStatus)
+	}
+	var taskStatus string
+	pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id='R'`).Scan(&taskStatus)
+	if taskStatus != "pending" {
+		t.Errorf("task status = %q, want pending (untouched)", taskStatus)
+	}
+
+	// Idempotent: second release retires nothing.
+	if n, err := Release(ctx, pool, "R"); err != nil || n != 0 {
+		t.Fatalf("second Release = (%d,%v), want (0,nil)", n, err)
+	}
+}

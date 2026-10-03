@@ -51,7 +51,17 @@ worktree.
    ```
    This flips `tasks.pr_state='open'` and `tasks.status='review'`.
 
-8. **Hand off**:
+8. **Release your implementor row**:
+   ```
+   maquinista tasks release <task-id>
+   ```
+   Your `agents` row is still live and only one live agent per task is
+   allowed — until it retires, the reviewer spawn fails on
+   `uq_agents_task_live` (MAQ-14). This is idempotent; if you skip it, the
+   dispatch loop self-heals after ~10 min of outbox idle, but don't rely
+   on that.
+
+9. **Hand off**:
    ```
    maquinista tasks mark-review <task-id>   # idempotent safety net
    ```

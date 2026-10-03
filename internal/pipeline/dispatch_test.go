@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -16,13 +18,17 @@ import (
 // (pane mechanics themselves are SpawnFresh's own tests' business — EX-03
 // owns the DB surface).
 type fakeSpawner struct {
-	t         *testing.T
-	pool      *pgxpool.Pool
-	spawns    []ReviewSpawnParams
-	insertRow bool
+	t              *testing.T
+	pool           *pgxpool.Pool
+	spawns         []ReviewSpawnParams
+	insertRow      bool
+	failUniqueLive bool // surface the uq_agents_task_live INSERT failure
 }
 
 func (f *fakeSpawner) SpawnReviewer(_ context.Context, p ReviewSpawnParams) error {
+	if f.failUniqueLive {
+		return fmt.Errorf("insert agent row: ERROR: duplicate key value violates unique constraint %q (SQLSTATE 23505)", "uq_agents_task_live")
+	}
 	f.spawns = append(f.spawns, p)
 	if f.insertRow {
 		role := p.Role
@@ -55,6 +61,48 @@ func seedReviewer(t *testing.T, pool *pgxpool.Pool, agentID, taskID string) {
 		                    runner_type, cwd, window_name, started_at, last_seen, stop_requested)
 		VALUES ($1, 'sess', $1, 'reviewer', $2, 'running', 'pi', '/tmp/wt', $1, NOW(), NOW(), FALSE)
 	`, agentID, taskID)
+}
+
+// seedImplementor inserts a live implementor agent bound to the task;
+// startedAt is a raw SQL timestamptz expression (e.g. "NOW() - interval '1 hour'").
+func seedImplementor(t *testing.T, pool *pgxpool.Pool, agentID, taskID, startedAt string) {
+	t.Helper()
+	execOK(t, pool, `
+		INSERT INTO agents (id, tmux_session, tmux_window, role, task_id, status,
+		                    runner_type, cwd, window_name, started_at, last_seen, stop_requested)
+		VALUES ($1, 'sess', $1, 'implementor', $2, 'running', 'pi', '/tmp/wt', $1, `+startedAt+`, NOW(), FALSE)
+	`, agentID, taskID)
+}
+
+// seedOutboxRow gives the agent an assistant outbox row aged by the raw SQL
+// interval expression (e.g. "30 minutes") — the monitor's liveness signal.
+func seedOutboxRow(t *testing.T, pool *pgxpool.Pool, agentID, age string) {
+	t.Helper()
+	execOK(t, pool, `
+		INSERT INTO agent_outbox (agent_id, content, created_at)
+		VALUES ($1, '{"type":"text","text":"PR opened."}'::jsonb, NOW() - $2::interval)
+	`, agentID, age)
+}
+
+func agentStatus(t *testing.T, pool *pgxpool.Pool, agentID string) string {
+	t.Helper()
+	var v string
+	if err := pool.QueryRow(context.Background(),
+		`SELECT status FROM agents WHERE id = $1`, agentID).Scan(&v); err != nil {
+		t.Fatalf("agent %s: %v", agentID, err)
+	}
+	return v
+}
+
+// pipelineNotifications counts pipeline-topic outbox rows mentioning the
+// stuck-implementor auto-retire — the exactly-once notification surface.
+func pipelineNotifications(t *testing.T, pool *pgxpool.Pool, taskID string) int {
+	t.Helper()
+	return count(t, pool, `
+		SELECT count(*) FROM agent_outbox
+		WHERE agent_id = 'pipeline' AND content->>'text' LIKE '%auto-retired%'
+		  AND content->>'text' LIKE '%' || $1 || '%'
+	`, taskID)
 }
 
 func taskCol(t *testing.T, pool *pgxpool.Pool, taskID, col string) string {
@@ -166,7 +214,7 @@ func TestZeroAuthor_RejectsSelfReview(t *testing.T) {
 	`)
 
 	sp := &fakeSpawner{t: t, pool: pool}
-	if err := dispatchPass(ctx, pool, sp); err != nil {
+	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if len(sp.spawns) != 0 {
@@ -190,7 +238,7 @@ func TestDispatch_SpawnsReviewerWithSoulAndBinding(t *testing.T) {
 	`)
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := dispatchPass(ctx, pool, sp); err != nil {
+	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if len(sp.spawns) != 1 {
@@ -226,7 +274,7 @@ func TestDispatch_SpawnsReviewerWithSoulAndBinding(t *testing.T) {
 
 	// Second tick: everything already in place → strict no-op.
 	before := len(sp.spawns)
-	if err := dispatchPass(ctx, pool, sp); err != nil {
+	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass 2: %v", err)
 	}
 	if len(sp.spawns) != before {
@@ -266,7 +314,7 @@ func TestReviewRounds_IncrementsPerSpawn(t *testing.T) {
 	seedReviewTask(t, pool, "tc", "uuid-c", "/tmp/wt-tc")
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := dispatchPass(ctx, pool, sp); err != nil {
+	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 
@@ -279,7 +327,7 @@ func TestReviewRounds_IncrementsPerSpawn(t *testing.T) {
 
 	// EX-04 fixer requeue (simulated): task returns to review.
 	execOK(t, pool, `UPDATE tasks SET status = 'review' WHERE id = 'tc'`)
-	if err := dispatchPass(ctx, pool, sp); err != nil {
+	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass round 2: %v", err)
 	}
 	if len(sp.spawns) != 2 {
@@ -471,5 +519,141 @@ func TestDerivedState_ReviewTransitions(t *testing.T) {
 	}
 	if name := ColReadyToMerge.String(); name != "Ready to Merge" {
 		t.Fatalf("ColReadyToMerge = %q, want Ready to Merge", name)
+	}
+}
+
+// ---- stuck-implementor self-heal (MAQ-14) -------------------------------
+
+func TestIsUniqueLiveErr(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("new tmux window: exited unexpectedly"), false},
+		{fmt.Errorf("insert agent row: %w", errors.New(`ERROR: duplicate key value violates unique constraint "uq_agents_task_live" (SQLSTATE 23505)`)), true},
+	}
+	for i, c := range cases {
+		if got := isUniqueLiveErr(c.err); got != c.want {
+			t.Errorf("case %d: isUniqueLiveErr = %v, want %v", i, got, c.want)
+		}
+	}
+}
+
+// TestDispatch_StuckImplementor_AutoRetireThenReviewerSpawns is the MAQ-14
+// regression: an implementor opens the PR (set-pr → task 'review'), ends its
+// turn without retiring, and its live row blocks every reviewer spawn with
+// uq_agents_task_live. Once the implementor's outbox is idle past the bound,
+// dispatch retires it exactly once (one pipeline-topic notification) and the
+// next tick spawns the reviewer.
+func TestDispatch_StuckImplementor_AutoRetireThenReviewerSpawns(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "ts", "uuid-s", "/tmp/wt-ts")
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('ts', 'implementor-ts', 'result', 'opened the PR')
+	`)
+	seedImplementor(t, pool, "implementor-ts", "ts", `NOW() - interval '1 hour'`)
+	seedOutboxRow(t, pool, "implementor-ts", "30 minutes")
+
+	// Tick 1: spawn dies on the unique-live index → self-heal retires.
+	sp := &fakeSpawner{t: t, pool: pool, failUniqueLive: true}
+	if err := dispatchPass(ctx, pool, sp, 10*time.Minute); err != nil {
+		t.Fatalf("dispatchPass: %v", err)
+	}
+	if len(sp.spawns) != 0 {
+		t.Fatalf("spawns = %d, want 0 (blocked tick)", len(sp.spawns))
+	}
+	if got := agentStatus(t, pool, "implementor-ts"); got != "dead" {
+		t.Fatalf("stuck implementor status = %q, want dead", got)
+	}
+	if n := pipelineNotifications(t, pool, "ts"); n != 1 {
+		t.Fatalf("auto-retire notifications = %d, want exactly 1", n)
+	}
+	if got := taskCol(t, pool, "ts", "status"); got != "review" {
+		t.Fatalf("task status = %q, want review (self-heal must not park)", got)
+	}
+
+	// Tick 2: blocker gone → reviewer spawns; no second notification.
+	sp2 := &fakeSpawner{t: t, pool: pool, insertRow: true}
+	if err := dispatchPass(ctx, pool, sp2, 10*time.Minute); err != nil {
+		t.Fatalf("dispatchPass 2: %v", err)
+	}
+	if len(sp2.spawns) != 1 || sp2.spawns[0].AgentID != "reviewer-ts" {
+		t.Fatalf("spawns = %+v, want one reviewer-ts", sp2.spawns)
+	}
+	if n := pipelineNotifications(t, pool, "ts"); n != 1 {
+		t.Fatalf("notifications after recovery = %d, want still 1", n)
+	}
+}
+
+// An implementor that never streamed a single outbox row idles from
+// started_at (COALESCE fallback) — same self-heal bound.
+func TestDispatch_StuckImplementor_NeverStreamed(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tn", "uuid-n", "/tmp/wt-tn")
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('tn', 'implementor-tn', 'result', 'opened the PR')
+	`)
+	seedImplementor(t, pool, "implementor-tn", "tn", `NOW() - interval '1 hour'`)
+
+	sp := &fakeSpawner{t: t, pool: pool, failUniqueLive: true}
+	if err := dispatchPass(ctx, pool, sp, 10*time.Minute); err != nil {
+		t.Fatalf("dispatchPass: %v", err)
+	}
+	if got := agentStatus(t, pool, "implementor-tn"); got != "dead" {
+		t.Fatalf("implementor status = %q, want dead (idle from started_at)", got)
+	}
+	if n := pipelineNotifications(t, pool, "tn"); n != 1 {
+		t.Fatalf("notifications = %d, want exactly 1", n)
+	}
+}
+
+// A fresh implementor (outbox activity within the bound) is left strictly
+// alone: no retire, no notification — silent retry until the idle bound.
+func TestDispatch_FreshImplementor_KeepsWaiting(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tf", "uuid-f", "/tmp/wt-tf")
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('tf', 'implementor-tf', 'result', 'opened the PR')
+	`)
+	seedImplementor(t, pool, "implementor-tf", "tf", `NOW() - interval '1 hour'`)
+	seedOutboxRow(t, pool, "implementor-tf", "1 minute")
+
+	sp := &fakeSpawner{t: t, pool: pool, failUniqueLive: true}
+	if err := dispatchPass(ctx, pool, sp, 10*time.Minute); err != nil {
+		t.Fatalf("dispatchPass: %v", err)
+	}
+	if got := agentStatus(t, pool, "implementor-tf"); got != "running" {
+		t.Fatalf("fresh implementor status = %q, want running", got)
+	}
+	if n := pipelineNotifications(t, pool, "tf"); n != 0 {
+		t.Fatalf("notifications = %d, want 0", n)
+	}
+}
+
+// A non-implementor blocker (e.g. a live reviewer row from a cross-process
+// race) must NOT be auto-retired — the generic retry path stays.
+func TestDispatch_NonImplementorBlocker_NotRetired(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tr", "uuid-r", "/tmp/wt-tr")
+	seedReviewer(t, pool, "reviewer-tr", "tr")
+	seedOutboxRow(t, pool, "reviewer-tr", "30 minutes")
+
+	sp := &fakeSpawner{t: t, pool: pool, failUniqueLive: true}
+	if err := dispatchPass(ctx, pool, sp, 10*time.Minute); err != nil {
+		t.Fatalf("dispatchPass: %v", err)
+	}
+	if got := agentStatus(t, pool, "reviewer-tr"); got != "running" {
+		t.Fatalf("reviewer blocker status = %q, want running (untouched)", got)
+	}
+	if n := pipelineNotifications(t, pool, "tr"); n != 0 {
+		t.Fatalf("notifications = %d, want 0", n)
 	}
 }
