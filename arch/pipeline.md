@@ -283,38 +283,71 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
 - **Enqueue pass** — each dispatch tick, tasks landing in `ready_to_merge`
   with a PR URL and a worktree get an entry (branch derived from the
   worktree's HEAD, base from `origin/HEAD`).
-- **Processing** — `maquinista merge` (or the approve verb, below) claims an
-  entry and drives the remote: `fetch` → `rebase origin/<base>` →
-  `push --force-with-lease` → CI gate (`gh pr view statusCheckRollup`) →
-  `gh pr merge --squash`. After the squash lands: entry `merged` with the
-  squash SHA, task `ready_to_merge → done` with `pr_state=merged`, one
-  observation, a best-effort board push to Done, then worktree + local +
-  remote branch cleanup.
+- **Drain — daemon-native executor (MAQ-21)** — the orchestrator runs the
+  merge executor itself: `pipeline.RunMergeDrain` (started next to the
+  dispatch loop, gh mode + auto-merge only) claims the OLDEST `pending`
+  entry every 10 s and drives it through the full flow below. Exactly-once
+  by claim (`pending → merging` held for the duration; every terminal arm
+  records queue+task state before returning); an infra error with no
+  terminal arm releases the entry back to `pending` for a later pass. This
+  replaces the external bash watcher (`merge-watcher.service` →
+  `~/.local/bin/merge-watcher.sh`), which re-ran `maquinista approve` in a
+  polling loop, could not reuse the daemon's guarded transitions, and
+  caused the 03/10 attempt-counter flood (128 duplicate notifies) — with
+  the daemon draining, no second executor may poll beside it. Inert in
+  local mode and when auto-merge is off (those merges belong to the
+  approve verb). `maquinista merge` remains as a manual one-shot on the
+  same code path.
+- **Processing** — `maquinista merge` (or the approve verb, below, or the
+  drain above) claims an entry and drives the remote: `fetch` →
+  `rebase origin/<base>` → `push --force-with-lease` → CI gate
+  (`gh pr view statusCheckRollup`) → `gh pr merge --squash`. After the
+  squash lands: entry `merged` with the squash SHA, task
+  `ready_to_merge → done` with `pr_state=merged`, one observation, a
+  best-effort board push to Done, then worktree + local + remote branch
+  cleanup.
 - **CI gate** — pending checks release the entry back to `pending` (a later
   pass retries); failed checks bump `attempts` and release silently below
   the cap, at the cap (default 5, `MAQUINISTA_MERGE_ATTEMPTS_MAX`) the entry
   fails, the task parks `pending_approval`, and the Pipeline topic gets the
   question (EX-06). No checks configured counts as green.
-- **Build gate (MAQ-20)** — between the CI gate and the squash: the branch is
-  never merged uncompiled. The gate materializes `origin/<branch>` — the
-  exact tree a squash-merge takes, rebase included — in a detached throwaway
-  worktree under `os.TempDir()` (`maquinista-mergegate-*`) and runs
-  `go build ./...` there (`internal/pipeline/mergegate.go`). Deterministic
-  compile failure: entry `failed` (terminal — the branch must change;
-  re-approval after a fix enqueues a fresh one), task parks
-  `pending_approval`, and both the Pipeline-topic question and a `merger`
-  observation carry the first ~20 compiler lines (MAQ-20: duplicate consts
-  across files are invisible in a per-file diff read but loud in build
-  output). Infra trouble (toolchain missing, worktree add failure, >10 min
-  build) fails the entry without blaming the branch — re-approve retries.
-  A branch root without `go.mod` passes vacuously (non-Go repos unchanged).
-  The worktree is removed on every outcome; there is deliberately NO config
-  knob — a skippable gate would reintroduce the PR-#21 failure. All merge
-  surfaces gate: the approve verb (Telegram, ticket comment, CLI) and
-  auto-merge converge on `ProcessMergeGH`, as does the merger-agent re-run
-  after a MAQ-15 conflict resolution. Added latency is one warm
-  `go build ./...` (~60-90s on the box, inside the approve fast-path
-  budget).
+- **Quality gate (MAQ-20 build + MAQ-21 tests)** — between the CI gate and
+  the squash, two legs in order (`runMergeGate`): the branch is never
+  merged uncompiled or red. Both legs materialize `origin/<branch>` — the
+  exact tree a squash-merge takes, rebase included — in a detached
+  throwaway worktree under `os.TempDir()` (`maquinista-mergegate-*`) and
+  run there (`internal/pipeline/mergegate.go`):
+  1. **build** — `go build ./...` (MAQ-20: PR #21 redeclared consts across
+     files and merged green; duplicate consts are invisible in a per-file
+     diff read but loud in compiler output).
+  2. **test** — `go test` on the packages the branch touches (MAQ-21,
+     decision C(b): `go build` does not compile `_test.go` files, so a red
+     test or a removed test-only dependency slips past the build leg).
+     Package selection (`touchedPackages`): the directory of every changed
+     `.go` file vs the merge-base with the base branch — base drift never
+     widens the set; a package the branch DELETES drops out (testing a
+     vanished directory would red-flag a legitimate removal);
+     `go.mod`/`go.sum` changes widen to the whole module (dependency
+     shifts can break any package's tests while the build stays green);
+     non-Go changes (docs, CI configs) select nothing.
+
+  Deterministic failure of either leg: entry `failed` (terminal — the
+  branch must change; re-approval after a fix enqueues a fresh one), task
+  parks `pending_approval`, and both the Pipeline-topic question and a
+  `merger` observation name the FAILING STEP (`go build ./...` or the
+  exact `go test <pkgs>` command, paths capped at 8 + count) and carry the
+  first ~20 output lines. Infra trouble (toolchain missing, worktree add
+  failure, >10 min build or >10 min test run) fails the entry without
+  blaming the branch — re-approve retries. A branch root without `go.mod`
+  passes vacuously (non-Go repos unchanged). The worktree is removed on
+  every outcome; there is deliberately NO config knob — a skippable gate
+  would reintroduce the PR-#21 failure. All merge surfaces gate: the
+  approve verb (Telegram, ticket comment, CLI), auto-merge, and the drain
+  converge on `ProcessMergeGH`, as does the merger-agent re-run after a
+  MAQ-15 conflict resolution. Added latency is one warm `go build ./...`
+  (~60-90s on the box) plus the touched packages' tests (seconds for most;
+  the DB-heavy integration packages run minutes — the ~3–5 min budget is
+  typical, 10m per leg is insurance).
 - **Conflicts — merger-agent leg (MAQ-15)** — under `PIPELINE_MERGE_AGENT=1`, a
   rebase conflict no longer parks immediately: the processor bumps the
   entry's `attempts` (the same budget as the CI cap), parks a
