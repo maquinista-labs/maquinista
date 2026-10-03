@@ -23,6 +23,23 @@ make dashboard-test       # Go-side dashboard tests (supervisor, config, CLI)
 
 `SKIP_DASHBOARD=1 make build` skips the Next.js pipeline and uses the committed `standalone.tgz` tarball.
 
+## PR descriptions
+
+Every PR opened in this repo (pipeline agent or human) MUST carry a description with exactly two sections:
+
+````markdown
+## what?
+<Concrete summary of the change: files/behavior, not narrative.>
+
+## why?
+<Motivation: problem solved + reference to the Linear issue ID (MAQ-NN) it implements.>
+````
+
+- `## what?` states observable behavior — what a reviewer will see change, without reading the diff.
+- `## why?` anchors the change to its task/spec; always cite the Linear issue ID.
+
+`.github/pull_request_template.md` pre-fills this skeleton for human-opened PRs.
+
 ## First-run
 
 ```bash
