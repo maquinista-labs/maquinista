@@ -307,12 +307,14 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   with a PR URL and a worktree get an entry (branch derived from the
   worktree's HEAD, base from `origin/HEAD`).
 - **Processing** — `maquinista merge` (or the approve verb, below) claims an
-  entry and drives the remote: `fetch` → `rebase origin/<base>` →
-  `push --force-with-lease` → CI gate (`gh pr view statusCheckRollup`) →
-  `gh pr merge --squash`. After the squash lands: entry `merged` with the
-  squash SHA, task `ready_to_merge → done` with `pr_state=merged`, one
-  observation, a best-effort board push to Done, then worktree + local +
-  remote branch cleanup.
+  entry and drives the remote: `fetch` → up-to-date fast path (MAQ-26: if
+  `origin/<base>` is already an ancestor of `origin/<branch>`, skip the
+  rewrite) → `rebase origin/<base>` → `push --force-with-lease` → CI gate
+  (`gh pr view statusCheckRollup`) → `gh pr merge --squash`. After the
+  squash lands: entry `merged` with the squash SHA, task
+  `ready_to_merge → done` with `pr_state=merged`, one observation, a
+  best-effort board push to Done, then worktree + local + remote branch
+  cleanup.
 - **CI gate** — pending checks release the entry back to `pending` (a later
   pass retries); failed checks bump `attempts` and release silently below
   the cap, at the cap (default 5, `MAQUINISTA_MERGE_ATTEMPTS_MAX`) the entry
@@ -338,6 +340,29 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   after a MAQ-15 conflict resolution. Added latency is one warm
   `go build ./...` (~60-90s on the box, inside the approve fast-path
   budget).
+- **Conflicts — auto merge-up leg (MAQ-26)** — with `PIPELINE_MERGE_AGENT=0`
+  (default), a rebase conflict no longer parks needs-human instantly: the
+  gate first tries an automatic merge-up, folding `origin/<base>` into the
+  BRANCH REF (never the task worktree — a fixer may be mid-episode in it).
+  GitHub's update-branch API first (`GhRunner.PRUpdateBranch`, with the
+  observed head SHA so a racing push 409s into a free re-release), then a
+  local fallback: `origin/<branch>` materialized in a detached throwaway
+  worktree (`maquinista-mergeup-*`), `--no-ff` merge of the base, published
+  as a strict fast-forward push. Success is re-verified (`origin/<base>`
+  must be an ancestor of `origin/<branch>` after a fetch — a claimed-but-
+  unsynced API success counts as a failure, never as mergeable) and the
+  normal gate → squash path resumes on the healed ref (the gates and
+  `finishMergeGH` read `origin/<branch>` throughout). Each FAILED attempt
+  consumes one unit of `merge_queue.mergeup_attempts` (migration 040,
+  deliberately separate from the CI/merger `attempts` budget) and comments
+  on the PR through `GhRunner.PRPostComment` — what was tried, the
+  conflicting files, the budget state. At the cap (N=2, a constant — a
+  tunable parking cap would be argued down) the conflict parks needs-human
+  exactly as before: a conflict surviving two merge-ups is a semantic
+  overlap, which is what the park is for (a `maquinista resolve` comment
+  still spawns a merger session). Below the cap the entry is released for
+  a later pass. The MAQ-15 merger-agent leg, when armed, takes precedence
+  and is unchanged.
 - **Conflicts — merger-agent leg (MAQ-15)** — under `PIPELINE_MERGE_AGENT=1`, a
   rebase conflict no longer parks immediately: the processor bumps the
   entry's `attempts` (the same budget as the CI cap), parks a
@@ -360,8 +385,8 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   guard on task status and on in-flight episodes (live merger or unconsumed
   marker → release untouched), so no merge can complete behind a
   needs-human verdict and no worktree is touched mid-resolution. With
-  `PIPELINE_MERGE_AGENT=0` (default) conflicts park needs-human exactly as
-  before.
+  `PIPELINE_MERGE_AGENT=0` (default) conflicts take the MAQ-26 merge-up leg
+  above.
 - **Human gate** — `PIPELINE_AUTO_MERGE=0` (default) makes every processing
   pass release the entry untouched; `maquinista approve <task>` on a
   `ready_to_merge` task runs the full flow immediately, overriding the gate
@@ -379,10 +404,12 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   via `prLinkSuffix`; tasks without a PR keep the old linkless text
   (MAQ-10: no null/empty links).
 - GitHub is behind `pipeline.GhRunner` (interface: `PRChecks`,
-  `PRMergeSquash`, plus MAQ-16's `PRComments` + `PRPostComment`); production
-  uses the gh CLI (`internal/gh`). The dispatch loop gets the same runner
-  wired in `orchestrator start` (`DispatchConfig.Gh`) for the MAQ-16 PR
-  surface; a nil runner disables it.
+  `PRMergeSquash`, MAQ-16's `PRComments` + `PRPostComment`, and MAQ-26's
+  `PRUpdateBranch` — the update-branch endpoint, whose 422/409 map to
+  `ErrMergeUpConflict`/`ErrMergeUpRace`); production uses the gh CLI
+  (`internal/gh`). The dispatch loop gets the same runner wired in
+  `orchestrator start` (`DispatchConfig.Gh`) for the MAQ-16 PR surface; a
+  nil runner disables it.
 
 ## GitHub comment commands (MAQ-12)
 

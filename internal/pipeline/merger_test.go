@@ -320,6 +320,9 @@ func TestMergerVerdict_NeedsHumanParksWithFiles(t *testing.T) {
 }
 
 // AC 2 (fallback): MergeAgent off keeps the old park behavior.
+// MAQ-26: with the agent off, the conflict leg merge-ups first — two failed
+// attempts park needs-human exactly as the bare path did, and no merger
+// marker is ever written (no episode exists without the agent).
 func TestProcessMergeGH_ConflictNoAgentParks(t *testing.T) {
 	pool := testPool(t)
 	_, worktree := initRemoteTrio(t, "noagent")
@@ -327,12 +330,23 @@ func TestProcessMergeGH_ConflictNoAgentParks(t *testing.T) {
 	taskID := entry.TaskID
 	forceRebaseConflict(t, gitRepoRoot(t, worktree), worktree, "feature.txt", "main wins\n", "branch wins\n")
 
-	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, MergeAgent: false, Gh: &fakeGh{checks: ChecksGreen}}
+	gh := &fakeGh{checks: ChecksGreen, updateErr: ErrMergeUpConflict} // GitHub 422: overlap is semantic
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, MergeAgent: false, Gh: gh}
 	if err := ProcessMergeGH(context.Background(), pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
 		t.Fatal(err)
 	}
+	if got := entryStatus(t, pool, entry.ID); got != "pending" {
+		t.Fatalf("attempt 1: entry = %q, want released to pending (merge-up budget)", got)
+	}
+	claimed, err := db.ClaimMergeEntryByID(pool, entry.ID)
+	if err != nil || claimed == nil {
+		t.Fatalf("re-claim: %v (%v)", err, claimed)
+	}
+	if err := ProcessMergeGH(context.Background(), pool, cfg, &fakeProvider{}, "team-1", claimed); err != nil {
+		t.Fatal(err)
+	}
 	if status, _ := taskRow(t, pool, taskID); status != "pending_approval" {
-		t.Errorf("task = %s, want pending_approval", status)
+		t.Errorf("task = %s, want pending_approval after 2 failed merge-ups", status)
 	}
 	if got := entryStatus(t, pool, entry.ID); got != "conflict" {
 		t.Errorf("entry = %q, want conflict", got)
