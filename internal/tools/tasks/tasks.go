@@ -111,6 +111,24 @@ func MarkReview(ctx context.Context, pool *pgxpool.Pool, taskID string) error {
 	return err
 }
 
+// Release retires the task's live implementor agent row(s) — the end-of-turn
+// cleanup for the /work-on-task flow. set-pr flips the task to 'review' but
+// touches no agents row; without a release (or a maquinista-done, which
+// pipeline implementors must not run — it would force status='done'), the
+// implementor row stays live and uq_agents_task_live blocks the reviewer
+// spawn (MAQ-14). The task row itself is untouched. Idempotent. Returns the
+// number of rows retired.
+func Release(ctx context.Context, pool *pgxpool.Pool, taskID string) (int64, error) {
+	tag, err := pool.Exec(ctx, `
+		UPDATE agents SET status='dead', last_seen=NOW()
+		WHERE task_id = $1 AND status <> 'dead' AND role = 'implementor'
+	`, taskID)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
 // TaskByPR looks up the task whose pr_url matches url. Used by
 // /close-pr to bridge webhook payload → task id.
 func TaskByPR(ctx context.Context, pool *pgxpool.Pool, url string) (string, error) {

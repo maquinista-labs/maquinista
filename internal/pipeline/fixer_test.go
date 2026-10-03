@@ -58,7 +58,7 @@ func TestFixerSpawn_SpawnsForChangesRequested(t *testing.T) {
 	seedFixEpisode(t, pool, "f1", "uuid-f1", "/tmp/wt-f1", 1)
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := fixerPass(ctx, pool, sp); err != nil {
+	if err := fixerPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("fixerPass: %v", err)
 	}
 	if len(sp.spawns) != 1 {
@@ -96,7 +96,7 @@ func TestFixerSpawn_SkipsWhenLiveAgent(t *testing.T) {
 	seedFixer(t, pool, "fixer-f2", "f2")
 
 	sp := &fakeSpawner{t: t, pool: pool}
-	if err := fixerPass(ctx, pool, sp); err != nil {
+	if err := fixerPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("fixerPass: %v", err)
 	}
 	if len(sp.spawns) != 0 {
@@ -113,7 +113,7 @@ func TestFixerSpawn_EnqueuesFixPromptOnce(t *testing.T) {
 	seedFixEpisode(t, pool, "f3", "uuid-f3", "/tmp/wt-f3", 2)
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := fixerPass(ctx, pool, sp); err != nil {
+	if err := fixerPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("fixerPass: %v", err)
 	}
 	if n := count(t, pool, `SELECT count(*) FROM agent_inbox
@@ -151,11 +151,11 @@ func TestFixerSpawn_EpisodeIdempotent(t *testing.T) {
 	seedFixEpisode(t, pool, "f4", "uuid-f4", "/tmp/wt-f4", 1)
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := fixerPass(ctx, pool, sp); err != nil {
+	if err := fixerPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("fixerPass: %v", err)
 	}
 	before := len(sp.spawns)
-	if err := fixerPass(ctx, pool, sp); err != nil {
+	if err := fixerPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("fixerPass 2: %v", err)
 	}
 	if len(sp.spawns) != before {
@@ -173,7 +173,7 @@ func TestFixerPrompt_HealsMissing(t *testing.T) {
 	seedFixer(t, pool, "fixer-f5", "f5")
 
 	for i := 0; i < 2; i++ {
-		if err := fixerPass(ctx, pool, &fakeSpawner{t: t, pool: pool}); err != nil {
+		if err := fixerPass(ctx, pool, &fakeSpawner{t: t, pool: pool}, DefaultImplementorIdleAfter); err != nil {
 			t.Fatalf("fixerPass %d: %v", i, err)
 		}
 	}
@@ -272,7 +272,7 @@ func TestMarkDone_FixerCompletedGoesToReview(t *testing.T) {
 	// Next round: the reviewer spawn pass mints a FRESH reviewer (never a
 	// fixer id) and bumps the round.
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := dispatchPass(ctx, pool, sp); err != nil {
+	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if len(sp.spawns) != 1 {
@@ -382,7 +382,7 @@ func TestFixerSpawn_SecondEpisodeSpawns(t *testing.T) {
 	`)
 
 	sp := &fakeSpawner{t: t, pool: pool}
-	if err := fixerPass(ctx, pool, sp); err != nil {
+	if err := fixerPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("fixerPass: %v", err)
 	}
 	// Mint is suffix-per-existing-AGENT-row: episode 1's fixer exists only as

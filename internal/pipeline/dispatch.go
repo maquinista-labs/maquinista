@@ -106,20 +106,33 @@ type DispatchConfig struct {
 	MaxReviewRounds int
 	// SessionName is the tmux session reviewers run in (window cleanup).
 	SessionName string
+	// ImplementorIdleAfter is the stuck-implementor self-heal bound (MAQ-14):
+	// when a reviewer/fixer spawn fails on uq_agents_task_live and the
+	// blocking live row is the task's implementor with no outbox activity
+	// for this long, the row is auto-retired so the pipeline proceeds
+	// (default 10m, MAQUINISTA_IMPLEMENTOR_IDLE_AFTER).
+	ImplementorIdleAfter time.Duration
 }
+
+// DefaultImplementorIdleAfter is the MAQ-14 self-heal bound: an implementor
+// whose pane streamed nothing for this long after the task reached 'review'
+// has ended its turn without retiring.
+const DefaultImplementorIdleAfter = 10 * time.Minute
 
 // DefaultDispatchConfig returns the documented defaults.
 func DefaultDispatchConfig(sessionName string) DispatchConfig {
 	return DispatchConfig{
-		Interval:        10 * time.Second,
-		ReviewTimeout:   2 * time.Hour,
-		MaxReviewRounds: DefaultMaxReviewRounds,
-		SessionName:     sessionName,
+		Interval:             10 * time.Second,
+		ReviewTimeout:        2 * time.Hour,
+		MaxReviewRounds:      DefaultMaxReviewRounds,
+		SessionName:          sessionName,
+		ImplementorIdleAfter: DefaultImplementorIdleAfter,
 	}
 }
 
-// DispatchConfigFromEnv applies MAQUINISTA_REVIEW_TIMEOUT and
-// MAQUINISTA_REVIEW_ROUNDS_MAX over the defaults.
+// DispatchConfigFromEnv applies MAQUINISTA_REVIEW_TIMEOUT,
+// MAQUINISTA_REVIEW_ROUNDS_MAX and MAQUINISTA_IMPLEMENTOR_IDLE_AFTER over
+// the defaults.
 func DispatchConfigFromEnv(sessionName string) DispatchConfig {
 	cfg := DefaultDispatchConfig(sessionName)
 	if v := strings.TrimSpace(os.Getenv("MAQUINISTA_REVIEW_TIMEOUT")); v != "" {
@@ -127,6 +140,13 @@ func DispatchConfigFromEnv(sessionName string) DispatchConfig {
 			cfg.ReviewTimeout = d
 		} else {
 			log.Printf("pipeline: dispatch: invalid MAQUINISTA_REVIEW_TIMEOUT %q, using %s", v, cfg.ReviewTimeout)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("MAQUINISTA_IMPLEMENTOR_IDLE_AFTER")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			cfg.ImplementorIdleAfter = d
+		} else {
+			log.Printf("pipeline: dispatch: invalid MAQUINISTA_IMPLEMENTOR_IDLE_AFTER %q, using %s", v, cfg.ImplementorIdleAfter)
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("MAQUINISTA_REVIEW_ROUNDS_MAX")); v != "" {
@@ -180,6 +200,9 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 	if cfg.MaxReviewRounds <= 0 {
 		cfg.MaxReviewRounds = DefaultMaxReviewRounds
 	}
+	if cfg.ImplementorIdleAfter <= 0 {
+		cfg.ImplementorIdleAfter = DefaultImplementorIdleAfter
+	}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -188,7 +211,7 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 			return
 		case <-ticker.C:
 		}
-		if err := dispatchPass(ctx, pool, spawn); err != nil {
+		if err := dispatchPass(ctx, pool, spawn, cfg.ImplementorIdleAfter); err != nil {
 			log.Printf("pipeline: dispatch: spawn pass: %v", err)
 		}
 		if err := promptPass(ctx, pool); err != nil {
@@ -197,7 +220,7 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := verdictPass(ctx, pool, cfg.MaxReviewRounds, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: verdict pass: %v", err)
 		}
-		if err := fixerPass(ctx, pool, spawn); err != nil {
+		if err := fixerPass(ctx, pool, spawn, cfg.ImplementorIdleAfter); err != nil {
 			log.Printf("pipeline: dispatch: fixer pass: %v", err)
 		}
 		if err := watchdogPass(ctx, pool, cfg.ReviewTimeout, cfg.SessionName, killWindow); err != nil {
@@ -220,7 +243,7 @@ WHERE t.status = 'review'
         SELECT 1 FROM agents a
         WHERE a.task_id = t.id AND a.status <> 'dead' AND a.role = '` + reviewerRole + `')`
 
-func dispatchPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) error {
+func dispatchPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner, idleAfter time.Duration) error {
 	rows, err := pool.Query(ctx, reviewCandidatesSQL)
 	if err != nil {
 		return err
@@ -271,6 +294,9 @@ func dispatchPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) 
 			Model:          model,
 		})
 		if err != nil {
+			if handleUniqueLiveBlocker(ctx, pool, c.taskID, err, idleAfter, "reviewer") {
+				continue
+			}
 			// Includes the cross-process unique-live loss; next tick no-ops.
 			log.Printf("pipeline: dispatch: spawn reviewer %s for %s: %v", agentID, c.taskID, err)
 			continue
@@ -281,6 +307,93 @@ func dispatchPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) 
 		log.Printf("pipeline: dispatch: spawned reviewer %s for task %s (worktree %s)", agentID, c.taskID, c.worktree)
 	}
 	return nil
+}
+
+// ---- stuck-implementor self-heal (MAQ-14) -------------------------------
+//
+// A task flips to 'review' when its implementor runs set-pr — which records
+// the PR but touches no agents row. Only a maquinista-done (or the
+// `maquinista tasks release` cleanup) retires the implementor, and an
+// implementor that ends its turn right after opening the PR leaves the row
+// 'running' forever. The uq_agents_task_live index then blocks every
+// reviewer/fixer spawn for the task until a human retires the row by hand.
+// The self-heal: on a unique-live spawn failure, if the blocking live row IS
+// the task's implementor and its last outbox activity is older than
+// idleAfter, the turn is over for good — retire it (the guarded UPDATE fires
+// at most once, which is also the exactly-once notification dedup) and let
+// the next tick spawn the reviewer. Fresh, still-streaming implementors are
+// left alone; non-implementor blockers (reviewer/fixer rows) keep the
+// generic retry path.
+
+// isUniqueLiveErr reports the one-live-agent-per-task violation
+// (SQLSTATE 23505 on uq_agents_task_live) surfaced by the agents INSERT in
+// SpawnFresh — the same shape EnsureAgent guards for the scheduler path.
+func isUniqueLiveErr(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "uq_agents_task_live")
+}
+
+// implementorLiveSQL: the live implementor row bound to a task (uq index
+// guarantees at most one), with its outbox idleness in seconds — last
+// agent_outbox write, falling back to started_at for agents that never
+// streamed.
+const implementorLiveSQL = `
+SELECT a.id,
+       EXTRACT(EPOCH FROM NOW() - COALESCE(
+             (SELECT MAX(o.created_at) FROM agent_outbox o WHERE o.agent_id = a.id),
+             a.started_at))
+FROM agents a
+WHERE a.task_id = $1 AND a.status <> 'dead' AND a.role = 'implementor'`
+
+// retireStuckImplementor retires the task's implementor row when it has been
+// outbox-idle past idleAfter (see the package comment above). Returns
+// retired=true when THIS call performed the retire (notification included);
+// live=true when a live implementor row exists but is not stale enough yet.
+func retireStuckImplementor(ctx context.Context, pool *pgxpool.Pool, taskID string, idleAfter time.Duration) (retired, live bool, err error) {
+	var agentID string
+	var idleSecs float64
+	err = pool.QueryRow(ctx, implementorLiveSQL, taskID).Scan(&agentID, &idleSecs)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, false, nil // blocker is a reviewer/fixer row — not ours
+	}
+	if err != nil {
+		return false, false, err
+	}
+	if time.Duration(idleSecs*float64(time.Second)) < idleAfter {
+		return false, true, nil // still streaming — keep retrying silently
+	}
+	tag, err := pool.Exec(ctx, `
+		UPDATE agents SET status='dead', last_seen=NOW()
+		WHERE id=$1 AND status <> 'dead' AND role='implementor'
+	`, agentID)
+	if err != nil {
+		return false, true, err
+	}
+	if tag.RowsAffected() == 0 {
+		return false, true, nil // raced to dead elsewhere — no notification
+	}
+	notifyf(ctx, pool, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.",
+		taskTitle(ctx, pool, taskID), agentID, idleAfter)
+	return true, true, nil
+}
+
+// handleUniqueLiveBlocker classifies a spawn failure. When it is the
+// unique-live violation it runs the stuck-implementor self-heal and reports
+// whether the caller should stay silent (retired, or implementor still
+// fresh); false means "not our case, log the error generically".
+func handleUniqueLiveBlocker(ctx context.Context, pool *pgxpool.Pool, taskID string, err error, idleAfter time.Duration, arm string) bool {
+	if !isUniqueLiveErr(err) {
+		return false
+	}
+	retired, _, herr := retireStuckImplementor(ctx, pool, taskID, idleAfter)
+	if herr != nil {
+		log.Printf("pipeline: dispatch: stuck-implementor check %s: %v", taskID, herr)
+		return true
+	}
+	if retired {
+		log.Printf("pipeline: dispatch: auto-retired stuck implementor on %s (%s spawn was uq_agents_task_live-blocked) — spawns next tick", taskID, arm)
+	}
+	// Fresh implementor or handled retire: silent retry until the idle bound.
+	return true
 }
 
 // taskAuthor returns the agent that recorded the task's latest result —
@@ -796,7 +909,7 @@ WHERE t.status = 'changes_requested'
 // reply; the tail keeps the prompt bounded).
 const maxFindingsChars = 6000
 
-func fixerPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) error {
+func fixerPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner, idleAfter time.Duration) error {
 	rows, err := pool.Query(ctx, fixerCandidatesSQL)
 	if err != nil {
 		return err
@@ -836,6 +949,9 @@ func fixerPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) err
 			Model:          model,
 		})
 		if err != nil {
+			if handleUniqueLiveBlocker(ctx, pool, c.taskID, err, idleAfter, "fixer") {
+				continue
+			}
 			// Includes the cross-process unique-live loss; next tick no-ops.
 			log.Printf("pipeline: dispatch: spawn fixer %s for %s: %v", agentID, c.taskID, err)
 			continue
