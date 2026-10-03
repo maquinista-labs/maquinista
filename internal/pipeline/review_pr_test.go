@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/maquinista-labs/maquinista/internal/gh"
 )
 
 func commentTime(s string) time.Time {
@@ -53,7 +52,7 @@ func TestReviewCommentMarker_NoCrossRoundCollision(t *testing.T) {
 
 func TestRenderHumanComments_Filters(t *testing.T) {
 	cutoff := commentTime("2026-10-03T10:00:00Z")
-	comments := []gh.PRComment{
+	comments := []PRComment{
 		{Author: "old-human", Body: "stale feedback", CreatedAt: commentTime("2026-10-03T09:00:00Z")},                   // before cutoff
 		{Author: "at-human", Body: "exactly at cutoff", CreatedAt: cutoff},                                              // not After(cutoff)
 		{Author: "alice", Body: "please add tests", CreatedAt: commentTime("2026-10-03T10:30:00Z")},                     // in
@@ -83,7 +82,7 @@ func TestRenderHumanComments_Filters(t *testing.T) {
 }
 
 func TestRenderHumanComments_NoCutoff_KeepsAll(t *testing.T) {
-	comments := []gh.PRComment{
+	comments := []PRComment{
 		{Author: "old-human", Body: "stale feedback", CreatedAt: commentTime("2026-10-03T09:00:00Z")},
 		{Author: "alice", Body: "please add tests", CreatedAt: commentTime("2026-10-03T10:30:00Z")},
 	}
@@ -97,7 +96,7 @@ func TestRenderHumanComments_Empty(t *testing.T) {
 	if got := renderHumanComments(nil, nil); got != "" {
 		t.Errorf("nil comments = %q, want empty", got)
 	}
-	if got := renderHumanComments([]gh.PRComment{{Author: "bot", IsBot: true, Body: "x"}}, nil); got != "" {
+	if got := renderHumanComments([]PRComment{{Author: "bot", IsBot: true, Body: "x"}}, nil); got != "" {
 		t.Errorf("bot-only = %q, want empty", got)
 	}
 }
@@ -105,10 +104,10 @@ func TestRenderHumanComments_Empty(t *testing.T) {
 func TestRenderHumanComments_OverflowKeepsNewest(t *testing.T) {
 	// Five ~850-char comments overflow the 4000 section cap — the OLDEST
 	// whole comment must be dropped, the newest kept.
-	mk := func(name, created string) gh.PRComment {
-		return gh.PRComment{Author: name, Body: strings.Repeat("x", 800), CreatedAt: commentTime(created)}
+	mk := func(name, created string) PRComment {
+		return PRComment{Author: name, Body: strings.Repeat("x", 800), CreatedAt: commentTime(created)}
 	}
-	comments := []gh.PRComment{
+	comments := []PRComment{
 		mk("c1", "2026-10-03T10:00:00Z"),
 		mk("c2", "2026-10-03T10:05:00Z"),
 		mk("c3", "2026-10-03T10:10:00Z"),
@@ -232,7 +231,7 @@ func TestVerdictPass_DedupsExistingRoundComment(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	seedPRReview(t, pool, "tpd", VerdictApprove)
-	fg := &fakeGh{comments: []gh.PRComment{
+	fg := &fakeGh{comments: []PRComment{
 		{Author: "acme-ci", IsBot: true, Body: "[review round 1] VERDICT: approve\n\n(pre-existing)"},
 	}}
 
@@ -318,7 +317,7 @@ func TestDispatch_PromptCarriesHumanPRComments(t *testing.T) {
 
 	pre := time.Now().Add(-90 * time.Minute)  // before the round-1 reviewer started
 	post := time.Now().Add(-30 * time.Minute) // between the rounds
-	fg := &fakeGh{comments: []gh.PRComment{
+	fg := &fakeGh{comments: []PRComment{
 		{Author: "early-bird", Body: "pre-round feedback", CreatedAt: pre},
 		{Author: "alice", Body: "between-rounds: cover the empty case", CreatedAt: post},
 		{Author: "ci-bot", IsBot: true, Body: "coverage dropped", CreatedAt: post},
@@ -359,7 +358,7 @@ func TestDispatch_PromptRound1_NoCutoff(t *testing.T) {
 		INSERT INTO task_context (task_id, agent_id, kind, content)
 		VALUES ('tph1', 'impl-tph1', 'result', 'done')
 	`)
-	fg := &fakeGh{comments: []gh.PRComment{
+	fg := &fakeGh{comments: []PRComment{
 		{Author: "early-bird", Body: "day-one feedback", CreatedAt: commentTime("2026-10-01T09:00:00Z")},
 	}}
 
@@ -383,7 +382,7 @@ func TestPromptHeal_CarriesHumanComments(t *testing.T) {
 	execOK(t, pool, `UPDATE tasks SET review_rounds = 1,
 		pr_url = 'https://github.com/acme/repo/pull/9' WHERE id = 'tphh'`)
 	seedReviewer(t, pool, "reviewer-tphh", "tphh")
-	fg := &fakeGh{comments: []gh.PRComment{
+	fg := &fakeGh{comments: []PRComment{
 		{Author: "alice", Body: "healed-prompt feedback", CreatedAt: commentTime("2026-10-03T12:00:00Z")},
 	}}
 

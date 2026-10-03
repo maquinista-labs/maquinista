@@ -1,17 +1,21 @@
 // Package gh implements the GitHub side of pipeline GitHub traffic via the
-// gh CLI (merge mode MAQ-16 PR comments). It is the production GhRunner for
-// the pipeline package — a thin, ugly-on-purpose wrapper around a handful of
-// subcommands, so all branching stays in the pipeline package where it is
-// testable.
+// gh CLI: the production GhRunner for pipeline.MergeConfig (merge mode +
+// reviewer PR-comment weighing) and the production pipeline.CommentSource
+// for the comment-command surface (MAQ-12) — thin, ugly-on-purpose wrappers
+// around gh subcommands, so all branching stays in the pipeline package
+// where it is testable.
 package gh
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/maquinista-labs/maquinista/internal/pipeline"
 )
 
 // Runner executes gh against the current directory's repo.
@@ -78,53 +82,46 @@ func (Runner) PRMergeSquash(ctx context.Context, pr int) error {
 	return nil
 }
 
-// PRComment is one issue comment on a pull request (the slice of
-// `gh pr view --json comments` callers need).
-type PRComment struct {
-	Author    string // login; bot/app logins carry the "[bot]" suffix
-	IsBot     bool   // author is a bot/app account
-	Body      string
-	CreatedAt time.Time
-}
-
-// commentsPayload is the slice of `gh pr view --json comments` we consume.
-// is_bot and __typename are both parsed defensively: older gh versions
-// expose only __typename ("User"|"Bot"), newer ones add is_bot.
-type commentsPayload struct {
-	Comments []struct {
-		Author struct {
-			Login    string `json:"login"`
-			IsBot    bool   `json:"is_bot"`
-			TypeName string `json:"__typename"`
-		} `json:"author"`
-		Body      string    `json:"body"`
-		CreatedAt time.Time `json:"createdAt"`
-	} `json:"comments"`
-}
-
-// PRComments lists the PR's issue comments, oldest first (GitHub's order).
-func (Runner) PRComments(ctx context.Context, pr int) ([]PRComment, error) {
-	out, err := exec.CommandContext(ctx, "gh", "pr", "view",
-		fmt.Sprint(pr), "--json", "comments").Output()
+// PRComments returns the PR's conversation comments (issue comments)
+// created after since, oldest first. The API's `since` filters on update
+// time (edited old comments resurface), so the result is re-filtered on
+// created_at here — one fetch, exact window. A zero since returns every
+// comment (the reviewer-prompt caller).
+func (Runner) PRComments(ctx context.Context, pr int, since time.Time) ([]pipeline.PRComment, error) {
+	uri := fmt.Sprintf("repos/{owner}/{repo}/issues/%d/comments?per_page=100&since=%s",
+		pr, since.UTC().Format(time.RFC3339))
+	out, err := exec.CommandContext(ctx, "gh", "api", uri).Output()
 	if err != nil {
-		return nil, fmt.Errorf("gh pr view %d comments: %w", pr, err)
+		return nil, fmt.Errorf("gh api issue comments %d: %w", pr, err)
 	}
-	return parseComments(out)
+	return parseComments(out, since)
 }
 
-// parseComments maps the comments JSON payload onto []PRComment, flagging
-// bot authors from every shape the field has taken (is_bot, __typename,
-// "[bot]" login suffix).
-func parseComments(out []byte) ([]PRComment, error) {
-	var p commentsPayload
-	if err := json.Unmarshal(out, &p); err != nil {
-		return nil, fmt.Errorf("gh pr view comments: %w", err)
+// parseComments maps the issue-comments JSON payload onto []pipeline.PRComment,
+// flagging bot authors from every shape the field has taken (REST type,
+// "[bot]" login suffix) and dropping anything not created after since.
+func parseComments(out []byte, since time.Time) ([]pipeline.PRComment, error) {
+	var raw []struct {
+		ID        int64     `json:"id"`
+		Body      string    `json:"body"`
+		CreatedAt time.Time `json:"created_at"`
+		User      struct {
+			Login string `json:"login"`
+			Type  string `json:"type"`
+		} `json:"user"`
 	}
-	comments := make([]PRComment, 0, len(p.Comments))
-	for _, c := range p.Comments {
-		comments = append(comments, PRComment{
-			Author:    c.Author.Login,
-			IsBot:     c.Author.IsBot || c.Author.TypeName == "Bot" || strings.HasSuffix(c.Author.Login, "[bot]"),
+	if err := json.Unmarshal(out, &raw); err != nil {
+		return nil, fmt.Errorf("gh api comments: %w", err)
+	}
+	var comments []pipeline.PRComment
+	for _, c := range raw {
+		if !c.CreatedAt.After(since) {
+			continue
+		}
+		comments = append(comments, pipeline.PRComment{
+			ID:        c.ID,
+			Author:    c.User.Login,
+			IsBot:     c.User.Type == "Bot" || strings.HasSuffix(c.User.Login, "[bot]"),
 			Body:      c.Body,
 			CreatedAt: c.CreatedAt,
 		})
@@ -139,4 +136,42 @@ func (Runner) PRPostComment(ctx context.Context, pr int, body string) error {
 		return fmt.Errorf("gh pr comment %d: %s: %w", pr, string(out), err)
 	}
 	return nil
+}
+
+// IsCollaborator reports whether login is a repo collaborator — the default
+// allowlist when PIPELINE_GH_ALLOWED_LOGINS is unset. gh api exits non-zero
+// on the 404 (not a collaborator); any other failure is an error so the
+// caller can retry instead of silently dropping the command.
+func (Runner) IsCollaborator(ctx context.Context, login string) (bool, error) {
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "gh", "api", "repos/{owner}/{repo}/collaborators/"+login)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if strings.Contains(stderr.String(), "(HTTP 404") {
+			return false, nil
+		}
+		return false, fmt.Errorf("gh api collaborators/%s: %s: %w", login, strings.TrimSpace(stderr.String()), err)
+	}
+	return true, nil
+}
+
+// ReactToComment adds a +1 reaction to a comment — the command ack.
+func (Runner) ReactToComment(ctx context.Context, commentID int64) error {
+	uri := fmt.Sprintf("repos/{owner}/{repo}/issues/comments/%d/reactions", commentID)
+	cmd := exec.CommandContext(ctx, "gh", "api", uri, "-f", "content=+1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("gh api reactions %d: %s: %w", commentID, string(out), err)
+	}
+	return nil
+}
+
+// PRHeadBranch returns the PR's head branch name (id-less resolution
+// fallback: merge_queue rows name the same line of work by branch).
+func (Runner) PRHeadBranch(ctx context.Context, pr int) (string, error) {
+	out, err := exec.CommandContext(ctx, "gh", "pr", "view", fmt.Sprint(pr),
+		"--json", "headRefName", "--jq", ".headRefName").Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr view %d headRefName: %w", pr, err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }

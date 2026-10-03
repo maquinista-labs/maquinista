@@ -520,6 +520,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			}
 		}()
 		log.Println("task-scheduler: started")
+
 		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
 		if perr != nil {
 			log.Printf("pipeline: %v", perr)
@@ -553,6 +554,25 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			}()
 			log.Printf("pipeline: ticket bridge started (%s)", tCfg.Provider)
 		}
+
+		// GitHub comment commands (MAQ-12): `maquinista <verb>` comments on
+		// PR conversations — approve ships first, resolving the task from
+		// the PR alone (id-less). gh merge mode only: the verbs drive the
+		// PR merge flow. Polling via gh (no webhooks), 30–60s cadence.
+		if mCfg := pipeline.MergeConfigFromEnv(); mCfg.Mode == pipeline.MergeModeGH {
+			runner := gh.New() // stateless: one runner serves both merge and comment surfaces
+			mCfg.Gh = runner
+			go pipeline.RunCommentCommands(ctx, pipeline.CommentDeps{
+				Pool:   pool,
+				Source: runner,
+				Auth:   pipeline.GhCommandsConfigFromEnv(),
+				Merge:  mCfg,
+				Prov:   prov,
+				TeamID: tCfg.TeamID,
+				Spawn:  pipelineReviewerSpawner{pool: pool, cfg: cfg, sidecars: sidecarMgr},
+			})
+			log.Println("pipeline: GitHub comment commands started (gh mode)")
+		}
 	}
 
 	err = b.Run(ctx)
@@ -566,7 +586,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 }
 
 // runDashboardAgentReconcile periodically scans for dashboard-spawned
-// agents (status='stopped', empty tmux_window) and provisions their tmux
+// agents (status='stopped', tmux_window='') and provisions their tmux
 // panes. After each reconcile pass it syncs the sidecar manager so that
 // newly-online agents get their own inbox goroutine within the same tick.
 // Runs as a background goroutine; terminates on ctx cancel.
