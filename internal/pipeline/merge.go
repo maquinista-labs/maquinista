@@ -368,7 +368,7 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		}
 		db.AddObservation(pool, taskID, "merger",
 			fmt.Sprintf("CI failed %d times on PR #%d — parked needs-human.", attempts, pr))
-		notifyf(ctx, pool, "🆘 %s: CI failed %d times on PR #%d — parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
+		notifyTaskf(ctx, pool, taskID, "🆘 %s: CI failed %d times on PR #%d — parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
 			taskTitle(ctx, pool, taskID), attempts, pr, taskID, prLinkSuffix(ctx, pool, taskID))
 		log.Printf("pipeline: merge %s CI failed %d times on PR #%d — parked needs-human", taskID, attempts, pr)
 		return nil
@@ -416,7 +416,7 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	}
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("PR #%d squash-merged into %s (%s).", pr, base, mergeSHA))
-	notifyf(ctx, pool, "✅ %s merged: PR #%d squash-merged into %s (%s).%s",
+	notifyTaskf(ctx, pool, taskID, "✅ %s merged: PR #%d squash-merged into %s (%s).%s",
 		taskTitle(ctx, pool, taskID), pr, base, mergeSHA, prLinkSuffix(ctx, pool, taskID))
 
 	// 6. Board sync (best-effort — the sync loop self-heals on next tick).
@@ -472,7 +472,7 @@ func parkMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID string, e
 	// EX-06: the needs-human question carries the conflict files so the
 	// human can decide without opening the worktree. (Conflict →
 	// merger-agent resolution stays deferred; the plan records why.)
-	notifyf(ctx, pool, "🆘 %s: rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.%s",
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.%s",
 		taskTitle(ctx, pool, taskID), entry.Branch, strings.Join(conflictErr.Files, "\n"), prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s conflict: %v", taskID, conflictErr)
 	return nil
@@ -486,7 +486,7 @@ func failMerge(ctx context.Context, pool *pgxpool.Pool, entryID int64, taskID, m
 	if err := db.FailMerge(pool, entryID, msg); err != nil {
 		return fmt.Errorf("pipeline: failing merge %d: %w", entryID, err)
 	}
-	notifyf(ctx, pool, "⚠️ %s: merge failed — %s. The queue entry is failed; reply `approve %s` here (or comment `approve` on the ticket issue) to re-enqueue the merge.%s",
+	notifyTaskf(ctx, pool, taskID, "⚠️ %s: merge failed — %s. The queue entry is failed; reply `approve %s` here (or comment `approve` on the ticket issue) to re-enqueue the merge.%s",
 		taskTitle(ctx, pool, taskID), msg, shortTaskID(taskID), prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s failed: %s", taskID, msg)
 	return nil

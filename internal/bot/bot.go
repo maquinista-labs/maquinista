@@ -64,6 +64,9 @@ type Bot struct {
 	// Approve-verb backend (MAQ-11): pipeline.ApproveRef wired with
 	// provider + gh by cmd_start. Nil → verb replies "not wired".
 	approveFn ApproveFunc
+	// Reply-comment backend (MAQ-24): pipeline.PostPRComment wired with gh
+	// by cmd_start. Nil → replies answer "not wired".
+	pipelineReplyFn PipelineReplyFunc
 	// tunnelNotify* stores the chat/thread the operator used to start the
 	// tunnel so expiry messages are sent to the right place.
 	tunnelNotifyMu       sync.Mutex

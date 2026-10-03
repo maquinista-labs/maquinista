@@ -96,3 +96,21 @@ func TestParseChecks(t *testing.T) {
 		})
 	}
 }
+
+// MAQ-24: the reply-comment path quotes the URL gh prints for the new
+// comment back into the Pipeline topic.
+func TestParsePRCommentURL(t *testing.T) {
+	got, err := parsePRCommentURL([]byte("https://github.com/o/r/pull/7#issuecomment-123456\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "https://github.com/o/r/pull/7#issuecomment-123456" {
+		t.Errorf("url = %q", got)
+	}
+	if _, err := parsePRCommentURL([]byte("")); err == nil {
+		t.Error("empty output must error")
+	}
+	if _, err := parsePRCommentURL([]byte("some unexpected banner")); err == nil {
+		t.Error("output without a comment url must error")
+	}
+}
