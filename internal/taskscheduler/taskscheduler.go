@@ -30,6 +30,27 @@ type Config struct {
 	EnsureAgent  EnsureAgentFn
 }
 
+// liveAgentStatusSQL is the set of agents.status values that mean "a pane
+// is actually working this task". `stopped` is deliberately excluded
+// (MAQ-18): SpawnFresh pre-registers the row as 'stopped' and only flips
+// it to 'running' once the tmux window exists (agentspawn.SpawnFresh),
+// the sidecar marks rows 'stopped' when a window vanishes mid-drive
+// (sidecar.Manager), and `maquinista stop` parks rows that way — in all
+// three the pane is gone, so the row must never wedge a task. The
+// dashboard "stopped + empty tmux_window = needs provisioning" state is
+// reachable only for role='user' + task_id IS NULL rows
+// (reconcileAgentPanes), so it cannot collide with the task-scoped rows
+// this package reasons about.
+const liveAgentStatusSQL = `'running','idle','working','spawning'`
+
+// staleClaimBoundSQL is how old a 'claimed' task must be — with no live
+// task-scoped agent row — before ReapStaleClaims releases it back to
+// 'ready'. The bound is what keeps the reaper away from fresh claims:
+// DispatchOne commits 'claimed' BEFORE EnsureAgent inserts the agent row,
+// and that row itself starts life as 'stopped' for up to ~15s
+// (SpawnFresh's ready-wait). Both windows are far shorter than this.
+const staleClaimBoundSQL = `INTERVAL '5 minutes'`
+
 // Run drives the task-scheduler loop until ctx is cancelled.
 //
 // Wake triggers: LISTEN task_events (from migration 004) with a
@@ -64,6 +85,16 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		} else if healed > 0 {
 			log.Printf("taskscheduler: healed %d task(s) with missing inbox prompt", healed)
 		}
+		// Reaper: a claimed task whose agent row died mid-flight (pane
+		// vanished, daemon restart raced the spawn) is released back to
+		// 'ready' once the claim is stale — otherwise nothing will ever
+		// pick it up again.
+		reaped, rerr := ReapStaleClaims(ctx, pool)
+		if rerr != nil {
+			log.Printf("taskscheduler: reap stale claims: %v", rerr)
+		} else if reaped > 0 {
+			log.Printf("taskscheduler: reaped %d stale claim(s) back to ready", reaped)
+		}
 		waitCtx, cancel := context.WithTimeout(ctx, cfg.PollInterval)
 		_, nerr := listener.Conn().WaitForNotification(waitCtx)
 		cancel()
@@ -83,12 +114,86 @@ func drain(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 			return err
 		}
 		if !dispatched {
+			// Nothing claimable this pass. If ready tasks were skipped
+			// because a live agent still holds them, journal why (MAQ-18:
+			// no silent skips).
+			if _, err := LogBlockedReadyTasks(ctx, pool); err != nil {
+				log.Printf("taskscheduler: blocked-task report: %v", err)
+			}
 			return nil
 		}
 	}
 }
 
+// LogBlockedReadyTasks journals every 'ready' task that is being skipped
+// because a live agent row still holds it, one log line per blocking
+// agent. Returns the number of blocked tasks reported. This is the
+// visible counterpart of the claim filter: before MAQ-18 a 'stopped'
+// agent row silenced a task with zero trace in the logs.
+func LogBlockedReadyTasks(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT t.id, a.id, a.status
+		FROM tasks t
+		JOIN agents a
+		  ON a.task_id = t.id
+		 AND a.status IN (`+liveAgentStatusSQL+`)
+		WHERE t.status = 'ready'
+		ORDER BY t.priority DESC, t.created_at, a.id
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("query blocked ready tasks: %w", err)
+	}
+	defer rows.Close()
+	type blocked struct{ taskID, agentID, status string }
+	var found []blocked
+	for rows.Next() {
+		var b blocked
+		if err := rows.Scan(&b.taskID, &b.agentID, &b.status); err != nil {
+			return 0, err
+		}
+		found = append(found, b)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, b := range found {
+		log.Printf("taskscheduler: ready task %s skipped: held by live agent %s (status=%s)",
+			b.taskID, b.agentID, b.status)
+	}
+	return len(found), nil
+}
+
+// ReapStaleClaims releases 'claimed' tasks whose task-scoped agent rows
+// are ALL non-live (stopped/archived/dead) and whose claim is older than
+// staleClaimBoundSQL — the mid-flight death case: implementor pane
+// vanishes, the sidecar parks the row at 'stopped', and the task would
+// otherwise sit 'claimed' forever with nobody working it. The claimed_at
+// bound keeps the reaper away from fresh claims, whose agent row does not
+// exist yet (claimed is committed before EnsureAgent) or is still in
+// SpawnFresh's 'stopped' pre-registration phase. Agent rows themselves
+// are left alone: DispatchOne's claim-TX release handles them when the
+// task is re-claimed.
+func ReapStaleClaims(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	tag, err := pool.Exec(ctx, `
+		UPDATE tasks t
+		SET status = 'ready', claimed_by = NULL, claimed_at = NULL
+		WHERE t.status = 'claimed'
+		  AND t.claimed_at < NOW() - `+staleClaimBoundSQL+`
+		  AND NOT EXISTS (
+		        SELECT 1 FROM agents a
+		        WHERE a.task_id = t.id AND a.status IN (`+liveAgentStatusSQL+`)
+		      )
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("reap stale claims: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
+}
+
 // DispatchOne claims one ready task that has no live agent and routes it.
+// A task whose only agent rows are 'stopped'/'archived'/'dead' IS
+// claimable — those rows are released (flipped to 'dead') atomically with
+// the claim so the uq_agents_task_live slot is free for the fresh spawn.
 // Returns (true, nil) on dispatch, (false, nil) when nothing is ready.
 func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, error) {
 	var taskID string
@@ -106,7 +211,7 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 		WHERE status = 'ready'
 		  AND NOT EXISTS (
 		        SELECT 1 FROM agents a
-		        WHERE a.task_id = t.id AND a.status <> 'dead'
+		        WHERE a.task_id = t.id AND a.status IN (` + liveAgentStatusSQL + `)
 		      )
 		ORDER BY priority DESC, created_at
 		FOR UPDATE SKIP LOCKED
@@ -118,6 +223,18 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 	if err != nil {
 		return false, fmt.Errorf("claim task: %w", err)
 	}
+
+	// Release stale agent rows from previous attempts. A 'stopped' or
+	// 'archived' row still occupies the uq_agents_task_live slot, so
+	// without this EnsureAgent's fresh insert would bounce off the index
+	// and the prompt would be enqueued to a pane that no longer exists.
+	// Running inside the claim TX keeps release + claim atomic.
+	if _, err := tx.Exec(ctx, `
+		UPDATE agents SET status = 'dead', last_seen = NOW()
+		WHERE task_id = $1 AND status IN ('stopped','archived')
+	`, taskID); err != nil {
+		return false, fmt.Errorf("release stale agents: %w", err)
+	}
 	role := "implementor"
 	if roleFromMeta != nil && *roleFromMeta != "" {
 		role = *roleFromMeta
@@ -125,9 +242,8 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 
 	// Flip the task state BEFORE committing the claim TX so concurrent
 	// schedulers see it as 'claimed' immediately. EnsureAgent runs after
-	// the commit — if it fails, a reaper (future work) flips back to
-	// 'ready', but for now the failure surfaces and the partial unique
-	// index releases the dead row naturally on the next tick.
+	// the commit — if it fails, the task is reverted to 'ready' below,
+	// and ReapStaleClaims covers the crash-in-between case.
 	if _, err := tx.Exec(ctx, `
 		UPDATE tasks
 		SET status = 'claimed', claimed_at = NOW()
