@@ -479,7 +479,8 @@ func TestProcessMergeGH_CICapParksNeedsHuman(t *testing.T) {
 	gh := &fakeGh{checks: ChecksFailed}
 	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, MaxAttempts: 2, Gh: gh}
 
-	// Attempt 1: below cap → silent release to pending.
+	// Attempt 1: below cap → release to pending, one gate-red one-liner
+	// (MAQ-22: a red gate is a transition; bounded by the attempts cap).
 	if err := ProcessMergeGH(ctx, pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
 		t.Fatal(err)
 	}
@@ -487,8 +488,13 @@ func TestProcessMergeGH_CICapParksNeedsHuman(t *testing.T) {
 		t.Fatalf("attempt 1: entry = %q, want released to pending", got)
 	}
 	texts := pipelineNotifyTextsPool(t, pool)
-	if len(texts) != 0 {
-		t.Fatalf("attempt 1 notified: %q (below-cap release must stay silent)", texts)
+	if len(texts) != 1 {
+		t.Fatalf("attempt 1 emitted %d notes, want exactly 1 gate-red note", len(texts))
+	}
+	for _, want := range []string{"🟥", "gate red (ci)", "attempt 1/2", "will re-check"} {
+		if !strings.Contains(texts[0], want) {
+			t.Errorf("gate-red note %q missing %q", texts[0], want)
+		}
 	}
 
 	// Re-claim and attempt 2: at cap → failed entry + parked task + question.
@@ -512,12 +518,12 @@ func TestProcessMergeGH_CICapParksNeedsHuman(t *testing.T) {
 		t.Errorf("merge fired %d times on red PR", gh.mergeCalls)
 	}
 	texts = pipelineNotifyTextsPool(t, pool)
-	if len(texts) != 1 {
-		t.Fatalf("attempt 2 emitted %d notes, want 1", len(texts))
+	if len(texts) != 2 {
+		t.Fatalf("attempt 2 emitted %d total notes, want 2 (gate-red + cap question)", len(texts))
 	}
 	for _, want := range []string{"🆘", "CI failed 2 times", "parked needs-human", "maquinista approve " + taskID} {
-		if !strings.Contains(texts[0], want) {
-			t.Errorf("note %q missing %q", texts[0], want)
+		if !strings.Contains(texts[1], want) {
+			t.Errorf("note %q missing %q", texts[1], want)
 		}
 	}
 }

@@ -232,6 +232,73 @@ func TestWatchdog_PRLink(t *testing.T) {
 	}
 }
 
+// ---- MAQ-22 lifecycle one-liners ----
+
+// TestReviewRound_NotifyClaimed: the reviewer spawn's round bump announces
+// the claim exactly once — "task claimed (role + round)" for the reviewer
+// leg of the journey.
+func TestReviewRound_NotifyClaimed(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tc", "uuid-c", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-tc", "tc")
+
+	if err := recordReviewRound(ctx, pool, nil, "reviewer-tc", "tc"); err != nil {
+		t.Fatalf("recordReviewRound: %v", err)
+	}
+	texts := pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 1 {
+		t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
+	}
+	for _, want := range []string{"👀", "reviewer claimed", "review round 1", "task tc"} {
+		if !strings.Contains(texts[0], want) {
+			t.Errorf("claim note %q missing %q", texts[0], want)
+		}
+	}
+
+	// A second bump (the next round's reviewer) announces the NEW round.
+	if err := recordReviewRound(ctx, pool, nil, "reviewer-tc", "tc"); err != nil {
+		t.Fatalf("recordReviewRound 2: %v", err)
+	}
+	texts = pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 2 || !strings.Contains(texts[1], "review round 2") {
+		t.Fatalf("second claim = %d texts %q, want round 2 note", len(texts), texts)
+	}
+}
+
+// TestFixEpisode_NotifyRoundStarted: the fix marker row is the exactly-once
+// guard; the round-started one-liner rides it.
+func TestFixEpisode_NotifyRoundStarted(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tf", "uuid-f", "/tmp/wt")
+	execOK(t, pool, `UPDATE tasks SET status='changes_requested' WHERE id='tf'`)
+	seedReviewer(t, pool, "reviewer-tf", "tf")
+	execOK(t, pool, `
+		INSERT INTO agent_outbox (agent_id, content)
+		VALUES ('reviewer-tf', $1::jsonb)
+	`, `{"text":"1. fix the bug\nVERDICT: request_changes\n"}`)
+	// Retire the reviewer BEFORE the live fixer insert — uq_agents_task_live
+	// allows one live agent per task; the findings outbox row survives.
+	execOK(t, pool, `UPDATE agents SET status='dead' WHERE id='reviewer-tf'`)
+	execOK(t, pool, `INSERT INTO agents (id, tmux_session, tmux_window, role, task_id, status,
+					    runner_type, cwd, window_name, started_at, last_seen, stop_requested)
+		VALUES ('fixer-tf', 'sess', 'fixer-tf', 'fixer', 'tf', 'running', 'pi', '/tmp/wt', 'fixer-tf', NOW(), NOW(), FALSE)`)
+
+	if err := recordFixEpisode(ctx, pool, "fixer-tf", "tf", 1, "reviewer-tf"); err != nil {
+		t.Fatalf("recordFixEpisode: %v", err)
+	}
+	texts := pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 1 {
+		t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
+	}
+	for _, want := range []string{"🔧", "fixer round 1 started", "task tf"} {
+		if !strings.Contains(texts[0], want) {
+			t.Errorf("fix note %q missing %q", texts[0], want)
+		}
+	}
+}
+
 // ---- helper ----
 
 // pipelineNotifyTextsPool reads the pipeline agent's outbox texts

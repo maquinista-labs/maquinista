@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maquinista-labs/maquinista/internal/pipeline"
 )
 
 // Task is the insert payload.
@@ -89,18 +90,39 @@ func ValidateDAG(ctx context.Context, pool *pgxpool.Pool) error {
 }
 
 // SetPRUrl records the opened-PR URL and flips status/pr_state to 'review'/'open'.
+// The flip is the guarded transition (MAQ-22): the UPDATE only lands when
+// the recorded PR state actually changes, and the Pipeline-topic one-liner
+// fires exactly once per transition — a re-set with the same URL/state is
+// an idempotent no-op that announces nothing; a NEW URL is a new PR-opened
+// transition and announces again.
 func SetPRUrl(ctx context.Context, pool *pgxpool.Pool, taskID, url string) error {
-	tag, err := pool.Exec(ctx, `
+	var title string
+	err := pool.QueryRow(ctx, `
 		UPDATE tasks
 		SET pr_url = $2, pr_state = 'open', status = 'review'
 		WHERE id = $1
-	`, taskID, url)
+		  AND (pr_url IS DISTINCT FROM $2
+		       OR COALESCE(pr_state, '') IS DISTINCT FROM 'open'
+		       OR status IS DISTINCT FROM 'review')
+		RETURNING title
+	`, taskID, url).Scan(&title)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Either the task does not exist, or this exact PR state is already
+		// recorded (idempotent re-set — transition already announced).
+		var exists bool
+		if qerr := pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM tasks WHERE id = $1)`, taskID).Scan(&exists); qerr != nil {
+			return qerr
+		}
+		if !exists {
+			return fmt.Errorf("no task %q", taskID)
+		}
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("no task %q", taskID)
-	}
+	pipeline.Notifyf(ctx, pool, "📤 %s: PR opened → review.\n🔗 PR: %s", title, url)
 	return nil
 }
 
