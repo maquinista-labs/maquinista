@@ -317,9 +317,22 @@ task via `tasks.pr_url`).
   insensitive, tolerant of a leading `/` and whitespace. Anything else is
   prose and ignored entirely (never claimed, never counted).
 - **Dispatch table** — verb → `CommentVerbHandler` via
-  `RegisterCommentVerb`; `approve` ships first. Adding a verb is exactly one
+  `RegisterCommentVerb`; `approve` and `resolve` ship. Adding a verb is exactly one
   registration call: parser, auth, resolution, idempotency and acks are
   shared. Unknown verbs parse and record a `no_op`.
+- **`resolve` verb (merger spawn)** — fills the EX-05 "merger-agent spawn
+  deferred" hole on demand. On a parked PR (`pending_approval` — rebase-
+  conflict or CI-cap park), commenting `maquinista resolve` spawns a merger
+  session: role `merger`, `pipeline-merger` soul (migration 035 — "rebase,
+  resolve conflicts, propose, never force"), in the task's worktree. The
+  prompt carries the parked branch plus the exact conflict file list from
+  `merge_queue.conflict_files`, and directs: rebase onto origin/main,
+  resolve every conflict, address every unresolved review-comment thread,
+  push `--force-with-lease`, post the merge proposal — **the merger never
+  merges**; `approve` re-runs the gate. Exactly-once rides the shared
+  comment claim (dedup id `resolve:<task>:<comment>`); an episode marker in
+  `task_context` audits the spawn. Gates: task must be `pending_approval`
+  and carry a worktree — otherwise a clean `no_op`.
 - **Target resolution (id-less)** — primary: `tasks.pr_url` ending in
   `/pull/<n>`; fallback: `merge_queue.branch` matching the PR head branch.
   No task, or the verb not applicable to its state (`approve` wants

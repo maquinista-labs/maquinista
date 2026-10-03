@@ -25,6 +25,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -38,6 +39,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/maquinista-labs/maquinista/internal/mailbox"
 )
 
 // PRComment is one PR conversation comment (a GitHub issue comment on the
@@ -171,6 +173,10 @@ type CommentContext struct {
 	TaskID    string
 	Actor     string // GitHub login
 	Args      []string
+	// Spawn materializes agent sessions for verbs that spawn one (resolve).
+	// Nil in tests that don't exercise spawning; a nil here fails the verb
+	// with a plain error (wiring bug, not a task-state no-op).
+	Spawn ReviewSpawner
 	// Merge plumbing for verbs that drive the PR merge flow.
 	Merge  MergeConfig
 	Prov   TicketProvider
@@ -211,6 +217,7 @@ func commentVerbHandler(verb string) CommentVerbHandler {
 
 func init() {
 	RegisterCommentVerb("approve", approveCommentHandler)
+	RegisterCommentVerb("resolve", resolveCommentHandler)
 }
 
 // approveCommentHandler is the `approve` verb: merge the resolved task's PR
@@ -250,6 +257,146 @@ func (hc CommentContext) ack(ctx context.Context) {
 	}
 }
 
+// ---- resolve verb ----
+//
+// `maquinista resolve` on a parked PR spawns a merger session (the
+// pipeline-merger soul, migration 035): rebase the branch onto origin/main,
+// resolve the conflict files and the PR's pending review comments, push,
+// and post the merge proposal. It does NOT merge — the operator's
+// `maquinista approve` re-runs the merge gate on the now-clean branch.
+// This is the human-triggered arm of the conflict-park path (EX-05 parks
+// pending_approval with the conflict file list; this verb turns that park
+// into work instead of a dead end).
+
+// resolveCommentHandler is the `resolve` verb: spawn the merger session for
+// the resolved task. Targets pending_approval — the state the merge flow
+// parks on (rebase conflict, CI-attempt cap, watchdog park). approve is the
+// verb for ready_to_merge; resolve on any other state is a clean no-op.
+func resolveCommentHandler(ctx context.Context, hc CommentContext) error {
+	if hc.Spawn == nil {
+		return fmt.Errorf("pipeline: resolve comment: no spawner wired (cmd_start CommentDeps.Spawn)")
+	}
+	var status, worktree string
+	if err := hc.Pool.QueryRow(ctx,
+		`SELECT status, COALESCE(worktree_path, '') FROM tasks WHERE id = $1`,
+		hc.TaskID).Scan(&status, &worktree); err != nil {
+		return fmt.Errorf("pipeline: resolve comment: loading task %s: %w", hc.TaskID, err)
+	}
+	if status != "pending_approval" {
+		return fmt.Errorf("%w: task %s is %s, want pending_approval (approve merges a ready_to_merge task)",
+			ErrNotApplicable, hc.TaskID, status)
+	}
+	if worktree == "" {
+		return fmt.Errorf("%w: task %s has no worktree — nothing to rebase", ErrNotApplicable, hc.TaskID)
+	}
+	branch, files := latestMergeEntry(ctx, hc.Pool, hc.TaskID)
+
+	agentID, err := mintAgentID(ctx, hc.Pool, mergerRole, hc.TaskID)
+	if err != nil {
+		return fmt.Errorf("pipeline: resolve comment: mint merger %s: %w", hc.TaskID, err)
+	}
+	runnerType, model, err := resolveTemplateExecFor(ctx, hc.Pool, MergerSoulTemplate)
+	if err != nil {
+		// Non-fatal: empty overrides fall through to the runner's own
+		// resolution chain (same stance as the fixer spawn).
+		log.Printf("pipeline: resolve comment: resolve merger exec for %s: %v", hc.TaskID, err)
+	}
+	if err := hc.Spawn.SpawnReviewer(ctx, ReviewSpawnParams{
+		AgentID:        agentID,
+		TaskID:         hc.TaskID,
+		WorktreePath:   worktree,
+		Role:           mergerRole,
+		SoulTemplateID: MergerSoulTemplate,
+		RunnerType:     runnerType,
+		Model:          model,
+	}); err != nil {
+		return fmt.Errorf("pipeline: resolve comment: spawn merger %s for %s: %w", agentID, hc.TaskID, err)
+	}
+	// Marker + prompt in one tx AFTER the spawn (fixer ordering): the
+	// external_msg_id dedups a retry; the 'merge' row is the audit trail.
+	if err := recordResolveEpisode(ctx, hc.Pool, agentID, hc.TaskID, hc.CommentID, branch, files); err != nil {
+		return fmt.Errorf("pipeline: resolve comment: record episode %s (merger %s spawned, prompt may be missing): %w",
+			hc.TaskID, agentID, err)
+	}
+	notifyf(ctx, hc.Pool, "🔧 %s: resolve session %s spawned (PR #%d, branch %s) by @%s — rebase + pending comments; approve re-merges after.",
+		taskTitle(ctx, hc.Pool, hc.TaskID), agentID, hc.PR, branch, hc.Actor)
+	hc.ack(ctx)
+	return nil
+}
+
+// latestMergeEntry returns the task's most recent merge_queue entry's branch
+// and conflict file list — the resolve prompt names them so the session
+// starts from the park's evidence, not a fresh probe. Best-effort: a lookup
+// failure yields empty strings (the prompt then carries no file list and the
+// session discovers the branch from its worktree).
+func latestMergeEntry(ctx context.Context, pool *pgxpool.Pool, taskID string) (string, []string) {
+	var branch string
+	var files []string
+	if err := pool.QueryRow(ctx,
+		`SELECT branch, COALESCE(conflict_files, '{}') FROM merge_queue
+		 WHERE task_id = $1 ORDER BY id DESC LIMIT 1`, taskID).Scan(&branch, &files); err != nil {
+		return "", nil
+	}
+	return branch, files
+}
+
+// recordResolveEpisode inserts the audit marker (task_context kind 'merge',
+// content 'resolve <comment-id>') and enqueues the resolve prompt — one tx,
+// the inbox dedup on (origin_channel, external_msg_id) making a re-resolve
+// of the same comment a no-op even across poller restarts.
+func recordResolveEpisode(ctx context.Context, pool *pgxpool.Pool, agentID, taskID string, commentID int64, branch string, files []string) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ($1, $2, 'merge', $3)
+	`, taskID, agentID, fmt.Sprintf("resolve %d", commentID)); err != nil {
+		return fmt.Errorf("insert merge row: %w", err)
+	}
+	content, err := json.Marshal(map[string]any{
+		"type":    "merge",
+		"task_id": taskID,
+		"prompt":  resolvePromptBody(taskID, branch, files),
+	})
+	if err != nil {
+		return err
+	}
+	if _, _, err := mailbox.EnqueueInbox(ctx, tx, mailbox.InboxMessage{
+		AgentID:       agentID,
+		FromKind:      "system",
+		FromID:        "pipeline",
+		OriginChannel: "task",
+		ExternalMsgID: fmt.Sprintf("resolve:%s:%d", taskID, commentID),
+		Content:       content,
+	}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// resolvePromptBody is the resolve session's briefing. The merger soul
+// carries the method (rebase first, conservative resolution, propose-not-
+// merge); this carries the specifics: the parked branch and conflict files.
+func resolvePromptBody(taskID, branch string, files []string) string {
+	b := fmt.Sprintf(
+		"Resolve session for task %s (branch %s): the merge flow parked it. "+
+			"Rebase the branch onto origin/main, resolving every conflict — "+
+			"keep the resolved diff minimal and faithful to the PR's intent. "+
+			"Then read the PR's review conversation and address every unresolved "+
+			"comment thread (reply or resolve each; no new scope). "+
+			"Re-run the proofs the resolution touched, push with --force-with-lease, "+
+			"and end by posting the merge proposal comment on the PR — do not merge: "+
+			"the operator's maquinista approve re-runs the merge gate.",
+		taskID, branch)
+	if len(files) > 0 {
+		b += "\n\nParked conflict files:\n" + strings.Join(files, "\n")
+	}
+	return b
+}
+
 // ---- dispatcher ----
 
 // CommentDeps bundles what the comment-command dispatcher needs.
@@ -260,6 +407,9 @@ type CommentDeps struct {
 	Merge  MergeConfig
 	Prov   TicketProvider
 	TeamID string
+	// Spawn materializes sessions for spawning verbs (resolve). The wiring
+	// passes the same spawner the dispatch loop uses.
+	Spawn ReviewSpawner
 }
 
 // errNoTaskForPR: no task row matches the PR (id-less resolution missed).
@@ -339,6 +489,7 @@ func DispatchCommentCommand(ctx context.Context, d CommentDeps, authz *commentAu
 	hc := CommentContext{
 		Pool: d.Pool, Source: d.Source, PR: pr, CommentID: c.ID,
 		TaskID: taskID, Actor: c.Author, Args: args,
+		Spawn: d.Spawn,
 		Merge: d.Merge, Prov: d.Prov, TeamID: d.TeamID,
 	}
 	err = handler(ctx, hc)

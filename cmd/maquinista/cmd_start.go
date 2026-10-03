@@ -568,6 +568,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				Merge:  mCfg,
 				Prov:   prov,
 				TeamID: tCfg.TeamID,
+				Spawn:  pipelineReviewerSpawner{pool: pool, cfg: cfg, sidecars: sidecarMgr},
 			})
 			log.Println("pipeline: GitHub comment commands started (gh mode)")
 		}

@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -566,5 +567,195 @@ func TestPollPRCommands_FetchErrorHoldsCursor(t *testing.T) {
 	}
 	if !cursor.After(base) {
 		t.Fatalf("cursor did not advance on clean pass: %s", cursor)
+	}
+}
+
+// ---- resolve verb ----
+
+// fakeMergerSpawner records ReviewSpawnParams; err short-circuits the spawn.
+// insertRow materializes the agents row the real SpawnFresh pre-registers —
+// the resolve prompt enqueues to agent_inbox, whose FK needs the row (EX-04
+// pitfall (i)).
+type fakeMergerSpawner struct {
+	t         *testing.T
+	pool      *pgxpool.Pool
+	insertRow bool
+	calls     []ReviewSpawnParams
+	err       error
+}
+
+func (f *fakeMergerSpawner) SpawnReviewer(ctx context.Context, p ReviewSpawnParams) error {
+	if f.err != nil {
+		return f.err
+	}
+	f.calls = append(f.calls, p)
+	if f.insertRow {
+		execOK(f.t, f.pool, `
+			INSERT INTO agents (id, tmux_session, tmux_window, role, task_id, status,
+			                    runner_type, cwd, window_name, started_at, last_seen, stop_requested)
+			VALUES ($1, 'sess', $1, $5, $2, 'running', $3, $4, $1, NOW(), NOW(), FALSE)
+		`, p.AgentID, p.TaskID, p.RunnerType, p.WorktreePath, p.Role)
+	}
+	return nil
+}
+
+// seedResolveTask inserts a parked task with a worktree and a conflicted
+// merge_queue entry (the EX-05 park shape).
+func seedResolveTask(t *testing.T, pool *pgxpool.Pool, status string) (taskID, worktree string) {
+	t.Helper()
+	taskID = fmt.Sprintf("t-%d", nextTaskNum())
+	worktree = t.TempDir()
+	execOK(t, pool, `
+		INSERT INTO tasks (id, title, status, worktree_path, pr_url)
+		VALUES ($1, 'parked pr', $2, $3, 'https://github.com/o/r/pull/9')
+	`, taskID, status, worktree)
+	execOK(t, pool, `
+		INSERT INTO merge_queue (task_id, agent_id, branch, worktree_dir, base_branch, status, conflict_files)
+		VALUES ($1, 'w-1', 'feat/parked', $2, 'main', 'conflict', '{internal/comments.go,cmd/main.go}')
+	`, taskID, worktree)
+	return taskID, worktree
+}
+
+func TestResolveComment_SpawnsMergerSession(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	taskID, worktree := seedResolveTask(t, pool, "pending_approval")
+	src := &fakeComments{}
+	sp := &fakeMergerSpawner{t: t, pool: pool, insertRow: true}
+	d := CommentDeps{
+		Pool:   pool,
+		Source: src,
+		Auth:   GhCommandsConfig{AllowedLogins: []string{"alice"}},
+		Merge:  MergeConfig{Mode: MergeModeGH},
+		Spawn:  sp,
+	}
+
+	disp, err := DispatchCommentCommand(ctx, d, nil, 9,
+		PRComment{ID: 701, Author: "alice", Body: "maquinista resolve"})
+	if err != nil || disp != DispOK {
+		t.Fatalf("disp=%q err=%v", disp, err)
+	}
+	// Session spawned with the merger role + soul, in the task worktree.
+	if len(sp.calls) != 1 {
+		t.Fatalf("spawn calls = %d, want 1", len(sp.calls))
+	}
+	call := sp.calls[0]
+	if call.Role != "merger" || call.SoulTemplateID != MergerSoulTemplate {
+		t.Errorf("role/template = %s/%s, want merger/%s", call.Role, call.SoulTemplateID, MergerSoulTemplate)
+	}
+	if call.WorktreePath != worktree {
+		t.Errorf("worktree = %q, want %q", call.WorktreePath, worktree)
+	}
+	if call.TaskID != taskID || !strings.HasPrefix(call.AgentID, "merger-"+taskID) {
+		t.Errorf("agent = %s task = %s, want merger-<task> prefix", call.AgentID, taskID)
+	}
+	// The resolve prompt is enqueued (dedup id carries the comment) and
+	// names the parked branch + conflict files.
+	var prompt string
+	if err := pool.QueryRow(ctx,
+		`SELECT content->>'prompt' FROM agent_inbox
+		 WHERE agent_id = $1 AND external_msg_id = $2`,
+		call.AgentID, fmt.Sprintf("resolve:%s:701", taskID)).Scan(&prompt); err != nil {
+		t.Fatalf("resolve prompt row: %v", err)
+	}
+	for _, want := range []string{"feat/parked", "internal/comments.go", "--force-with-lease", "do not merge"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing %q", want)
+		}
+	}
+	// The 'merge' audit marker exists.
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_context WHERE task_id = $1 AND kind = 'merge'`, taskID).Scan(&n); err != nil || n != 1 {
+		t.Errorf("merge markers = %d err=%v, want 1", n, err)
+	}
+	// Ack + task untouched (still parked; the session does the moving).
+	if len(src.reactions) != 1 || src.reactions[0] != 701 {
+		t.Errorf("reactions = %v, want ack on comment 701", src.reactions)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id = $1`, taskID).Scan(&status); err != nil || status != "pending_approval" {
+		t.Errorf("status = %q err=%v, want pending_approval", status, err)
+	}
+}
+
+func TestResolveComment_NoOpWrongState(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	seedResolveTask(t, pool, "review") // parked shape, wrong state
+	sp := &fakeMergerSpawner{}
+	d := CommentDeps{
+		Pool:   pool,
+		Source: &fakeComments{},
+		Auth:   GhCommandsConfig{AllowedLogins: []string{"alice"}},
+		Merge:  MergeConfig{Mode: MergeModeGH},
+		Spawn:  sp,
+	}
+	disp, err := DispatchCommentCommand(ctx, d, nil, 9,
+		PRComment{ID: 702, Author: "alice", Body: "maquinista resolve"})
+	if err != nil || disp != DispNoOp {
+		t.Fatalf("disp=%q err=%v, want clean no-op", disp, err)
+	}
+	if len(sp.calls) != 0 {
+		t.Fatalf("spawn calls = %d, want 0", len(sp.calls))
+	}
+}
+
+func TestResolveComment_NoWorktreeNoOp(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	execOK(t, pool, `
+		INSERT INTO tasks (id, title, status, pr_url)
+		VALUES ($1, 'no worktree', 'pending_approval', 'https://github.com/o/r/pull/11')
+	`, fmt.Sprintf("t-%d", nextTaskNum()))
+	sp := &fakeMergerSpawner{}
+	d := CommentDeps{
+		Pool:   pool,
+		Source: &fakeComments{},
+		Auth:   GhCommandsConfig{AllowedLogins: []string{"alice"}},
+		Merge:  MergeConfig{Mode: MergeModeGH},
+		Spawn:  sp,
+	}
+	disp, err := DispatchCommentCommand(ctx, d, nil, 11,
+		PRComment{ID: 703, Author: "alice", Body: "maquinista resolve"})
+	if err != nil || disp != DispNoOp {
+		t.Fatalf("disp=%q err=%v, want clean no-op", disp, err)
+	}
+	if len(sp.calls) != 0 {
+		t.Fatalf("spawn calls = %d, want 0", len(sp.calls))
+	}
+}
+
+func TestResolveComment_SpawnErrorNoEpisode(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	taskID, _ := seedResolveTask(t, pool, "pending_approval")
+	sp := &fakeMergerSpawner{err: fmt.Errorf("uq_agents_task_live")}
+	d := CommentDeps{
+		Pool:   pool,
+		Source: &fakeComments{},
+		Auth:   GhCommandsConfig{AllowedLogins: []string{"alice"}},
+		Merge:  MergeConfig{Mode: MergeModeGH},
+		Spawn:  sp,
+	}
+	disp, err := DispatchCommentCommand(ctx, d, nil, 9,
+		PRComment{ID: 704, Author: "alice", Body: "maquinista resolve"})
+	if err == nil || disp != DispError {
+		t.Fatalf("disp=%q err=%v, want error disposition", disp, err)
+	}
+	// Spawn-before-record ordering: a failed spawn leaves no episode rows.
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM task_context WHERE task_id = $1 AND kind = 'merge'`, taskID).Scan(&n); err != nil || n != 0 {
+		t.Errorf("merge markers = %d err=%v, want 0", n, err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM agent_inbox WHERE external_msg_id = $1`,
+		fmt.Sprintf("resolve:%s:704", taskID)).Scan(&n); err != nil || n != 0 {
+		t.Errorf("inbox rows = %d err=%v, want 0", n, err)
 	}
 }

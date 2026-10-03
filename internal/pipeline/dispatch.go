@@ -51,11 +51,17 @@ const ReviewerSoulTemplate = "pipeline-reviewer"
 // (migration 035): resolve the reviewer's findings in the SAME worktree/PR.
 const FixerSoulTemplate = "pipeline-fixer"
 
+// MergerSoulTemplate is the soul template dispatch (and the comment-command
+// resolve verb) clones per merge/resolve session (migration 035): rebase,
+// gate, propose — merge only on operator approve.
+const MergerSoulTemplate = "pipeline-merger"
+
 // reviewerRole / fixerRole are the agents.role values for dispatched
 // pipeline agents.
 const (
 	reviewerRole = "reviewer"
 	fixerRole    = "fixer"
+	mergerRole   = "merger"
 )
 
 // DefaultMaxReviewRounds is the fixer-loop cap (ADR-0005 AC 7): the

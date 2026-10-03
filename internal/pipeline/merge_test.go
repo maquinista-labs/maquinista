@@ -7,6 +7,7 @@ package pipeline
 
 import (
 	"context"
+	"time"
 	"errors"
 	"fmt"
 	"os"
@@ -17,7 +18,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/db"
-	"github.com/maquinista-labs/maquinista/internal/gh"
 	"github.com/maquinista-labs/maquinista/internal/git"
 )
 
@@ -29,7 +29,7 @@ type fakeGh struct {
 	mergeCalls int
 	mergeErr   error
 
-	comments     []gh.PRComment // returned by PRComments
+	comments     []PRComment // returned by PRComments
 	commentsErr  error
 	postedBodies []string // bodies passed to PRPostComment, in order
 	postErr      error
@@ -42,7 +42,7 @@ func (f *fakeGh) PRMergeSquash(ctx context.Context, pr int) error {
 	f.mergeCalls++
 	return f.mergeErr
 }
-func (f *fakeGh) PRComments(ctx context.Context, pr int) ([]gh.PRComment, error) {
+func (f *fakeGh) PRComments(ctx context.Context, pr int, _ time.Time) ([]PRComment, error) {
 	return f.comments, f.commentsErr
 }
 func (f *fakeGh) PRPostComment(ctx context.Context, pr int, body string) error {
