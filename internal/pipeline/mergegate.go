@@ -153,7 +153,7 @@ func parkBuildFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, en
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("Build gate failed on branch %s — `%s` does not compile:\n%s", entry.Branch, gateCmd, output))
 	notifyf(ctx, pool, "🆘 %s: build gate failed on branch %s — %s does not compile. Compiler output (first %d lines):\n%s\nTask parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
-		taskTitle(ctx, pool, taskID), entry.Branch, gateCmd, maxBuildErrLines, output, taskID, prLinkSuffix(ctx, pool, taskID))
+		TaskTitle(ctx, pool, taskID), entry.Branch, gateCmd, maxBuildErrLines, output, taskID, prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s build gate failed on branch %s", taskID, entry.Branch)
 	return nil
 }

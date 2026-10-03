@@ -242,7 +242,7 @@ func approveCommentHandler(ctx context.Context, hc CommentContext) error {
 	// approval to the GitHub commenter. RunMergeOnApprove has already run
 	// the merge synchronously by the time this posts.
 	notifyf(ctx, hc.Pool, "👍 %s: approved via PR #%d comment by @%s — merge completed.",
-		taskTitle(ctx, hc.Pool, hc.TaskID), hc.PR, hc.Actor)
+		TaskTitle(ctx, hc.Pool, hc.TaskID), hc.PR, hc.Actor)
 	hc.ack(ctx)
 	return nil
 }
@@ -320,7 +320,7 @@ func resolveCommentHandler(ctx context.Context, hc CommentContext) error {
 			hc.TaskID, agentID, err)
 	}
 	notifyf(ctx, hc.Pool, "🔧 %s: resolve session %s spawned (PR #%d, branch %s) by @%s — rebase + pending comments; approve re-merges after.",
-		taskTitle(ctx, hc.Pool, hc.TaskID), agentID, hc.PR, branch, hc.Actor)
+		TaskTitle(ctx, hc.Pool, hc.TaskID), agentID, hc.PR, branch, hc.Actor)
 	hc.ack(ctx)
 	return nil
 }

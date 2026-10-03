@@ -391,7 +391,7 @@ func retireStuckImplementor(ctx context.Context, pool *pgxpool.Pool, taskID stri
 		return false, true, nil // raced to dead elsewhere — no notification
 	}
 	notifyf(ctx, pool, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.%s",
-		taskTitle(ctx, pool, taskID), agentID, idleAfter, prLinkSuffix(ctx, pool, taskID))
+		TaskTitle(ctx, pool, taskID), agentID, idleAfter, prLinkSuffix(ctx, pool, taskID))
 	return true, true, nil
 }
 
@@ -521,6 +521,12 @@ func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agen
 	`, taskID).Scan(&round); err != nil {
 		return fmt.Errorf("bump review_rounds: %w", err)
 	}
+	// MAQ-22: the round's claim announces itself exactly once — this bump
+	// runs once per spawned reviewer (the spawn pass's no-live-reviewer
+	// filter is the guard), so the journey stays visible in the topic
+	// without re-firing on later ticks.
+	notifyf(ctx, pool, "👀 %s: reviewer claimed — review round %d starting.",
+		TaskTitle(ctx, pool, taskID), round)
 
 	content, err := json.Marshal(map[string]any{
 		"type":    "review",
@@ -1098,6 +1104,11 @@ func recordFixEpisode(ctx context.Context, pool *pgxpool.Pool, agentID, taskID s
 	`, taskID, agentID, fmt.Sprintf("round %d", round)); err != nil {
 		return fmt.Errorf("insert fix row: %w", err)
 	}
+	// MAQ-22: the episode marker above is the exactly-once guard — it is
+	// what fixerCandidatesSQL keys on — so the round-started one-liner
+	// fires exactly once per fixer episode.
+	notifyf(ctx, pool, "🔧 %s: fixer round %d started — resolving request_changes findings.",
+		TaskTitle(ctx, pool, taskID), round)
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return err
