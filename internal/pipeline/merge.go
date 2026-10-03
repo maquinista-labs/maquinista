@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/db"
+	"github.com/maquinista-labs/maquinista/internal/gh"
 	"github.com/maquinista-labs/maquinista/internal/git"
 )
 
@@ -38,12 +39,17 @@ const (
 )
 
 // GhRunner abstracts the GitHub side (gh CLI in production, a fake in
-// tests). Kept minimal: one read, one write.
+// tests). Kept minimal: two reads, two writes (MAQ-16 added the PR-comment
+// pair — verdict posts + human-comment reads).
 type GhRunner interface {
 	// PRChecks returns the aggregate state of the PR's CI checks.
 	PRChecks(ctx context.Context, pr int) (string, error)
 	// PRMergeSquash squash-merges the PR via the API/CLI.
 	PRMergeSquash(ctx context.Context, pr int) error
+	// PRComments lists the PR's issue comments, oldest first.
+	PRComments(ctx context.Context, pr int) ([]gh.PRComment, error)
+	// PRPostComment posts body as a new comment on the PR.
+	PRPostComment(ctx context.Context, pr int, body string) error
 }
 
 // MergeConfig carries the merge-mode knobs plus the GhRunner. Gh is nil in

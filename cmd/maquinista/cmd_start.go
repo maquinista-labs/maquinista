@@ -29,8 +29,8 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/runner"
 	"github.com/maquinista-labs/maquinista/internal/scheduler"
 	"github.com/maquinista-labs/maquinista/internal/sidecar"
-	"github.com/maquinista-labs/maquinista/internal/taskscheduler"
 	"github.com/maquinista-labs/maquinista/internal/state"
+	"github.com/maquinista-labs/maquinista/internal/taskscheduler"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
 )
@@ -504,7 +504,9 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		// provider — runs even if NewProvider fails below.
 		go func() {
 			spawner := pipelineReviewerSpawner{pool: pool, cfg: cfg, sidecars: sidecarMgr}
-			pipeline.RunDispatch(ctx, pool, pipeline.DispatchConfigFromEnv(cfg.TmuxSessionName), spawner, tmux.KillWindow)
+			dcfg := pipeline.DispatchConfigFromEnv(cfg.TmuxSessionName)
+			dcfg.Gh = gh.New() // MAQ-16: verdict comments + human-comment reads on PRs
+			pipeline.RunDispatch(ctx, pool, dcfg, spawner, tmux.KillWindow)
 		}()
 
 		// Task-scheduler (EX-07): drains 'ready' tasks (created by the
@@ -564,7 +566,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 }
 
 // runDashboardAgentReconcile periodically scans for dashboard-spawned
-// agents (status='stopped', tmux_window='') and provisions their tmux
+// agents (status='stopped', tmux_window=”) and provisions their tmux
 // panes. After each reconcile pass it syncs the sidecar manager so that
 // newly-online agents get their own inbox goroutine within the same tick.
 // Runs as a background goroutine; terminates on ctx cancel.

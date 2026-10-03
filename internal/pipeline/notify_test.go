@@ -77,7 +77,7 @@ func TestVerdict_NotifyPerOutcome(t *testing.T) {
 				VALUES ('reviewer-`+taskID+`', $1::jsonb)
 			`, `{"text":"findings...\nVERDICT: `+c.verdict+`\n"}`)
 
-			if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
+			if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
 				t.Fatalf("verdictPass: %v", err)
 			}
 
@@ -129,7 +129,7 @@ func TestVerdict_PRLinkInSummary(t *testing.T) {
 				VALUES ('reviewer-`+taskID+`', $1::jsonb)
 			`, `{"text":"findings...\nVERDICT: `+c.verdict+`\n"}`)
 
-			if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
+			if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
 				t.Fatalf("verdictPass: %v", err)
 			}
 			texts := pipelineNotifyTextsPool(t, pool)
@@ -155,7 +155,7 @@ func TestVerdict_MalformedNoNotify(t *testing.T) {
 		VALUES ('reviewer-tm', '{"text":"VERDICT: approved-ish"}'::jsonb)
 	`)
 
-	if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if texts := pipelineNotifyTextsPool(t, pool); len(texts) != 0 {

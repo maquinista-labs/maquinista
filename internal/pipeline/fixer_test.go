@@ -272,7 +272,7 @@ func TestMarkDone_FixerCompletedGoesToReview(t *testing.T) {
 	// Next round: the reviewer spawn pass mints a FRESH reviewer (never a
 	// fixer id) and bumps the round.
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := dispatchPass(ctx, pool, sp, DefaultImplementorIdleAfter); err != nil {
+	if err := dispatchPass(ctx, pool, nil, sp, DefaultImplementorIdleAfter); err != nil {
 		t.Fatalf("dispatchPass: %v", err)
 	}
 	if len(sp.spawns) != 1 {
