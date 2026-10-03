@@ -281,13 +281,17 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 		_, _ = pool.Exec(ctx, `UPDATE tasks SET status='ready' WHERE id=$1 AND status='claimed'`, taskID)
 		return true, fmt.Errorf("ensure_agent %s: %w", taskID, err)
 	}
-	// MAQ-22: the claim announces itself once it has an owner. The guarded
-	// claim above (SKIP LOCKED + status flip) fired exactly once; on the
-	// ErrAgentAlreadyLive path no fresh pane exists (agentID empty) and the
-	// existing pane's claim was already announced when it first landed.
+	// MAQ-22: the claim announces itself. The exactly-once guard is the
+	// guarded claim above (FOR UPDATE SKIP LOCKED + 'ready'→'claimed'
+	// flip): one winner per claim, one note. EnsureAgent returns a
+	// non-empty id on both outcomes — a freshly minted pane, or the
+	// already-live pane (ErrAgentAlreadyLive) that a racing spawn created
+	// and this claim then routes a fresh /work-on-task to — so both paths
+	// are genuine claims and both announce; the empty check below is
+	// defensiveness against a future EnsureAgent change, not the guard.
 	if agentID != "" {
-		pipeline.Notifyf(ctx, pool, "📋 %s: claimed by @%s (implementor) — /work-on-task dispatched.",
-			pipeline.TaskTitle(ctx, pool, taskID), agentID)
+		pipeline.Notifyf(ctx, pool, "📋 %s: claimed by @%s (%s) — /work-on-task dispatched.",
+			pipeline.TaskTitle(ctx, pool, taskID), agentID, role)
 	}
 
 	// Enqueue the implementor's starting prompt + mark task.claimed_by.

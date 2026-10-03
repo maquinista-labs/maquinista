@@ -342,9 +342,10 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		return nil
 	case ChecksFailed:
 		// Cap the reclaim loop (EX-06): a red PR under AUTO_MERGE=1
-		// otherwise releases and re-claims forever. Below cap: silent
-		// release (the spam bug the cap exists for). At cap: entry
-		// failed, task parked needs-human, one question out.
+		// otherwise releases and re-claims forever. Below cap: release
+		// with exactly one 🟥 gate-red one-liner (the attempts bump bounds
+		// the note to once per distinct red, not once per pass). At cap:
+		// entry failed, task parked needs-human, one question out.
 		attempts, err := db.BumpMergeAttempts(pool, entry.ID)
 		if err != nil {
 			return fmt.Errorf("pipeline: bumping attempts %d: %w", entry.ID, err)

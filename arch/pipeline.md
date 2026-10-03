@@ -62,8 +62,12 @@ implementor:
   `task:<id>` dedup) and sets `tasks.claimed_by`; `HealMissingInbox` covers
   the crash-between-claim-and-enqueue wedge; once the spawn has an owner
   the claim announces itself on the Pipeline topic (MAQ-22 one-liner,
-  `pipeline.Notifyf` — silent on the `ErrAgentAlreadyLive` path where no
-  fresh pane exists)
+  `pipeline.Notifyf`; the exactly-once guard is the guarded claim itself —
+  one `ready`→`claimed` flip per claim — not the agent id: `EnsureAgent`
+  returns a non-empty id on both outcomes, so the `ErrAgentAlreadyLive`
+  path (a racing spawn's already-live pane, which the claim routes a fresh
+  /work-on-task to) announces too; the note interpolates the task's
+  `metadata->>'role'`, defaulting to implementor)
 - two MAQ-18 safety nets run each wake: `LogBlockedReadyTasks` journals
   every `ready` task skipped because a live agent still holds it (no
   silent skips), and `ReapStaleClaims` releases `claimed` tasks back to
