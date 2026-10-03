@@ -98,8 +98,8 @@ type DispatchConfig struct {
 	// Interval between passes (default 10s, same cadence as sync).
 	Interval time.Duration
 	// ReviewTimeout is the stall watchdog bound: a live reviewer or fixer
-	// with no outbox activity for this long parks the task in
-	// pending_approval (default 2h, MAQUINISTA_REVIEW_TIMEOUT).
+	// with no outbox activity and no transcript growth for this long parks
+	// the task in pending_approval (default 2h, MAQUINISTA_REVIEW_TIMEOUT).
 	ReviewTimeout time.Duration
 	// MaxReviewRounds is the fixer-loop cap (default 3,
 	// MAQUINISTA_REVIEW_ROUNDS_MAX).
@@ -745,7 +745,8 @@ func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verd
 
 // watchdogPass parks stalled pipeline agents: a live reviewer (in 'review')
 // or fixer (in 'changes_requested') with NO outbox activity (the monitor
-// writes rows as the agent streams) for longer than the timeout flips the
+// writes rows as the agent streams) AND no transcript growth
+// (agents.last_transcript_at, MAQ-9) for longer than the timeout flips the
 // task to pending_approval and retires the pane. Agents younger than the
 // timeout are exempt: a freshly spawned reviewer has no outbox rows yet
 // (prompt delivery races pi's cold boot), and parking it on sight murders
@@ -770,11 +771,20 @@ WHERE a.role = '` + fixerRole + `'
   AND t.metadata->>'ticket_issue_id' IS NOT NULL`
 
 func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
+	// Stall = silent on BOTH activity channels for the whole window:
+	//   - no agent_outbox rows (assistant text streamed by the monitor), AND
+	//   - no transcript growth (last_transcript_at — a healthy agent
+	//     mid-command streams tool events into the JSONL but writes no
+	//     outbox text; MAQ-9).
+	// NULL last_transcript_at = no growth ever observed. The started_at age
+	// guard keeps newborns (no signal on either channel yet) untouchable.
 	stallFilter := `
   AND a.started_at < NOW() - make_interval(secs => $1)
   AND NOT EXISTS (
         SELECT 1 FROM agent_outbox o
-        WHERE o.agent_id = a.id AND o.created_at > NOW() - make_interval(secs => $1))`
+        WHERE o.agent_id = a.id AND o.created_at > NOW() - make_interval(secs => $1))
+  AND (a.last_transcript_at IS NULL
+       OR a.last_transcript_at < NOW() - make_interval(secs => $1))`
 	var reviewers []liveReviewer
 	if err := scanReviewers(ctx, pool, liveReviewersSQL+stallFilter,
 		[]any{timeout.Seconds()}, &reviewers); err != nil {

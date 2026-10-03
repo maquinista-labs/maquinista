@@ -180,12 +180,18 @@ session in the SAME worktree/PR:
   reviewer spawn pass mints a fresh reviewer and bumps the round
 
 **Watchdog.** A live reviewer (in `review`) or fixer (in
-`changes_requested`) with NO outbox activity (the monitor writes rows as the
-agent streams) for longer than `MAQUINISTA_REVIEW_TIMEOUT` (default 2h)
-parks the task in `pending_approval` with a watchdog verdict row and retires
-the pane. The malformed-verdict case is deliberately left to the watchdog:
-the parser never guesses, the timeout is the backstop — and a stalled fixer
-is bounded the same way.
+`changes_requested`) with NO activity signal for longer than
+`MAQUINISTA_REVIEW_TIMEOUT` (default 2h) parks the task in
+`pending_approval` with a watchdog verdict row and retires the pane.
+Activity is two-channel (MAQ-9): `agent_outbox` rows (assistant text the
+monitor streams) OR transcript growth (`agents.last_transcript_at`, written
+throttled by the monitor on JSONL offset advance — a healthy agent
+mid-command emits tool events but no outbox text). Parking requires BOTH
+channels silent for the whole window; agents younger than the timeout are
+exempt entirely (a newborn has no signal on either channel yet — parking on
+sight murders slow-booting spawns). The malformed-verdict case is
+deliberately left to the watchdog: the parser never guesses, the timeout is
+the backstop — and a stalled fixer is bounded the same way.
 
 ## Env contract
 

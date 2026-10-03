@@ -27,32 +27,74 @@ type ObservingTopic struct {
 	UserID  int64
 }
 
+// transcriptTouchInterval throttles the transcript-liveness writes: a
+// streaming agent advances its transcript on every poll (~2s), while the
+// pipeline watchdog's stall bound is hours — minute granularity is plenty.
+const transcriptTouchInterval = 30 * time.Second
+
 // Monitor polls transcript sources and routes entries to the message queue.
 type Monitor struct {
-	config            *config.Config
-	state             *state.State
-	monitorState      *state.MonitorState
-	sink              *MultiSink
-	pool              *pgxpool.Pool
-	sources           []TranscriptSource
-	pollInterval      time.Duration
-	turnStarts        sync.Map // windowID → time.Time
-	PlanHandler       func(userID int64, threadID int, chatID int64, planJSON string)
-	planBuffers       map[string]string // windowID → partial plan text
-	ObservationLookup ObservationLookup // optional: resolve window → observing topics
-	pollCount         int
+	config              *config.Config
+	state               *state.State
+	monitorState        *state.MonitorState
+	sink                *MultiSink
+	pool                *pgxpool.Pool
+	sources             []TranscriptSource
+	pollInterval        time.Duration
+	turnStarts          sync.Map // windowID → time.Time
+	PlanHandler         func(userID int64, threadID int, chatID int64, planJSON string)
+	planBuffers         map[string]string // windowID → partial plan text
+	ObservationLookup   ObservationLookup // optional: resolve window → observing topics
+	pollCount           int
+	transcriptTouches   sync.Map      // windowID → time.Time of last liveness write
+	transcriptTouchFreq time.Duration // liveness write throttle (default transcriptTouchInterval; 0 disables)
 }
 
 // New creates a new Monitor.
 func New(cfg *config.Config, st *state.State, ms *state.MonitorState, sink *MultiSink, pool *pgxpool.Pool) *Monitor {
 	return &Monitor{
-		config:       cfg,
-		state:        st,
-		monitorState: ms,
-		sink:         sink,
-		pool:         pool,
-		pollInterval: time.Duration(cfg.MonitorPollInterval * float64(time.Second)),
-		planBuffers:  make(map[string]string),
+		config:              cfg,
+		state:               st,
+		monitorState:        ms,
+		sink:                sink,
+		pool:                pool,
+		pollInterval:        time.Duration(cfg.MonitorPollInterval * float64(time.Second)),
+		planBuffers:         make(map[string]string),
+		transcriptTouchFreq: transcriptTouchInterval,
+	}
+}
+
+// touchTranscriptLiveness records transcript growth for the agent owning
+// windowID (MAQ-9): agents.last_transcript_at = NOW(). The pipeline
+// watchdog treats any growth inside the stall window as liveness — a
+// healthy agent mid-command (go test, build) streams tool events into the
+// transcript but writes zero agent_outbox rows, so outbox silence alone
+// must not read as stalled. Throttled to one write per
+// transcriptTouchFreq per window; best-effort (failures are logged, never
+// fail the poll pass). Windows that resolve to no agent row (user
+// sessions, dead rows) are silently skipped.
+func (m *Monitor) touchTranscriptLiveness(windowID string) {
+	if m.pool == nil {
+		return
+	}
+	if v, ok := m.transcriptTouches.Load(windowID); ok {
+		if time.Since(v.(time.Time)) < m.transcriptTouchFreq {
+			return
+		}
+	}
+	// Store before writing: the throttle bounds the query rate even when
+	// the write loses the race or the DB hiccups — the next growth tick
+	// retries after one interval, far inside any stall window.
+	m.transcriptTouches.Store(windowID, time.Now())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	agentID, err := resolveAgentFromWindow(ctx, m.pool, windowID)
+	if err != nil || agentID == "" {
+		return
+	}
+	if _, err := m.pool.Exec(ctx,
+		`UPDATE agents SET last_transcript_at = NOW() WHERE id = $1`, agentID); err != nil {
+		log.Printf("monitor: transcript liveness update agent=%s: %v", agentID, err)
 	}
 }
 
@@ -108,8 +150,13 @@ func (m *Monitor) poll() {
 				continue
 			}
 
-			// Update offset even if no parsed entries (source handles offset tracking internally)
-			_ = newOffset
+			// Sources self-track their read offsets internally; the returned
+			// offset is the transcript-growth signal (MAQ-9): any advance is
+			// liveness, even with zero displayable entries (tool events
+			// mid-command, metadata lines).
+			if newOffset > offset {
+				m.touchTranscriptLiveness(sess.WindowID)
+			}
 
 			if len(parsed) == 0 {
 				continue

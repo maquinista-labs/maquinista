@@ -478,6 +478,61 @@ func TestWatchdog_InsideTimeoutUntouched(t *testing.T) {
 	}
 }
 
+// TestWatchdog_TranscriptGrowthKeepsAlive pins the MAQ-9 liveness signal:
+// a reviewer past the age guard with ZERO outbox rows but recent transcript
+// growth (last_transcript_at inside the stall window — a long `go test`
+// streams tool events, not assistant text) is HEALTHY and must not be
+// parked. Regression: 2026-10-02, the EX-07 round-3 reviewer spent minutes
+// running the suite with zero outbox rows; today's code parks it anyway.
+func TestWatchdog_TranscriptGrowthKeepsAlive(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tg", "uuid-g", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-tg", "tg")
+	// Past the age guard (PR #12), silent outbox, but the transcript grew
+	// five minutes ago — mid-command liveness.
+	execOK(t, pool, `
+		UPDATE agents SET started_at = NOW() - interval '31 minutes',
+		                   last_transcript_at = NOW() - interval '5 minutes'
+		WHERE id='reviewer-tg'`)
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	if got := taskCol(t, pool, "tg", "status"); got != "review" {
+		t.Fatalf("growing-transcript task status = %q, want review (growth is liveness)", got)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='reviewer-tg'`).Scan(&status); err != nil {
+		t.Fatalf("reviewer row: %v", err)
+	}
+	if status != "running" {
+		t.Fatalf("growing-transcript reviewer status = %q, want running", status)
+	}
+}
+
+// TestWatchdog_StaleTranscriptStillParks is the AC-2 regression: the
+// liveness signal must not become an amnesty. A reviewer past the age
+// guard whose transcript last grew BEFORE the stall window (grew once at
+// spawn, silent since) and with zero outbox rows is truly idle — parked.
+func TestWatchdog_StaleTranscriptStillParks(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "ts", "uuid-s", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-ts", "ts")
+	execOK(t, pool, `
+		UPDATE agents SET started_at = NOW() - interval '62 minutes',
+		                   last_transcript_at = NOW() - interval '31 minutes'
+		WHERE id='reviewer-ts'`)
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	if got := taskCol(t, pool, "ts", "status"); got != "pending_approval" {
+		t.Fatalf("stale-transcript task status = %q, want pending_approval", got)
+	}
+}
+
 // TestWatchdog_YoungAgentUntouched pins the young-agent guard: a freshly
 // spawned reviewer with ZERO outbox activity (prompt delivery racing pi's
 // cold boot) must NOT be parked — the watchdog may only kill agents that

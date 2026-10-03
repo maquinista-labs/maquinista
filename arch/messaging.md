@@ -88,6 +88,11 @@ origin delivery.
    `ActiveInboxMap[agentID]` to stamp `in_reply_to`. A `NOTIFY
    agent_outbox_new` fires.
 
+   Independently of assistant text, the tailer also records raw transcript
+   growth (any offset advance) as `agents.last_transcript_at` (throttled,
+   MAQ-9) — liveness for the pipeline watchdog, which must not read a
+   mid-command agent's outbox silence as stalled.
+
 4. **Relay** — `maquinista relay` daemon wakes, claims the outbox row,
    runs `fanoutDeliveries`:
    - **Origin leg** — if `in_reply_to` points to a `telegram` inbox row,
