@@ -52,12 +52,8 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/mailbox"
 )
 
-// MergerSoulTemplate is the soul template dispatch clones per merger agent
-// (migration 035 seeded it; 038 pivoted it to the conflict contract).
-const MergerSoulTemplate = "pipeline-merger"
-
-// mergerRole is the agents.role value for dispatched merger agents.
-const mergerRole = "merger"
+// MergerSoulTemplate and mergerRole are declared in dispatch.go (shared with
+// the comment-command resolve verb and dispatch's reviewer/fixer roles).
 
 // VerdictMerged extends the frozen verdict vocabulary for the merger
 // contract (reviewers keep approve/request_changes/needs_human).
