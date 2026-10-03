@@ -226,6 +226,87 @@ func mergeEnqueuePass(ctx context.Context, pool *pgxpool.Pool) error {
 	return err
 }
 
+// ---- daemon-native merge executor (MAQ-21) ------------------------------
+//
+// The queue used to be drained by an EXTERNAL executor: a bash loop
+// (merge-watcher.service → ~/.local/bin/merge-watcher.sh) that re-ran
+// `maquinista approve` against ready_to_merge tasks. Two executors drift —
+// the bash loop cannot reuse the daemon's guarded transitions, needed
+// hand-fixes (the 03/10 attempt-counter flood: 128 duplicate notifies), and
+// was always interim. RunMergeDrain moves execution into the orchestrator:
+// one pending entry per tick, oldest first, straight through
+// ProcessMergeGH (rebase → CI gate → quality gate → squash). Exactly-once
+// by claim: the 'merging' status is held for the duration and every
+// terminal arm records queue+task state before returning. No second
+// executor may poll beside it — with the daemon draining, the watcher unit
+// and script retire.
+
+// mergeDrainInterval is the idle poll cadence of the daemon merge executor.
+// One entry per tick also bounds concurrency: a merge holds its worktree
+// for the rebase+gate duration (~3–5 min budget), and processing entries in
+// claim order serially keeps the queue FIFO.
+const mergeDrainInterval = 10 * time.Second
+
+// RunMergeDrainPass is one iteration of the daemon merge executor: claim
+// the oldest pending merge_queue entry and drive it through ProcessMergeGH.
+// processed=false when the queue is empty or the executor is inert
+// (non-gh mode, or auto-merge off — those merges belong to the approve
+// verb, which bypasses the auto-merge gate for one merge at a time; a
+// drain pass would only churn claim→release against it).
+//
+// ProcessMergeGH returns an error only on infrastructure trouble (DB down,
+// unreadable task row). No terminal arm recorded → the entry is released
+// back to 'pending' so a later pass retries; ReleaseMergeEntry's 'merging'
+// guard keeps an entry that raced to a terminal state safe.
+func RunMergeDrainPass(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, prov TicketProvider, teamID string) (processed bool, err error) {
+	if cfg.Mode != MergeModeGH || !cfg.AutoMerge {
+		return false, nil
+	}
+	if cfg.Gh == nil {
+		return false, fmt.Errorf("pipeline: merge drain requires a GhRunner")
+	}
+	entry, err := db.ClaimMergeEntry(pool)
+	if err != nil {
+		return false, fmt.Errorf("pipeline: merge drain claim: %w", err)
+	}
+	if entry == nil {
+		return false, nil
+	}
+	log.Printf("pipeline: merge drain: entry %d claimed (task %s, branch %s → %s)",
+		entry.ID, entry.TaskID, entry.Branch, entry.BaseBranch)
+	if err := ProcessMergeGH(ctx, pool, cfg, prov, teamID, entry); err != nil {
+		if rerr := db.ReleaseMergeEntry(pool, entry.ID); rerr != nil {
+			log.Printf("pipeline: merge drain: releasing entry %d after error: %v", entry.ID, rerr)
+		}
+		return true, fmt.Errorf("pipeline: merge drain entry %d (task %s): %w", entry.ID, entry.TaskID, err)
+	}
+	return true, nil
+}
+
+// RunMergeDrain runs the daemon merge executor until ctx is cancelled: one
+// merge attempt per tick, oldest entry first. Runs only in gh mode with
+// auto-merge on; otherwise it exits immediately (the approve verb owns
+// those merges) — callers can start it unconditionally alongside the
+// dispatch loop.
+func RunMergeDrain(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, prov TicketProvider, teamID string) {
+	if cfg.Mode != MergeModeGH || !cfg.AutoMerge {
+		log.Printf("pipeline: merge drain: inert (mode=%q auto_merge=%v) — merges wait for the approve verb", cfg.Mode, cfg.AutoMerge)
+		return
+	}
+	ticker := time.NewTicker(mergeDrainInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if _, err := RunMergeDrainPass(ctx, pool, cfg, prov, teamID); err != nil {
+			log.Printf("%v", err)
+		}
+	}
+}
+
 // ProcessMergeGH runs one merge attempt for a claimed queue entry in gh
 // mode. Every terminal outcome records queue + task + observation state and
 // returns nil; only infrastructure errors return an error.
@@ -376,19 +457,21 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		// green / none — proceed.
 	}
 
-	// 3.5 Build gate (MAQ-20): compile the branch before the squash. CI
-	// does not run on PRs, so this is the only point between the implementor
-	// verdict and the merge that executes a build — PR #21 merged duplicate
-	// consts and broke main because nothing here compiled. origin/<branch>
-	// is the tree a squash-merge takes: step 1's rebase already folded in
-	// the latest base and step 2 lease-pushed it, so the gate never builds
-	// a stale tree.
-	passed, buildOut, err := runBuildGate(ctx, wt, "origin/"+entry.Branch)
+	// 3.5 Quality gate (MAQ-20 build + MAQ-21 tests): compile the branch,
+	// then run the test suite on the packages it touches, before the squash.
+	// CI does not run on PRs, so this is the only point between the
+	// implementor verdict and the merge that executes code — PR #21 merged
+	// duplicate consts and broke main because nothing here compiled, and
+	// `go build ./...` alone cannot see a red test or a broken test-only
+	// dependency. origin/<branch> is the tree a squash-merge takes: step 1's
+	// rebase already folded in the latest base and step 2 lease-pushed it,
+	// so the gate never builds a stale tree.
+	passed, gateStep, gateCmd, gateOut, err := runMergeGate(ctx, wt, "origin/"+entry.Branch, "origin/"+base)
 	if err != nil {
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("build gate could not run: %v", err))
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("%s gate could not run: %v", gateStep, err))
 	}
 	if !passed {
-		return parkBuildFailure(ctx, pool, taskID, entry, buildOut)
+		return parkGateFailure(ctx, pool, taskID, entry, gateStep, gateCmd, gateOut)
 	}
 
 	// 4. Squash-merge on the remote.

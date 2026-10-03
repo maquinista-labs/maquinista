@@ -562,6 +562,12 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		if mCfg := pipeline.MergeConfigFromEnv(); mCfg.Mode == pipeline.MergeModeGH {
 			runner := gh.New() // stateless: one runner serves both merge and comment surfaces
 			mCfg.Gh = runner
+			// Daemon-native merge executor (MAQ-21): the orchestrator drains
+			// merge_queue in-process, oldest entry first, through the same
+			// guarded ProcessMergeGH arms — merge-watcher.service and its
+			// script retire; no second executor may poll beside it. Inert
+			// without auto-merge (the approve verb owns those merges).
+			go pipeline.RunMergeDrain(ctx, pool, mCfg, prov, tCfg.TeamID)
 			go pipeline.RunCommentCommands(ctx, pipeline.CommentDeps{
 				Pool:   pool,
 				Source: runner,
@@ -571,7 +577,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				TeamID: tCfg.TeamID,
 				Spawn:  pipelineReviewerSpawner{pool: pool, cfg: cfg, sidecars: sidecarMgr},
 			})
-			log.Println("pipeline: GitHub comment commands started (gh mode)")
+			log.Println("pipeline: merge drain + GitHub comment commands started (gh mode)")
 		}
 	}
 
