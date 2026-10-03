@@ -233,6 +233,15 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := fixerPass(ctx, pool, spawn, cfg.ImplementorIdleAfter); err != nil {
 			log.Printf("pipeline: dispatch: fixer pass: %v", err)
 		}
+		if err := mergerPass(ctx, pool, spawn); err != nil {
+			log.Printf("pipeline: dispatch: merger spawn pass: %v", err)
+		}
+		if err := mergerVerdictPass(ctx, pool, cfg.SessionName, killWindow); err != nil {
+			log.Printf("pipeline: dispatch: merger verdict pass: %v", err)
+		}
+		if err := mergerWatchdogPass(ctx, pool, cfg.ReviewTimeout, cfg.SessionName, killWindow); err != nil {
+			log.Printf("pipeline: dispatch: merger watchdog pass: %v", err)
+		}
 		if err := watchdogPass(ctx, pool, cfg.ReviewTimeout, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: watchdog pass: %v", err)
 		}

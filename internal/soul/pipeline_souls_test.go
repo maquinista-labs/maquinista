@@ -306,23 +306,28 @@ func TestPipelineMergerContract(t *testing.T) {
 	tpl := mustLoadTemplate(t, ctx, pool, "pipeline-merger")
 	out := renderPipelineTemplate(t, ctx, pool, "pipeline-merger", "pm-rend")
 
-	// AC 11: rebase, gate, conflict handling.
+	// AC 11 (as pivoted by MAQ-15, migration 038): the gh merge mode drives
+	// the mechanical merge in Go; the merger role is the rebase-CONFLICT
+	// resolver. Frozen contract: keep both sides, prove green, one verdict.
 	for _, want := range []string{
-		"origin/main",
-		"gh pr checks",
-		"conflict file list",
+		"VERDICT: merged",
+		"VERDICT: needs_human",
+		"go build",
+		"go test",
+		"both sides",
 	} {
 		if !strings.Contains(out, want) {
-			t.Errorf("merger prompt missing merge element %q", want)
+			t.Errorf("merger prompt missing conflict-contract element %q", want)
 		}
 	}
 
-	// AC 12: proposal-then-wait is the stated default.
-	if !strings.Contains(out, "merge proposal") {
-		t.Error("merger prompt missing merge proposal behavior")
+	// The merge itself stays with the queue — the agent never pushes/merges,
+	// and a semantic conflict aborts instead of being forced.
+	if !strings.Contains(tpl.Goal, "never push, never merge") {
+		t.Error("merger goal missing the never-push/merge rule")
 	}
-	if !strings.Contains(tpl.Goal, "maquinista approve") {
-		t.Error("merger goal missing maquinista approve wait")
+	if !strings.Contains(tpl.Boundaries, "rebase --abort") {
+		t.Error("merger boundaries missing the semantic-conflict abort rule")
 	}
 }
 
