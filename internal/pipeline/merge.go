@@ -376,6 +376,21 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		// green / none — proceed.
 	}
 
+	// 3.5 Build gate (MAQ-20): compile the branch before the squash. CI
+	// does not run on PRs, so this is the only point between the implementor
+	// verdict and the merge that executes a build — PR #21 merged duplicate
+	// consts and broke main because nothing here compiled. origin/<branch>
+	// is the tree a squash-merge takes: step 1's rebase already folded in
+	// the latest base and step 2 lease-pushed it, so the gate never builds
+	// a stale tree.
+	passed, buildOut, err := runBuildGate(ctx, wt, "origin/"+entry.Branch)
+	if err != nil {
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("build gate could not run: %v", err))
+	}
+	if !passed {
+		return parkBuildFailure(ctx, pool, taskID, entry, buildOut)
+	}
+
 	// 4. Squash-merge on the remote.
 	if err := cfg.Gh.PRMergeSquash(ctx, pr); err != nil {
 		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("gh pr merge failed: %v", err))
