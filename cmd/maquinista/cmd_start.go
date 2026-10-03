@@ -566,7 +566,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 }
 
 // runDashboardAgentReconcile periodically scans for dashboard-spawned
-// agents (status='stopped', tmux_window=”) and provisions their tmux
+// agents (status='stopped', empty tmux_window) and provisions their tmux
 // panes. After each reconcile pass it syncs the sidecar manager so that
 // newly-online agents get their own inbox goroutine within the same tick.
 // Runs as a background goroutine; terminates on ctx cancel.

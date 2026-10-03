@@ -124,11 +124,14 @@ live reviewer agent:
   extras (`default_runner`, `reasoning_class`) — `ResolveExec`: class
   `high` → `MAQUINISTA_PI_MODEL_HIGH`, else `MAQUINISTA_PI_MODEL`, empty
   model = the runner's own chain
-- builds the round prompt (see **Human PR comments**, below) and spawns via
-  `ReviewSpawner` (wraps `agentspawn.SpawnFresh`: agents row
+- spawns via `ReviewSpawner` (wraps `agentspawn.SpawnFresh`: agents row
   task-bound, soul clone, tmux pane, sidecar), then bumps
-  `tasks.review_rounds` and enqueues the prompt in ONE tx
-  (`external_msg_id = review:<task>:<round>` dedups)
+  `tasks.review_rounds` (autocommit — its presence makes the next tick a
+  no-op for the spawn pass), builds the round prompt (see **Human PR
+  comments**, below — deliberately with NO transaction open, so the gh
+  comment fetch never holds a DB tx), and enqueues the prompt in its own
+  tx (`external_msg_id = review:<task>:<round>` dedups). A crash between
+  bump and enqueue heals via the prompt pass
 - on a `uq_agents_task_live` spawn failure, runs the **stuck-implementor
   self-heal (MAQ-14)**: if the blocking live row is the task's implementor
   whose last outbox activity is older than
