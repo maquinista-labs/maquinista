@@ -352,8 +352,10 @@ task via `tasks.pr_url`).
   fetch (`gh api`, `since=` cursor) per watched PR per tick; watched PRs =
   open pipeline PRs (`review`/`changes_requested`/`ready_to_merge`/
   `pending_approval`). Cadence 60 s default, 30 s floor. The cursor only
-  advances on a fetch-clean pass (a failed PR re-reads its window; claims
-  keep that exactly-once) and starts at now−10 min after a daemon restart.
+  advances on a clean pass — a failed fetch **or** a failed dispatch (a
+  transient dispatch error claims nothing) re-reads its window next pass;
+  claims keep that exactly-once — and starts at now−10 min after a daemon
+  restart.
 - **Ack** — accepted commands get a +1 reaction on the comment (best-effort)
   and a note to the Pipeline topic via the EX-06 notify path.
 - GitHub specifics live behind `pipeline.CommentSource` (interface:

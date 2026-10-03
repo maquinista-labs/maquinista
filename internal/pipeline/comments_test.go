@@ -759,3 +759,61 @@ func TestResolveComment_SpawnErrorNoEpisode(t *testing.T) {
 		t.Errorf("inbox rows = %d err=%v, want 0", n, err)
 	}
 }
+
+func TestPollPRCommands_DispatchErrorHoldsCursor(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	execOK(t, pool, `
+		INSERT INTO tasks (id, title, status, pr_url)
+		VALUES ('t-cursor3', 'watched', 'ready_to_merge', 'https://github.com/o/r/pull/9')
+	`)
+
+	base := time.Now().UTC().Add(-time.Hour)
+	cmdAt := base.Add(time.Minute)
+	src := &fakeComments{
+		comments: map[int][]PRComment{
+			9: {{ID: 901, Author: "alice", Body: "maquinista probe", CreatedAt: cmdAt}},
+		},
+		collaborators: map[string]bool{"alice": true},
+		collabErr:     errors.New("gh down"),
+	}
+	var fired int
+	RegisterCommentVerb("probe", func(context.Context, CommentContext) error { fired++; return nil })
+	t.Cleanup(func() { unregisterCommentVerb("probe") })
+
+	// No allowlist → every command comment hits the collaborator check, so
+	// an auth outage surfaces as a dispatch error on the comment. Nothing
+	// may be claimed and the cursor must hold: the silently-swallowed
+	// `maquinista approve` is exactly the failure mode this guards against.
+	d := commentDepsForTest(pool, src) // no allowlist
+	authz := newCommentAuthorizer(d.Auth)
+
+	cursor, err := PollPRCommands(ctx, d, authz, base)
+	if err == nil {
+		t.Fatalf("want the dispatch error to fail the pass")
+	}
+	if !cursor.Equal(base) {
+		t.Fatalf("cursor advanced past a comment whose dispatch failed: %s", cursor)
+	}
+	var n int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM gh_comment_commands WHERE comment_id = 901`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("claimed rows = %d err=%v, want 0 (nothing claimed on transient error)", n, err)
+	}
+
+	// Next pass, GitHub healthy again: the command lands exactly once.
+	src.mu.Lock()
+	src.collabErr = nil
+	src.mu.Unlock()
+	cursor, err = PollPRCommands(ctx, d, authz, cursor)
+	if err != nil {
+		t.Fatalf("pass 2: %v", err)
+	}
+	if fired != 1 {
+		t.Fatalf("fired = %d after retry, want 1", fired)
+	}
+	if !cursor.Equal(cmdAt) {
+		t.Fatalf("cursor = %s, want %s", cursor, cmdAt)
+	}
+}

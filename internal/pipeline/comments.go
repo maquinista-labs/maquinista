@@ -239,8 +239,9 @@ func approveCommentHandler(ctx context.Context, hc CommentContext) error {
 		return err
 	}
 	// The merge flow posts its own result note; this one attributes the
-	// approval to the GitHub commenter.
-	notifyf(ctx, hc.Pool, "👍 %s: approved via PR #%d comment by @%s — merge dispatched.",
+	// approval to the GitHub commenter. RunMergeOnApprove has already run
+	// the merge synchronously by the time this posts.
+	notifyf(ctx, hc.Pool, "👍 %s: approved via PR #%d comment by @%s — merge completed.",
 		taskTitle(ctx, hc.Pool, hc.TaskID), hc.PR, hc.Actor)
 	hc.ack(ctx)
 	return nil
@@ -681,22 +682,26 @@ func watchedPRs(ctx context.Context, pool *pgxpool.Pool) ([]int, error) {
 
 // PollPRCommands runs one pass: fetch each watched PR's comments since,
 // dispatch commands, return the advanced cursor. The cursor only advances
-// on a fetch-clean pass — a failed PR re-reads the whole window next pass,
-// which the claims make exactly-once.
+// on a clean pass — a failed fetch OR a failed dispatch re-reads the whole
+// window next pass, which the claims make exactly-once (a transient
+// dispatch error claims nothing, so the retry re-runs the comment).
 func PollPRCommands(ctx context.Context, d CommentDeps, authz *commentAuthorizer, since time.Time) (time.Time, error) {
 	prs, err := watchedPRs(ctx, d.Pool)
 	if err != nil {
 		return since, err
 	}
 	cursor := since
-	var fetchErr error
+	var passErr error
+	hold := func(err error) {
+		if passErr == nil {
+			passErr = err
+		}
+	}
 	for _, pr := range prs {
 		comments, err := d.Source.PRComments(ctx, pr, since)
 		if err != nil {
 			log.Printf("pipeline: comments PR #%d: %v", pr, err)
-			if fetchErr == nil {
-				fetchErr = err
-			}
+			hold(fmt.Errorf("comments PR #%d: %w", pr, err))
 			continue
 		}
 		sort.Slice(comments, func(i, j int) bool { return comments[i].CreatedAt.Before(comments[j].CreatedAt) })
@@ -711,6 +716,11 @@ func PollPRCommands(ctx context.Context, d CommentDeps, authz *commentAuthorizer
 			switch {
 			case err != nil:
 				log.Printf("pipeline: comment %d on PR #%d by @%s: dispatch error: %v", c.ID, pr, c.Author, err)
+				// Dispatch errors hold the cursor (same contract as fetch
+				// errors): a transient `("", err)` claimed nothing, so the
+				// comment must be re-read next pass or it is silently
+				// swallowed. A claimed one re-reads as a harmless duplicate.
+				hold(fmt.Errorf("comment %d on PR #%d: %w", c.ID, pr, err))
 			case disp == "":
 				// non-command — ignored entirely
 			default:
@@ -718,8 +728,8 @@ func PollPRCommands(ctx context.Context, d CommentDeps, authz *commentAuthorizer
 			}
 		}
 	}
-	if fetchErr != nil {
-		return since, fetchErr
+	if passErr != nil {
+		return since, passErr
 	}
 	return cursor, nil
 }

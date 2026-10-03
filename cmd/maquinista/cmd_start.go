@@ -560,10 +560,11 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		// the PR alone (id-less). gh merge mode only: the verbs drive the
 		// PR merge flow. Polling via gh (no webhooks), 30–60s cadence.
 		if mCfg := pipeline.MergeConfigFromEnv(); mCfg.Mode == pipeline.MergeModeGH {
-			mCfg.Gh = gh.New()
+			runner := gh.New() // stateless: one runner serves both merge and comment surfaces
+			mCfg.Gh = runner
 			go pipeline.RunCommentCommands(ctx, pipeline.CommentDeps{
 				Pool:   pool,
-				Source: gh.New(),
+				Source: runner,
 				Auth:   pipeline.GhCommandsConfigFromEnv(),
 				Merge:  mCfg,
 				Prov:   prov,
@@ -585,7 +586,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 }
 
 // runDashboardAgentReconcile periodically scans for dashboard-spawned
-// agents (status='stopped', empty tmux_window) and provisions their tmux
+// agents (status='stopped', tmux_window='') and provisions their tmux
 // panes. After each reconcile pass it syncs the sidecar manager so that
 // newly-online agents get their own inbox goroutine within the same tick.
 // Runs as a background goroutine; terminates on ctx cancel.
