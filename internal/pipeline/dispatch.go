@@ -371,8 +371,8 @@ func retireStuckImplementor(ctx context.Context, pool *pgxpool.Pool, taskID stri
 	if tag.RowsAffected() == 0 {
 		return false, true, nil // raced to dead elsewhere — no notification
 	}
-	notifyf(ctx, pool, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.",
-		taskTitle(ctx, pool, taskID), agentID, idleAfter)
+	notifyf(ctx, pool, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.%s",
+		taskTitle(ctx, pool, taskID), agentID, idleAfter, prLinkSuffix(ctx, pool, taskID))
 	return true, true, nil
 }
 
