@@ -290,6 +290,12 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	}
 	wt := info.WorktreePath
 
+	// MAQ-25: the merge leg's pickup marker on the PR — the gate is about
+	// to run for real (human gate, status guard and merger-episode guard
+	// all passed). Best effort, deduped once per PR by needle scan: the
+	// release-and-reclaim loop re-runs this pass per attempt.
+	postPickupComment(ctx, pool, cfg.Gh, taskID, mergePickupNeedle, mergePickupBody(taskIssueKey(ctx, pool, taskID)))
+
 	// 1. Sync the branch with the remote and rebase onto origin's default.
 	base, err := defaultBranch(wt)
 	if err != nil {
