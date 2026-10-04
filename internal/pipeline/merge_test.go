@@ -469,8 +469,9 @@ func TestProcessMergeGH_Conflict(t *testing.T) {
 	if n := mergeUpAttempts(t, pool, entry.ID); n != 1 {
 		t.Fatalf("attempt 1: mergeup_attempts = %d, want 1", n)
 	}
-	if len(gh.postedBodies) != 1 || !strings.Contains(gh.postedBodies[0], "attempt 1/2") ||
-		!strings.Contains(gh.postedBodies[0], "feature.txt") {
+	attempt1 := withoutPickup(gh.postedBodies)
+	if len(attempt1) != 1 || !strings.Contains(attempt1[0], "attempt 1/2") ||
+		!strings.Contains(attempt1[0], "feature.txt") {
 		t.Fatalf("attempt 1: PR comments = %q, want one attempt-1 comment naming feature.txt", gh.postedBodies)
 	}
 	// Worktree must be left usable (rebase aborted, merge-up never touched it).
@@ -497,7 +498,8 @@ func TestProcessMergeGH_Conflict(t *testing.T) {
 	if gh.mergeCalls != 0 || len(prov.calls) != 0 {
 		t.Errorf("merge/board must not fire on conflict (gh=%d, board=%v)", gh.mergeCalls, prov.calls)
 	}
-	if len(gh.postedBodies) != 2 || !strings.Contains(gh.postedBodies[1], "attempt 2/2") {
+	attempt2 := withoutPickup(gh.postedBodies)
+	if len(attempt2) != 2 || !strings.Contains(attempt2[1], "attempt 2/2") {
 		t.Errorf("attempt 2: PR comments = %q, want one attempt-2 comment", gh.postedBodies)
 	}
 	if observationCount(t, pool, taskID, "merger") == 0 {
@@ -539,7 +541,7 @@ func TestProcessMergeGH_MergeUpHealsStaleBranch(t *testing.T) {
 	if gh.lastExpectedSHA == "" {
 		t.Error("update-branch must carry the observed head SHA")
 	}
-	if len(gh.postedBodies) != 0 {
+	if n := len(withoutPickup(gh.postedBodies)); n != 0 {
 		t.Errorf("a healed merge-up must not comment, got %q", gh.postedBodies)
 	}
 	var found bool
@@ -611,7 +613,7 @@ func TestProcessMergeGH_MergeUpUnverifiedCountsAsFailure(t *testing.T) {
 	if n := mergeUpAttempts(t, pool, entry.ID); n != 1 {
 		t.Fatalf("mergeup_attempts = %d, want 1 (unverified success is a failure)", n)
 	}
-	if len(gh.postedBodies) != 1 {
+	if n := len(withoutPickup(gh.postedBodies)); n != 1 {
 		t.Fatalf("PR comments = %q, want one", gh.postedBodies)
 	}
 	if status, _ := taskRow(t, pool, taskID); status != "ready_to_merge" {
@@ -691,7 +693,7 @@ func TestProcessMergeGH_MergeUpRace(t *testing.T) {
 	if n := mergeUpAttempts(t, pool, entry.ID); n != 0 {
 		t.Errorf("mergeup_attempts = %d, want 0 (races are free)", n)
 	}
-	if len(gh.postedBodies) != 0 {
+	if n := len(withoutPickup(gh.postedBodies)); n != 0 {
 		t.Errorf("PR comments = %q, want none on a race", gh.postedBodies)
 	}
 }
@@ -953,4 +955,17 @@ func gitRepoRoot(t *testing.T, dir string) string {
 		t.Fatalf("common dir of %s: %v", dir, err)
 	}
 	return admin
+}
+
+// withoutPickup filters the MAQ-25 pickup marker ("merge gate running") out
+// of recorded PR comments: the marker is orthogonal to merge-up commentary,
+// and these tests assert only the latter.
+func withoutPickup(bodies []string) []string {
+	out := make([]string, 0, len(bodies))
+	for _, b := range bodies {
+		if !strings.Contains(b, mergePickupNeedle) {
+			out = append(out, b)
+		}
+	}
+	return out
 }
