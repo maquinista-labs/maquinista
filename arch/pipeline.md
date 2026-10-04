@@ -19,10 +19,25 @@ provider implementation (`linear.go` for Linear).
 - `ClaimIssue` inserts, in ONE transaction:
   - a `tasks` row — status `ready`, project `MAQUINISTA_TICKETS_PROJECT`
     (fallback `MAQUINISTA_PROJECT`), title `[<Key>] <title>`, metadata
-    `ticket_issue_id` + `ticket_url`
+    `ticket_issue_id` + `ticket_url`, and — since MAQ-13 — `worktree_path`
+    pointing at the issue's sibling worktree
   - a `ticket_issue_map` row — `pending_state` = "In Progress"
 - the map row's primary key is the provider issue ID, so the INSERT **is**
   the claim: `ON CONFLICT DO NOTHING` + rollback makes re-claims no-ops
+- **Sibling worktree provisioning (MAQ-13):** before claiming, the bridge
+  provisions the issue's worktree (`EnsureIssueWorktree`,
+  `internal/pipeline/worktree.go`) — house convention: `<repoBase>.<slug>`
+  sibling of the repo root (e.g. `~/code/maquinista.maq13`), branch `<slug>`
+  (`maq13`), branched from `origin/main` (fallback `origin/HEAD`, `HEAD`);
+  slug = lowercased issue key with non-alphanumerics stripped. Idempotent:
+  existing worktrees are reused, existing branches are attached, non-git
+  directories at the target path are refused. The repo root comes from
+  `MAQUINISTA_TICKETS_REPO`, defaulting to the orchestrator cwd's git root;
+  unresolvable is logged once at startup. Provisioning is best effort: a
+  failure claims the task WITHOUT `worktree_path` and the task scheduler
+  parks it needs-human (below) — the loud path, never a spawn wedge. This
+  replaces the manual `git worktree add` + SQL fix the MAQ-9..12 incident
+  needed
 - claimed tasks flow through the task-scheduler → EnsureAgent → agent_inbox
   path (wired in `orchestrator start` since EX-07, see "Task scheduler"
   below); bridge tasks carry no `metadata.role` yet (default `implementor`,
@@ -49,6 +64,17 @@ implementor:
 - worktree guard: the task must have a usable `worktree_path` — SpawnFresh
   does not stat; a bad path fails the spawn with a readable error and
   DispatchOne reverts the task to `ready` for the next tick
+- **worktree-less park (MAQ-13):** a `ready` task with no `worktree_path` is
+  never claimed at all — DispatchOne parks it `pending_approval` inside the
+  claim tx with a `task_context` verdict note and ONE Pipeline-topic ping.
+  This replaced the old revert-to-`ready` loop that spun ensure_agent errors
+  at ~43 lines/sec during the MAQ-9..12 incident
+- **unspawnable backstop (MAQ-13):** `taskscheduler.ParkUnspawnable` runs on
+  every scheduler wake and parks `claimed` tasks that have no
+  `worktree_path`, no live agent, and have been claimed longer than
+  `MAQUINISTA_WORKTREE_GRACE` (default 10m) — legacy wedged rows and tasks
+  that lost the race between claim and ensure. Exactly once by guarded
+  transition (`claimed` → `pending_approval` + note in one tx)
 - id mint: `<role>-<taskID>[-rN]` via `pipeline.MintWorkerID` (same shape as
   the reviewer mint; role default `implementor`, overridable via
   `tasks.metadata->>'role'`)
@@ -277,6 +303,8 @@ the backstop — and a stalled fixer is bounded the same way.
 | `MAQUINISTA_TICKETS_API_KEY` | ticket-system API key | required to enable |
 | `MAQUINISTA_TICKETS_TEAM_ID` | team/board id intake polls | required to enable |
 | `MAQUINISTA_TICKETS_PROJECT` | project_id stamped on claimed tasks | falls back to `MAQUINISTA_PROJECT` |
+| `MAQUINISTA_TICKETS_REPO` | repo root the bridge provisions sibling worktrees from (MAQ-13) | the orchestrator cwd's git root |
+| `MAQUINISTA_WORKTREE_GRACE` | how long an unspawnable claimed task (no worktree, no live agent) sits before the scheduler parks it needs-human | `10m` |
 | `MAQUINISTA_TICKETS_APPROVERS` | ticket-system identities (email or display name, comma-separated) allowed to drive comment verbs; empty = fail-closed | (nobody) |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
 | `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound (reviewers + fixers) | `2h` |
