@@ -172,9 +172,10 @@ verdict INPUT:
   `started_at` is the row's creation time). No prior reviewer row (round 1)
   = the PR-open baseline: every human comment counts.
 - **filters** — bot authors (all three spellings: `is_bot`, `__typename
-  Bot`, `[bot]` login suffix), the pipeline's own `[review round N]`
-  comments (the gh CLI may be authenticated as a human account, so the
-  marker — not the author — identifies them), blank bodies, and everything
+  Bot`, `[bot]` login suffix), the pipeline's own comments — the MAQ-16
+  `[review round N]` verdicts and the MAQ-25 pickup markers (the gh CLI may
+  be authenticated as a human account, so the marker — not the author —
+  identifies them; `isOwnPRComment`), blank bodies, and everything
   at/before the cutoff.
 - **framing** — the section is rendered explicitly as INPUT ONLY (never
   approve/request_changes verbs; the verb surface stays MAQ-11's
@@ -183,6 +184,28 @@ verdict INPUT:
   comments.
 - **degradation** — no `GhRunner` wired, no `pr_url`, or any gh failure →
   the prompt ships without the section; nothing else changes.
+
+**Spawn pickup markers (MAQ-25).** At spawn time — before the agent does
+any work — dispatch posts a one-line pickup comment on the task's open PR
+(`postPickupComment`, the MAQ-16 `PRComments`+`PRPostComment` transport),
+so the PR page reads as a timeline while a round is mid-flight:
+
+- reviewer round N (in the spawn pass, after the round bump): `🔁 [MAQ-n]
+  review round N started`
+- fixer episode (in the fixer pass, after the fix row): `🔧 [MAQ-n] fixer
+  round N picked this up - <first finding line>` — the reason is distilled
+  from the reviewer's findings (`fixPickupReason`: first non-blank,
+  non-`VERDICT:` line, capped at 120 chars; fallback "addressing review
+  findings")
+- merge leg (in `ProcessMergeGH`, after the human-gate/status/merger-episode
+  guards pass): `🚀 [MAQ-n] merge gate running`
+
+The `[MAQ-n]` tag is the task's Linear issue key (`ticket_issue_map
+.issue_key`, title-prefix fallback; keyless tasks ship without it). Exactly
+one comment per spawn: a round-scoped needle scan of the PR's existing
+comments (`reviewPickupNeedle` / `fixerPickupNeedle` / `mergePickupNeedle`)
+dedups reposts; every failure — no PR, gh outage — only logs and never
+blocks or fails the spawn/record path.
 
 **Verdict pass.** Scans each live reviewer's newest outbox rows for the
 contract verdict line (`ParseVerdict`, line-anchored, exact three-value
