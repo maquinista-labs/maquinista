@@ -57,7 +57,7 @@ func TestVerdict_NotifyPerOutcome(t *testing.T) {
 		bumpRounds    bool
 		wantSubstr    []string
 	}{
-		{"approve", VerdictApprove, false, []string{"✅", "approved (review round 0)", "ready_to_merge", "maquinista approve tv"}},
+		{"approve", VerdictApprove, false, []string{"✅", "approved (review round 0)", "ready_to_merge", "reply `approve tv-appro`", "comment `approve` on the ticket issue"}},
 		{"request-changes", VerdictRequestChanges, false, []string{"🔁", "request_changes (review round 0)", "fixer spawning"}},
 		{"needs-human", VerdictNeedsHuman, false, []string{"🆘", "needs-human", "maquinista approve tv", "maquinista reject tv"}},
 		{"round-cap", VerdictRequestChanges, true, []string{"🆘", "review round cap 3 reached", "parked needs-human"}},
@@ -77,7 +77,7 @@ func TestVerdict_NotifyPerOutcome(t *testing.T) {
 				VALUES ('reviewer-`+taskID+`', $1::jsonb)
 			`, `{"text":"findings...\nVERDICT: `+c.verdict+`\n"}`)
 
-			if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
+			if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
 				t.Fatalf("verdictPass: %v", err)
 			}
 
@@ -85,10 +85,59 @@ func TestVerdict_NotifyPerOutcome(t *testing.T) {
 			if len(texts) != 1 {
 				t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
 			}
+			text := texts[0]
 			for _, want := range c.wantSubstr {
-				if !strings.Contains(texts[0], want) {
-					t.Errorf("summary %q missing %q", texts[0], want)
+				if !strings.Contains(text, want) {
+					t.Errorf("summary %q missing %q", text, want)
 				}
+			}
+			// No pr_url seeded → no link fragment may appear (AC: graceful
+			// degrade, no null/empty links).
+			if strings.Contains(text, "🔗 PR") {
+				t.Errorf("summary %q contains a PR link but the task has no pr_url", text)
+			}
+		})
+	}
+}
+
+// TestVerdict_PRLinkInSummary (MAQ-10): every verdict branch for a task with
+// a pr_url carries the link.
+func TestVerdict_PRLinkInSummary(t *testing.T) {
+	cases := []struct {
+		name, verdict string
+		bumpRounds    bool
+	}{
+		{"approve", VerdictApprove, false},
+		{"request-changes", VerdictRequestChanges, false},
+		{"needs-human", VerdictNeedsHuman, false},
+		{"round-cap", VerdictRequestChanges, true},
+	}
+	const prURL = "https://github.com/maquinista-labs/maquinista/pull/42"
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			pool := testPool(t)
+			ctx := context.Background()
+			taskID := "tvpr-" + c.name
+			seedReviewTask(t, pool, taskID, "uuid-"+c.name, "/tmp/wt")
+			execOK(t, pool, `UPDATE tasks SET pr_url = $2 WHERE id = $1`, taskID, prURL)
+			if c.bumpRounds {
+				execOK(t, pool, `UPDATE tasks SET review_rounds = 3 WHERE id = $1`, taskID)
+			}
+			seedReviewer(t, pool, "reviewer-"+taskID, taskID)
+			execOK(t, pool, `
+				INSERT INTO agent_outbox (agent_id, content)
+				VALUES ('reviewer-`+taskID+`', $1::jsonb)
+			`, `{"text":"findings...\nVERDICT: `+c.verdict+`\n"}`)
+
+			if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
+				t.Fatalf("verdictPass: %v", err)
+			}
+			texts := pipelineNotifyTextsPool(t, pool)
+			if len(texts) != 1 {
+				t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
+			}
+			if !strings.Contains(texts[0], "\n🔗 PR: "+prURL) {
+				t.Errorf("summary %q missing the PR link %q", texts[0], prURL)
 			}
 		})
 	}
@@ -106,7 +155,7 @@ func TestVerdict_MalformedNoNotify(t *testing.T) {
 		VALUES ('reviewer-tm', '{"text":"VERDICT: approved-ish"}'::jsonb)
 	`)
 
-	if err := verdictPass(ctx, pool, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if texts := pipelineNotifyTextsPool(t, pool); len(texts) != 0 {
@@ -154,6 +203,32 @@ func TestWatchdog_ActiveNoNotify(t *testing.T) {
 	}
 	if texts := pipelineNotifyTextsPool(t, pool); len(texts) != 0 {
 		t.Fatalf("active reviewer notified: %q", texts)
+	}
+}
+
+// TestWatchdog_PRLink: a parked task with a PR gets the link in the
+// needs-human question (MAQ-10).
+func TestWatchdog_PRLink(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "twpr", "uuid-wpr", "/tmp/wt")
+	execOK(t, pool, `UPDATE tasks SET pr_url = $2 WHERE id = $1`, "twpr",
+		"https://github.com/maquinista-labs/maquinista/pull/7")
+	seedReviewer(t, pool, "reviewer-twpr", "twpr")
+	// Backdate past the stall bound: the young-agent guard exempts agents
+	// younger than the timeout even with zero outbox activity (same shape
+	// as TestWatchdog_StallTimeout).
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-twpr'`)
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	texts := pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 1 {
+		t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
+	}
+	if !strings.Contains(texts[0], "pull/7") {
+		t.Errorf("watchdog summary %q missing the PR link", texts[0])
 	}
 }
 

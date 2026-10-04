@@ -96,6 +96,28 @@ var tasksMarkClosedCmd = &cobra.Command{
 	},
 }
 
+var tasksReleaseCmd = &cobra.Command{
+	Use:   "release <task-id>",
+	Args:  cobra.ExactArgs(1),
+	Short: "Release: retire the task's live implementor row (end-of-turn cleanup)",
+	Long:  "Retire the task's live implementor agents row so the review dispatch can spawn (uq_agents_task_live). Task status is untouched; idempotent.",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if err := connectDB(); err != nil {
+			return err
+		}
+		n, err := tasks.Release(context.Background(), pool, args[0])
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			fmt.Println("no live implementor row for this task (already released)")
+		} else {
+			fmt.Printf("✓ released %d implementor row(s) for %s\n", n, args[0])
+		}
+		return nil
+	},
+}
+
 func init() {
 	tasksCreateCmd.Flags().StringVar(&tasksCreateID, "id", "", "")
 	tasksCreateCmd.Flags().StringVar(&tasksCreateTitle, "title", "", "")
@@ -111,7 +133,7 @@ func init() {
 
 	tasksCmd.AddCommand(tasksCreateCmd, tasksAddDepCmd, tasksValidateCmd,
 		tasksSetPRCmd, tasksMarkMergedCmd, tasksMarkClosedCmd,
-		tasksMarkReviewCmd, tasksByPRCmd)
+		tasksMarkReviewCmd, tasksByPRCmd, tasksReleaseCmd)
 	rootCmd.AddCommand(tasksCmd)
 }
 

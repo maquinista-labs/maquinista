@@ -34,7 +34,7 @@ All consumers use `LISTEN` + a poll fallback (10 s) so a missed `NOTIFY`
 
 | Table | Purpose |
 |-------|---------|
-| `agents` | One row per agent; status, tmux_window, runner_type, workspace |
+| `agents` | One row per agent; status, tmux_window, runner_type, workspace, last_transcript_at (liveness, MAQ-9) |
 | `agent_souls` | Per-agent identity / system prompt fields |
 | `soul_templates` | Reusable soul blueprints |
 | `agent_memory` | Key/value memory blocks appended to soul render |
@@ -45,6 +45,9 @@ All consumers use `LISTEN` + a poll fallback (10 s) so a missed `NOTIFY`
 | `agent_workspaces` | Per-agent git worktrees / workspace records |
 | `conversations` | Multi-turn conversation threads (A2A + human) |
 | `tasks` | Orchestrator task graph |
+| `ticket_issue_map` | Ticket issue ↔ task mirror; the row is the bridge claim |
+| `ticket_comment_log` | Consumed ticket-comment ids (comment-verb exactly-once) |
+| `merge_queue` | One row per merge attempt (pending → merging → merged\|conflict\|failed) |
 | `job_registry` | Scheduled jobs (cron + hooks) |
 | `soul_templates` | Reusable soul templates |
 

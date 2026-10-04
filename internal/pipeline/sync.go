@@ -61,6 +61,8 @@ func backoffDelay(failures int) time.Duration {
 }
 
 // RunSync reconciles the map every syncInterval until ctx is cancelled.
+// Each tick also pushes PR links (SyncIssueLinks) so a freshly opened PR
+// reaches the issue within one interval.
 func RunSync(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider, teamID string, interval time.Duration) error {
 	if interval <= 0 {
 		interval = syncInterval
@@ -73,6 +75,11 @@ func RunSync(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider, teamI
 			log.Printf("pipeline: sync tick: %v", err)
 		} else if n > 0 {
 			log.Printf("pipeline: synced %d transition(s)", n)
+		}
+		if n, err := SyncIssueLinks(ctx, pool, prov); err != nil {
+			log.Printf("pipeline: sync pr-link tick: %v", err)
+		} else if n > 0 {
+			log.Printf("pipeline: synced %d pr link(s)", n)
 		}
 		select {
 		case <-ctx.Done():
@@ -187,6 +194,54 @@ func ReconcileOnce(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider,
 			       synced_at = NOW(), updated_at = NOW()
 			WHERE  issue_id = $1`, p.issueID, p.col.String()); err != nil {
 			return pushed, fmt.Errorf("pipeline: sync success update: %w", err)
+		}
+		pushed++
+	}
+	return pushed, nil
+}
+
+// SyncIssueLinks pushes every mapped task's pr_url to its ticket issue —
+// exactly once per URL (MAQ-10). The dedup key is
+// ticket_issue_map.pr_url_synced, the last URL successfully written:
+// a task with no PR (or an unchanged one) selects nothing, so repeated
+// 10 s ticks never re-write. A failed provider call is only logged — the
+// row stays unsynced and the next tick retries. Returns the number of
+// links pushed.
+func SyncIssueLinks(ctx context.Context, pool *pgxpool.Pool, prov TicketProvider) (int, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT m.issue_id, t.pr_url
+		FROM   ticket_issue_map m
+		JOIN   tasks t ON t.id = m.task_id
+		WHERE  t.pr_url IS NOT NULL AND t.pr_url <> ''
+		       AND (m.pr_url_synced IS NULL OR m.pr_url_synced <> t.pr_url)`)
+	if err != nil {
+		return 0, fmt.Errorf("pipeline: pr-link select: %w", err)
+	}
+	defer rows.Close()
+	type link struct{ issueID, url string }
+	var links []link
+	for rows.Next() {
+		var l link
+		if err := rows.Scan(&l.issueID, &l.url); err != nil {
+			return 0, fmt.Errorf("pipeline: pr-link scan: %w", err)
+		}
+		links = append(links, l)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("pipeline: pr-link rows: %w", err)
+	}
+	rows.Close()
+
+	pushed := 0
+	for _, l := range links {
+		if err := prov.AddIssueLink(ctx, l.issueID, l.url); err != nil {
+			log.Printf("pipeline: pr-link %s: push %s: %v (retry next tick)", l.issueID, l.url, err)
+			continue
+		}
+		if _, err := pool.Exec(ctx, `
+			UPDATE ticket_issue_map SET pr_url_synced = $2, updated_at = NOW()
+			WHERE issue_id = $1`, l.issueID, l.url); err != nil {
+			return pushed, fmt.Errorf("pipeline: pr-link bookkeeping %s: %w", l.issueID, err)
 		}
 		pushed++
 	}

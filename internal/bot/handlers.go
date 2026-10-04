@@ -29,6 +29,19 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 	if b.handlePendingInput(msg) {
 		return
 	}
+	// Pipeline-topic comment verbs (MAQ-11): a bare `approve <ref>` in the
+	// Pipeline topic runs the merge-approve path. Must sit after the wizard
+	// input handlers and before the routing ladder — the synthetic pipeline
+	// agent has no sidecar, so the ladder would strand the message.
+	if b.handlePipelineApproveText(msg) {
+		return
+	}
+	// Pipeline-topic reply comments (MAQ-24): a plain reply to a pipeline
+	// notification lands as a PR comment. Same placement constraints as the
+	// verb arm; non-replies fall through to the ladder untouched.
+	if b.handlePipelineReplyText(msg) {
+		return
+	}
 
 	cancelBashCapture(msg.From.ID, getThreadID(msg))
 

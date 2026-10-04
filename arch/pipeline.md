@@ -47,10 +47,19 @@ provider implementation (`linear.go` for Linear).
 
 `taskscheduler.Run` runs inside `orchestrator start` (cmd_start.go), in the
 same tickets-enabled block as review dispatch. Wake triggers: LISTEN
-`task_events` + 30 s poll fallback. `DispatchOne` claims one `ready` task
-with no live agent (`FOR UPDATE SKIP LOCKED`, `uq_agents_task_live` keeps
-replicas honest), flips it to `claimed`, then the cmd-side
-`ensureTaskWorker` adapter spawns the implementor:
+`task_events` + 30 s poll fallback. "Live" for task-scoped agent rows means
+`status IN ('running','idle','working','spawning')` — `stopped` does NOT
+block a claim (MAQ-18): SpawnFresh pre-registers rows as `stopped`, the
+sidecar marks vanished windows `stopped`, and `maquinista stop` parks rows
+that way; a task wedged behind such a row would be silently unclaimable.
+The dashboard "stopped + empty tmux_window = needs provisioning" state is
+role=`user`/task_id NULL only, so it never collides with this.
+`DispatchOne` claims one `ready` task with no live agent (`FOR UPDATE SKIP
+LOCKED`, `uq_agents_task_live` keeps replicas honest), releases stale
+`stopped`/`archived` rows of previous attempts to `dead` inside the claim
+TX (freeing the unique-live slot for the fresh spawn), flips the task to
+`claimed`, then the cmd-side `ensureTaskWorker` adapter spawns the
+implementor:
 
 - worktree guard: the task must have a usable `worktree_path` — SpawnFresh
   does not stat; a bad path fails the spawn with a readable error and
@@ -78,6 +87,13 @@ replicas honest), flips it to `claimed`, then the cmd-side
 - the scheduler then enqueues `/work-on-task <id>` (external_msg_id
   `task:<id>` dedup) and sets `tasks.claimed_by`; `HealMissingInbox` covers
   the crash-between-claim-and-enqueue wedge
+- two MAQ-18 safety nets run each wake: `LogBlockedReadyTasks` journals
+  every `ready` task skipped because a live agent still holds it (no
+  silent skips), and `ReapStaleClaims` releases `claimed` tasks back to
+  `ready` when all their task-scoped agent rows are non-live and the
+  claim is older than 5 min (mid-flight implementor death; the bound
+  protects fresh claims whose agent row is still in SpawnFresh's stopped
+  pre-registration phase)
 
 The standalone `maquinista task-scheduler` subcommand keeps the
 orchestrator.EnsureAgent stub (row-only, no pty) for debugging alongside a
@@ -116,6 +132,14 @@ column ids via `TicketProvider.Columns` before pushing (`SetIssueColumn`).
   degrades to backoff, never to a lost transition
 - a state name missing from the team (operator renamed a column) backs off
   like any other failure instead of hot-looping
+- **PR-link sync (MAQ-10)** — the same tick also runs `SyncIssueLinks`:
+  every mapped task whose `pr_url` is set and differs from
+  `ticket_issue_map.pr_url_synced` (the last URL successfully written,
+  migration 037) gets one `TicketProvider.AddIssueLink` write — for Linear,
+  a comment carrying the raw URL. `pr_url_synced` is stamped only after a
+  successful push, so ticks are idempotent (exactly one write per URL) and
+  a failed push retries on the next tick. Tasks without a PR select
+  nothing — no empty-link writes.
 
 ## Review dispatch (EX-03)
 
@@ -144,18 +168,86 @@ live reviewer agent:
   model = the runner's own chain
 - spawns via `ReviewSpawner` (wraps `agentspawn.SpawnFresh`: agents row
   task-bound, soul clone, tmux pane, sidecar), then bumps
-  `tasks.review_rounds` and enqueues the round prompt in ONE tx
-  (`external_msg_id = review:<task>:<round>` dedups)
+  `tasks.review_rounds` (autocommit — its presence makes the next tick a
+  no-op for the spawn pass), builds the round prompt (see **Human PR
+  comments**, below — deliberately with NO transaction open, so the gh
+  comment fetch never holds a DB tx), and enqueues the prompt in its own
+  tx (`external_msg_id = review:<task>:<round>` dedups). A crash between
+  bump and enqueue heals via the prompt pass
+- on a `uq_agents_task_live` spawn failure, runs the **stuck-implementor
+  self-heal (MAQ-14)**: if the blocking live row is the task's implementor
+  whose last outbox activity is older than
+  `MAQUINISTA_IMPLEMENTOR_IDLE_AFTER` (default 10m), it is auto-retired
+  (`status='dead'`, guarded UPDATE — fires once, which is also the
+  exactly-once Pipeline-topic notification dedup) and the reviewer spawns
+  next tick. Fresh implementors are left alone (silent retry); the same
+  heal guards the fixer pass.
 
 **Prompt heal.** A crash between spawn and enqueue leaves a live reviewer
 with no prompt; the heal pass re-enqueues exactly one (dedup'd) on the next
-tick.
+tick. The heal builds the prompt through the same code as the spawn pass,
+so it carries the human-comment section too.
+
+**Human PR comments (MAQ-16).** When a round prompt is built, dispatch
+fetches the PR's issue comments (`GhRunner.PRComments` — `gh pr view --json
+comments` in production) and folds the human ones into the prompt as
+verdict INPUT:
+
+- **cutoff** — the start time of the previous round's reviewer agent
+  (newest `agents` row with role reviewer, other than the current one;
+  `started_at` is the row's creation time). No prior reviewer row (round 1)
+  = the PR-open baseline: every human comment counts.
+- **filters** — bot authors (all three spellings: `is_bot`, `__typename
+  Bot`, `[bot]` login suffix), the pipeline's own comments — the MAQ-16
+  `[review round N]` verdicts and the MAQ-25 pickup markers (the gh CLI may
+  be authenticated as a human account, so the marker — not the author —
+  identifies them; `isOwnPRComment`), blank bodies, and everything
+  at/before the cutoff.
+- **framing** — the section is rendered explicitly as INPUT ONLY (never
+  approve/request_changes verbs; the verb surface stays MAQ-11's
+  Telegram/Linear/comments path). Oversized bodies are trimmed per comment
+  (1000 chars) and the section as a whole (4000 chars) keeps the newest
+  comments.
+- **degradation** — no `GhRunner` wired, no `pr_url`, or any gh failure →
+  the prompt ships without the section; nothing else changes.
+
+**Spawn pickup markers (MAQ-25).** At spawn time — before the agent does
+any work — dispatch posts a one-line pickup comment on the task's open PR
+(`postPickupComment`, the MAQ-16 `PRComments`+`PRPostComment` transport),
+so the PR page reads as a timeline while a round is mid-flight:
+
+- reviewer round N (in the spawn pass, after the round bump): `🔁 [MAQ-n]
+  review round N started`
+- fixer episode (in the fixer pass, after the fix row): `🔧 [MAQ-n] fixer
+  round N picked this up - <first finding line>` — the reason is distilled
+  from the reviewer's findings (`fixPickupReason`: first non-blank,
+  non-`VERDICT:` line, capped at 120 chars; fallback "addressing review
+  findings")
+- merge leg (in `ProcessMergeGH`, after the human-gate/status/merger-episode
+  guards pass): `🚀 [MAQ-n] merge gate running`
+
+The `[MAQ-n]` tag is the task's Linear issue key (`ticket_issue_map
+.issue_key`, title-prefix fallback; keyless tasks ship without it). Exactly
+one comment per spawn: a round-scoped needle scan of the PR's existing
+comments (`reviewPickupNeedle` / `fixerPickupNeedle` / `mergePickupNeedle`)
+dedups reposts; every failure — no PR, gh outage — only logs and never
+blocks or fails the spawn/record path.
 
 **Verdict pass.** Scans each live reviewer's newest outbox rows for the
 contract verdict line (`ParseVerdict`, line-anchored, exact three-value
 vocabulary). The first well-formed line wins; a malformed `VERDICT:`-ish
-line is logged loudly and never transitions. On a verdict, one tx:
+line is logged loudly and never transitions. On a verdict:
 
+- **PR verdict comment (MAQ-16)** — BEFORE the guarded transition, dispatch
+  posts one `[review round N]` comment on the PR (`GhRunner.PRPostComment`):
+  marker + the verdict line + the reviewer's findings tail — the PR page is
+  self-describing. Posting runs first so a crash between post and
+  transition heals on the next tick (verdict re-parsed; the round marker
+  dedups the repost — exactly one comment per round across
+  requeue/prompt-heal paths), whereas the other order would lose the
+  comment (the transition retires the reviewer). Everything is best-effort:
+  no `pr_url`, a gh outage, or an unreadable findings tail logs and falls
+  through — the verdict transition is never blocked.
 - task transition: `approve` → `ready_to_merge`,
   `request_changes` → `changes_requested`, `needs_human` →
   `pending_approval` (guarded on the task still being in `review` — a raced
@@ -190,12 +282,18 @@ session in the SAME worktree/PR:
   reviewer spawn pass mints a fresh reviewer and bumps the round
 
 **Watchdog.** A live reviewer (in `review`) or fixer (in
-`changes_requested`) with NO outbox activity (the monitor writes rows as the
-agent streams) for longer than `MAQUINISTA_REVIEW_TIMEOUT` (default 2h)
-parks the task in `pending_approval` with a watchdog verdict row and retires
-the pane. The malformed-verdict case is deliberately left to the watchdog:
-the parser never guesses, the timeout is the backstop — and a stalled fixer
-is bounded the same way.
+`changes_requested`) with NO activity signal for longer than
+`MAQUINISTA_REVIEW_TIMEOUT` (default 2h) parks the task in
+`pending_approval` with a watchdog verdict row and retires the pane.
+Activity is two-channel (MAQ-9): `agent_outbox` rows (assistant text the
+monitor streams) OR transcript growth (`agents.last_transcript_at`, written
+throttled by the monitor on JSONL offset advance — a healthy agent
+mid-command emits tool events but no outbox text). Parking requires BOTH
+channels silent for the whole window; agents younger than the timeout are
+exempt entirely (a newborn has no signal on either channel yet — parking on
+sight murders slow-booting spawns). The malformed-verdict case is
+deliberately left to the watchdog: the parser never guesses, the timeout is
+the backstop — and a stalled fixer is bounded the same way.
 
 ## Env contract
 
@@ -207,13 +305,18 @@ is bounded the same way.
 | `MAQUINISTA_TICKETS_PROJECT` | project_id stamped on claimed tasks | falls back to `MAQUINISTA_PROJECT` |
 | `MAQUINISTA_TICKETS_REPO` | repo root the bridge provisions sibling worktrees from (MAQ-13) | the orchestrator cwd's git root |
 | `MAQUINISTA_WORKTREE_GRACE` | how long an unspawnable claimed task (no worktree, no live agent) sits before the scheduler parks it needs-human | `10m` |
+| `MAQUINISTA_TICKETS_APPROVERS` | ticket-system identities (email or display name, comma-separated) allowed to drive comment verbs; empty = fail-closed | (nobody) |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
 | `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound (reviewers + fixers) | `2h` |
+| `MAQUINISTA_IMPLEMENTOR_IDLE_AFTER` | stuck-implementor self-heal bound: outbox idleness past this retires a `uq_agents_task_live`-blocking implementor row | `10m` |
 | `MAQUINISTA_REVIEW_ROUNDS_MAX` | fixer-loop cap: the request_changes landing at/after this review round parks the task | `3` |
 | `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |
 | `PIPELINE_MERGE_MODE` | merge driver: `local` (MergeNoFF in repo) or `gh` (remote PR flow) | `local` |
 | `PIPELINE_AUTO_MERGE` | gh mode only: truthy (`1`/`true`/`yes`/`t`/`y`) lets the queue merge without the approve verb | `0` |
+| `PIPELINE_MERGE_AGENT` | gh mode only: truthy arms the merger-agent conflict leg (MAQ-15) — rebase conflicts spawn a `pipeline-merger` agent instead of parking needs-human | `0` |
 | `MAQUINISTA_MERGE_ATTEMPTS_MAX` | red-PR reclaim cap before the task parks needs-human | `5` |
+| `PIPELINE_GH_ALLOWED_LOGINS` | GitHub logins allowed to issue PR comment commands; unset = repo-collaborator check via gh | (collaborators) |
+| `PIPELINE_GH_COMMENTS_POLL` | comment-command poll interval (floor 30s) | `60s` |
 
 Without key + team the bridge is a logged no-op; nothing else in the
 orchestrator changes. The Linear provider additionally honors the legacy
@@ -232,33 +335,167 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   with a PR URL and a worktree get an entry (branch derived from the
   worktree's HEAD, base from `origin/HEAD`).
 - **Processing** — `maquinista merge` (or the approve verb, below) claims an
-  entry and drives the remote: `fetch` → `rebase origin/<base>` →
-  `push --force-with-lease` → CI gate (`gh pr view statusCheckRollup`) →
-  `gh pr merge --squash`. After the squash lands: entry `merged` with the
-  squash SHA, task `ready_to_merge → done` with `pr_state=merged`, one
-  observation, a best-effort board push to Done, then worktree + local +
-  remote branch cleanup.
+  entry and drives the remote: `fetch` → up-to-date fast path (MAQ-26: if
+  `origin/<base>` is already an ancestor of `origin/<branch>`, skip the
+  rewrite) → `rebase origin/<base>` → `push --force-with-lease` → CI gate
+  (`gh pr view statusCheckRollup`) → `gh pr merge --squash`. After the
+  squash lands: entry `merged` with the squash SHA, task
+  `ready_to_merge → done` with `pr_state=merged`, one observation, a
+  best-effort board push to Done, then worktree + local + remote branch
+  cleanup.
 - **CI gate** — pending checks release the entry back to `pending` (a later
   pass retries); failed checks bump `attempts` and release silently below
   the cap, at the cap (default 5, `MAQUINISTA_MERGE_ATTEMPTS_MAX`) the entry
   fails, the task parks `pending_approval`, and the Pipeline topic gets the
   question (EX-06). No checks configured counts as green.
-- **Conflicts** — the rebase is aborted and the task parks at
-  `pending_approval` (Needs Human on the board) with the conflicting files
-  in the observation and in the Pipeline-topic note; conflicts are never
-  auto-resolved.
+- **Build gate (MAQ-20)** — between the CI gate and the squash: the branch is
+  never merged uncompiled. The gate materializes `origin/<branch>` — the
+  exact tree a squash-merge takes, rebase included — in a detached throwaway
+  worktree under `os.TempDir()` (`maquinista-mergegate-*`) and runs
+  `go build ./...` there (`internal/pipeline/mergegate.go`). Deterministic
+  compile failure: entry `failed` (terminal — the branch must change;
+  re-approval after a fix enqueues a fresh one), task parks
+  `pending_approval`, and both the Pipeline-topic question and a `merger`
+  observation carry the first ~20 compiler lines (MAQ-20: duplicate consts
+  across files are invisible in a per-file diff read but loud in build
+  output). Infra trouble (toolchain missing, worktree add failure, >10 min
+  build) fails the entry without blaming the branch — re-approve retries.
+  A branch root without `go.mod` passes vacuously (non-Go repos unchanged).
+  The worktree is removed on every outcome; there is deliberately NO config
+  knob — a skippable gate would reintroduce the PR-#21 failure. All merge
+  surfaces gate: the approve verb (Telegram, ticket comment, CLI) and
+  auto-merge converge on `ProcessMergeGH`, as does the merger-agent re-run
+  after a MAQ-15 conflict resolution. Added latency is one warm
+  `go build ./...` (~60-90s on the box, inside the approve fast-path
+  budget).
+- **Conflicts — auto merge-up leg (MAQ-26)** — with `PIPELINE_MERGE_AGENT=0`
+  (default), a rebase conflict no longer parks needs-human instantly: the
+  gate first tries an automatic merge-up, folding `origin/<base>` into the
+  BRANCH REF (never the task worktree — a fixer may be mid-episode in it).
+  GitHub's update-branch API first (`GhRunner.PRUpdateBranch`, with the
+  observed head SHA so a racing push 409s into a free re-release), then a
+  local fallback: `origin/<branch>` materialized in a detached throwaway
+  worktree (`maquinista-mergeup-*`), `--no-ff` merge of the base, published
+  as a strict fast-forward push. Success is re-verified (`origin/<base>`
+  must be an ancestor of `origin/<branch>` after a fetch — a claimed-but-
+  unsynced API success counts as a failure, never as mergeable) and the
+  normal gate → squash path resumes on the healed ref (the gates and
+  `finishMergeGH` read `origin/<branch>` throughout). Each FAILED attempt
+  consumes one unit of `merge_queue.mergeup_attempts` (migration 040,
+  deliberately separate from the CI/merger `attempts` budget) and comments
+  on the PR through `GhRunner.PRPostComment` — what was tried, the
+  conflicting files, the budget state. At the cap (N=2, a constant — a
+  tunable parking cap would be argued down) the conflict parks needs-human
+  exactly as before: a conflict surviving two merge-ups is a semantic
+  overlap, which is what the park is for (a `maquinista resolve` comment
+  still spawns a merger session). Below the cap the entry is released for
+  a later pass. The MAQ-15 merger-agent leg, when armed, takes precedence
+  and is unchanged.
+- **Conflicts — merger-agent leg (MAQ-15)** — under `PIPELINE_MERGE_AGENT=1`, a
+  rebase conflict no longer parks immediately: the processor bumps the
+  entry's `attempts` (the same budget as the CI cap), parks a
+  `merge_conflict` marker row (`task_context`, JSON: entry/attempt/base/
+  branch/files) and releases the entry back to `pending` in ONE tx. The
+  dispatch loop's merger pass spawns a fresh `pipeline-merger` agent in the
+  task worktree (prompt dedup id `merger:<task>:<entry>:<attempt>`), the
+  merger rebases, resolves conflicts PRESERVING both sides' semantics,
+  proves the resolution (`go build ./...` + `go test` on touched packages)
+  and ends with exactly `VERDICT: merged` or `VERDICT: needs_human`. On
+  `merged` the verdict pass consumes the episode and the released entry
+  re-runs the normal path unchanged (fetch → rebase → lease push → CI gate
+  → squash). On `needs_human` (or a stalled merger past
+  `MAQUINISTA_REVIEW_TIMEOUT`, or a marker left unconsumed for 2h) the task
+  parks `pending_approval` and the entry goes `conflict` with the marker's
+  files — the pre-MAQ-15 landing, unchanged. Below the attempts cap the
+  episode arms; at the cap the conflict parks directly. Episode identity is
+  `(entry_id, attempt)` — attempts reset on freshly enqueued entries, so
+  re-approved tasks run the merger path exactly once per entry. Processors
+  guard on task status and on in-flight episodes (live merger or unconsumed
+  marker → release untouched), so no merge can complete behind a
+  needs-human verdict and no worktree is touched mid-resolution. With
+  `PIPELINE_MERGE_AGENT=0` (default) conflicts take the MAQ-26 merge-up leg
+  above.
 - **Human gate** — `PIPELINE_AUTO_MERGE=0` (default) makes every processing
   pass release the entry untouched; `maquinista approve <task>` on a
   `ready_to_merge` task runs the full flow immediately, overriding the gate
-  for that one merge.
+  for that one merge. (MAQ-12 adds the id-less third surface: comment
+  `maquinista approve` on the PR itself — see "GitHub comment commands"
+  below; the Telegram/CLI id-carrying verbs are unchanged.)
 - **Telegram plumbing (EX-06)** — merge lifecycle notes (merged, conflict,
   infra failure, CI-cap) ride the stock delivery path via the synthetic
   `pipeline` notifier agent (migration `036`): `Notify` opens a tx, appends
   one `agent_outbox` row for the agent, commits — the relay's binding leg
   fans it into `channel_deliveries` for the Pipeline topic provisioned by
   the bot (`ensurePipelineTopic`). Failures are logged, never escalated.
-- GitHub is behind `pipeline.GhRunner` (interface: `PRChecks` +
-  `PRMergeSquash`); production uses the gh CLI (`internal/gh`).
+  Every task mention that has a `pr_url` carries the link — verdict
+  summaries (`notifyVerdict`), watchdog parks, and all merge-flow notes —
+  via `prLinkSuffix`; tasks without a PR keep the old linkless text
+  (MAQ-10: no null/empty links).
+- GitHub is behind `pipeline.GhRunner` (interface: `PRChecks`,
+  `PRMergeSquash`, MAQ-16's `PRComments` + `PRPostComment`, and MAQ-26's
+  `PRUpdateBranch` — the update-branch endpoint, whose 422/409 map to
+  `ErrMergeUpConflict`/`ErrMergeUpRace`); production uses the gh CLI
+  (`internal/gh`). The dispatch loop gets the same runner wired in
+  `orchestrator start` (`DispatchConfig.Gh`) for the MAQ-16 PR surface; a
+  nil runner disables it.
+
+## GitHub comment commands (MAQ-12)
+
+`pipeline.RunCommentCommands` (in `internal/pipeline/comments.go`, wired in
+`orchestrator start` next to dispatch/sync, **gh merge mode only**) turns
+the PR conversation into a control surface: an allowed GitHub login comments
+`maquinista <verb> [args...]` on a PR and the verb runs with the task
+resolved from the PR alone — no ids in the command (the PR maps 1:1 to the
+task via `tasks.pr_url`).
+
+- **Parser** (`ParseCommentCommand`) — first non-empty line, case-
+  insensitive, tolerant of a leading `/` and whitespace. Anything else is
+  prose and ignored entirely (never claimed, never counted).
+- **Dispatch table** — verb → `CommentVerbHandler` via
+  `RegisterCommentVerb`; `approve` and `resolve` ship. Adding a verb is exactly one
+  registration call: parser, auth, resolution, idempotency and acks are
+  shared. Unknown verbs parse and record a `no_op`.
+- **`resolve` verb (merger spawn)** — fills the EX-05 "merger-agent spawn
+  deferred" hole on demand. On a parked PR (`pending_approval` — rebase-
+  conflict or CI-cap park), commenting `maquinista resolve` spawns a merger
+  session: role `merger`, `pipeline-merger` soul (migration 035 — "rebase,
+  resolve conflicts, propose, never force"), in the task's worktree. The
+  prompt carries the parked branch plus the exact conflict file list from
+  `merge_queue.conflict_files`, and directs: rebase onto origin/main,
+  resolve every conflict, address every unresolved review-comment thread,
+  push `--force-with-lease`, post the merge proposal — **the merger never
+  merges**; `approve` re-runs the gate. Exactly-once rides the shared
+  comment claim (dedup id `resolve:<task>:<comment>`); an episode marker in
+  `task_context` audits the spawn. Gates: task must be `pending_approval`
+  and carry a worktree — otherwise a clean `no_op`.
+- **Target resolution (id-less)** — primary: `tasks.pr_url` ending in
+  `/pull/<n>`; fallback: `merge_queue.branch` matching the PR head branch.
+  No task, or the verb not applicable to its state (`approve` wants
+  `ready_to_merge`) → one clean `no_op`, no state damage. Handlers re-check
+  state; the merge transitions themselves are status-guarded.
+- **Auth** — commenter login ∈ `PIPELINE_GH_ALLOWED_LOGINS`; unset →
+  repo-collaborator check via gh (cached 10 min per login). Non-allowed
+  logins are ignored silently — but claimed, so the silence is remembered.
+  Transient GitHub/DB errors claim nothing and retry next pass.
+- **Exactly-once** — `gh_comment_commands` (migration `037`): PK = the
+  globally unique GitHub comment id, `ON CONFLICT DO NOTHING` — the INSERT
+  is the claim, so a duplicate command comment never re-runs its verb and
+  can never double-merge (the merge_queue live-entry index is the second
+  guard). `disposition` audits the outcome (`ok` / `no_op` /
+  `unauthorized` / `error`).
+- **Polling, not webhooks** (home infra, no public endpoint) — one comments
+  fetch (`gh api`, `since=` cursor) per watched PR per tick; watched PRs =
+  open pipeline PRs (`review`/`changes_requested`/`ready_to_merge`/
+  `pending_approval`). Cadence 60 s default, 30 s floor. The cursor only
+  advances on a clean pass — a failed fetch **or** a failed dispatch (a
+  transient dispatch error claims nothing) re-reads its window next pass;
+  claims keep that exactly-once — and starts at now−10 min after a daemon
+  restart.
+- **Ack** — accepted commands get a +1 reaction on the comment (best-effort)
+  and a note to the Pipeline topic via the EX-06 notify path.
+- GitHub specifics live behind `pipeline.CommentSource` (interface:
+  `PRComments` + `IsCollaborator` + `ReactToComment` + `PRHeadBranch`);
+  production is the same gh CLI wrapper (`internal/gh`).
 
 ## Role souls
 
@@ -272,14 +509,15 @@ dispatcher clones them per spawn):
 | `pipeline-reviewer` | independent diff review — fresh per round, zero-author | `high` |
 | `pipeline-arbiter` | adjudication of contested / repeated `request_changes` | `high` |
 | `pipeline-fixer` | reviewer-findings resolution in the same worktree/PR | `standard` |
-| `pipeline-merger` | rebase + `gh pr checks` gate + propose/merge | `standard` |
+| `pipeline-merger` | rebase-conflict resolution in the task worktree — keep both sides, prove build+test green, one verdict (pivoted by MAQ-15, migration 038) | `standard` |
 
 Cross-exercise contracts frozen here (EX-03 dispatch + verdict parsing build
 on these literals):
 
 - **Verdict line** — reviewer/arbiter sessions end their output with exactly
   one line: `VERDICT: approve` / `VERDICT: request_changes` /
-  `VERDICT: needs_human`.
+  `VERDICT: needs_human`. Merger sessions (MAQ-15) end with exactly
+  `VERDICT: merged` / `VERDICT: needs_human` (`ParseMergeVerdict`).
 - **Dispatch hints** — every pipeline template carries `extras` keys
   `default_runner` (all `pi`) and `reasoning_class`; EX-03 resolves them to
   runner + model at dispatch.
@@ -287,13 +525,102 @@ on these literals):
 Souls stay runner-agnostic (ADR-0005 revisit triggers): re-binding a role to
 a new harness is an extras edit, not a soul rewrite.
 
+## Comment actions (MAQ-11)
+
+The human release authority is a comment from an allowed approver on a
+surface he already has open — the Telegram Pipeline topic or the ticket
+issue. Both surfaces route into ONE verb arm, `pipeline.ApproveRef`
+(`approve.go`): resolve the task reference (full uuid or unambiguous
+prefix), no-op unless the task is `ready_to_merge` (approve never forces a
+transition), then `RunMergeOnApprove` — the same queue flow the CLI uses,
+overriding the auto-merge gate for that one merge. No new merge code path.
+The verb arms a merge audit observation (`approved via … by <who>`).
+
+- **Telegram** — `/approve <task-ref>` as a bot command (any topic,
+  `ALLOWED_USERS` gate is the stock one in `handleUpdate`), or a bare
+  `approve <task-ref>` typed in the Pipeline topic
+  (`handlePipelineApproveText` intercepts BEFORE the routing ladder — the
+  synthetic pipeline agent has no sidecar, so the ladder would strand the
+  message in its inbox). The in-topic form is regex-strict (`approve <one
+  ref>`) and gated on the thread's owner binding being the `pipeline`
+  agent, so ordinary agent conversations are never hijacked. The ack is
+  immediate; the merge runs async and its outcome rides the standard
+  notifier notes into the same topic.
+- **Reply comments (MAQ-24)** — a plain reply to a pipeline notification in
+  the Pipeline topic is posted verbatim as a PR comment on that task's open
+  PR (`internal/bot/pipeline_reply.go` intercept, after the verb arm;
+  `internal/pipeline/telegram_comment.go` for resolution/claim/post). See
+  "Telegram reply → PR comment" below.
+- **Ticket comments** — `RunCommentApprovals` polls at the sync cadence
+  (10 s, same pass family). Each pass: ready_to_merge tasks with a
+  `ticket_issue_map` row → `CommentFetcher.RecentComments` (optional
+  provider extension; Linear implements it, providers without comments are
+  a logged no-op) → verb parse (whole body must be `approve` or
+  `maquinista approve`, punctuation-tolerant — prose mentioning the word
+  never merges) → approver gate (`MAQUINISTA_TICKETS_APPROVERS`, email or
+  display name, case-insensitive, empty = fail-closed) → consume →
+  approve.
+- **Exactly-once** — the comment id is consumed into `ticket_comment_log`
+  (INSERT ON CONFLICT DO NOTHING + RETURNING) BEFORE the verb runs, so a
+  second identical comment or a pagination overlap loses the race and never
+  reaches the merge; `merge_queue`'s partial live index is the second
+  guard. A failing verb still consumes its comment — the operator
+  re-approves with a new comment or the CLI.
+- **Notifier verbs** — the merge-proposal note teaches the comment forms
+  (short id, typeable from a phone): reply `approve <short-id>` in the
+  Pipeline topic or comment `approve` on the ticket issue. The CLI verb
+  (`maquinista approve`, now routed through `ApproveRef` too) keeps working.
+  Notes about `pending_approval` tasks (round cap, needs-human escalation,
+  CI-cap) keep the CLI-only form — the comment verb deliberately does not
+  act on `pending_approval`.
+
+## Telegram reply → PR comment (MAQ-24)
+
+Feedback no longer requires a browser: a non-verb reply to a pipeline
+notification in the Pipeline topic lands as a PR comment on that task's
+open PR, and the next review round weighs it through MAQ-16's existing
+human-comment machinery (the comment is authored by the gh CLI account and
+carries no `[review round N]` marker, so it counts as human INPUT
+unchanged).
+
+- **Target resolution, no prose parsing** — task-aware notifications stamp
+  their task id into the outbox content (`NotifyTask`/`notifyTaskf`; every
+  verdict/merge/watchdog note uses them). The bot resolves a replied-to
+  Telegram message via `channel_deliveries.external_msg_id` (the message id
+  the dispatcher recorded) → `agent_outbox` → `content->>'task_id'`. A miss
+  (not a notification, or a legacy row without the stamp) falls through to
+  the routing ladder exactly as before.
+- **Exactly-once** — `telegram_pr_comments` (migration `039`): PK
+  `(chat_id, message_id)`, the INSERT is the claim made BEFORE posting, so
+  a retried/redelivered update of the same reply never double-posts.
+  `disposition` audits the outcome (`ok` / `no_op` / `error`), and the
+  comment URL is stored + quoted back into the topic as the delivery
+  confirmation.
+- **Open-PR guard** — `pipeline.PostPRComment` gates on `tasks.pr_url`
+  being a GitHub pull URL and the PR state being OPEN (`gh pr view
+  --json state`); anything else is `ErrNoOpenPR` → one graceful "no open
+  PR" reply, nothing posted (AC: no-PR tasks are safe). gh specifics live
+  behind `pipeline.PRCommentPoster` (`PRState` + `PRPostCommentURL`);
+  production is the shared gh CLI wrapper (`internal/gh`), which captures
+  the comment URL `gh pr comment` prints.
+- **Verbs stay MAQ-11's** — the in-topic `approve <ref>` intercept runs
+  first (handlers.go ordering), and `maquinista <verb>`-shaped replies are
+  refused here: posting them would arm the MAQ-12 GitHub comment-command
+  surface from chat text. approve/reject/resolve behavior is unchanged.
+
 ## TODO
 
 - fixer re-claim loop: **shipped (EX-04)** — see "Fixer pass" above; round
   cap + fixer watchdog included
 - merge mode: **shipped (EX-05)** — see "Merge mode: gh" above; enqueue
   pass, rebase + CI gate, approve-verb override included
-- Telegram plumbing: EX-06
+- merger conflict leg: **shipped (MAQ-15)** — merger-agent episodes on
+  rebase conflicts; see the Conflicts bullet in "Merge mode: gh"
+- Telegram plumbing: **shipped (EX-06)** — synthetic notifier agent,
+  Pipeline topic, merge lifecycle notes; approve comment verbs (MAQ-11)
+  extend it, see "Comment actions" above
+- comment actions: **shipped (MAQ-11)** — see "Comment actions" above;
+  park/rerun/retry verbs are follow-ups once approve proves the pattern
 - worker spawn wiring: **shipped (EX-07)** — see "Task scheduler" above;
   task-scheduler in `orchestrator start`, ensureTaskWorker → SpawnFresh
 

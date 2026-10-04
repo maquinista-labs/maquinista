@@ -1,7 +1,11 @@
 package taskscheduler
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -199,6 +203,213 @@ func TestDispatchOne_ConcurrentRacersDispatchOnce(t *testing.T) {
 	if successCount != 1 {
 		t.Errorf("successes=%d, want 1", successCount)
 	}
+}
+
+// Regression (MAQ-18): a ready task whose only agent row is 'stopped'
+// (frozen SpawnFresh pre-registration, sidecar vanished-window mark, or
+// `maquinista stop` park) must be claimed, and the stale row must be
+// flipped to 'dead' so uq_agents_task_live frees the slot for the fresh
+// implementor. Before the fix the task was silently skipped forever.
+func TestDispatchOne_ClaimsTaskWithStoppedAgentRow(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, worktree_path) VALUES ('T', 'x', 'ready', $1)`, dir)
+	pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, stop_requested, role)
+		VALUES ('impl-old', 'maquinista', 'impl-old', 'T', 'stopped', TRUE, 'implementor')
+	`)
+
+	ensured := false
+	cfg := Config{
+		EnsureAgent: func(_ context.Context, role, taskID string) (string, error) {
+			ensured = true
+			_, err := pool.Exec(ctx, `
+				INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+				VALUES ($1, 'maquinista', $1, $2, 'working', $3)
+			`, "impl-"+taskID, taskID, role)
+			return "impl-" + taskID, err
+		},
+	}
+
+	ok, err := DispatchOne(ctx, pool, cfg)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if !ensured {
+		t.Error("EnsureAgent never called — stopped agent row still blocks the claim")
+	}
+
+	// The stale stopped row must be released (dead), not left holding the
+	// unique-live slot.
+	var oldStatus string
+	pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='impl-old'`).Scan(&oldStatus)
+	if oldStatus != "dead" {
+		t.Errorf("stale agent status=%q, want dead", oldStatus)
+	}
+}
+
+// MAQ-18 acceptance 2: the dashboard's "stopped + empty tmux_window =
+// needs provisioning" state (role='user', task_id NULL) is out of the
+// scheduler's reach — claiming a task must never flip such a row.
+func TestDispatchOne_DoesNotTouchStoppedUserAgents(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, worktree_path) VALUES ('T', 'x', 'ready', $1)`, dir)
+	pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, role, task_id, status, stop_requested)
+		VALUES ('dash-user', 'maquinista', '', 'user', NULL, 'stopped', FALSE)
+	`)
+
+	cfg := Config{EnsureAgent: func(_ context.Context, role, taskID string) (string, error) {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+			VALUES ($1, 'maquinista', $1, $2, 'working', $3)
+		`, "impl-"+taskID, taskID, role)
+		return "impl-" + taskID, err
+	}}
+	if ok, err := DispatchOne(ctx, pool, cfg); err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+
+	var status, window string
+	pool.QueryRow(ctx, `SELECT status, tmux_window FROM agents WHERE id='dash-user'`).Scan(&status, &window)
+	if status != "stopped" || window != "" {
+		t.Errorf("dashboard agent mutated: status=%q window=%q, want stopped/empty (reconcile would lose it)", status, window)
+	}
+}
+
+// MAQ-18 acceptance 3: a ready task held by a LIVE agent must be skipped
+// (correct behavior) but reported — one journal line naming the blocking
+// agent + status, instead of the old silence.
+func TestLogBlockedReadyTasks(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, worktree_path) VALUES ('T', 'x', 'ready', $1)`, dir)
+	pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+		VALUES ('impl-live', 'maquinista', 'impl-live', 'T', 'working', 'implementor')
+	`)
+
+	cfg := Config{EnsureAgent: func(_ context.Context, _, _ string) (string, error) {
+		t.Error("EnsureAgent must not run for a task held by a live agent")
+		return "", nil
+	}}
+	if ok, err := DispatchOne(ctx, pool, cfg); err != nil || ok {
+		t.Fatalf("live agent must block the claim: ok=%v err=%v", ok, err)
+	}
+
+	var logBuf syncBuffer
+	log.SetOutput(&logBuf)
+	n, err := LogBlockedReadyTasks(ctx, pool)
+	log.SetOutput(os.Stderr) // nil would leave the default logger panicking on the next log call
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("blocked tasks=%d, want 1", n)
+	}
+	out := logBuf.String()
+	for _, want := range []string{"T", "impl-live", "working"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("journal line missing %q: %q", want, out)
+		}
+	}
+}
+
+// MAQ-18 reaper: a 'claimed' task whose agent row went 'stopped'
+// mid-flight (pane vanished → sidecar mark) is released back to 'ready'
+// once the claim is stale. Fresh claims and claims with live agents are
+// left alone — the bound protects the SpawnFresh stopped→running window.
+func TestReapStaleClaims(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	// Stale claim with a dead-paned (stopped) agent → reaped.
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, worktree_path, claimed_at, claimed_by)
+		VALUES ('STALE', 'x', 'claimed', $1, NOW() - INTERVAL '10 minutes', '@impl-old')`, dir)
+	pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, stop_requested, role)
+		VALUES ('impl-old', 'maquinista', 'impl-old', 'STALE', 'stopped', TRUE, 'implementor')
+	`)
+	// Fresh claim (agent row still in SpawnFresh's stopped phase) → kept.
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, worktree_path, claimed_at)
+		VALUES ('FRESH', 'x', 'claimed', $1, NOW())`, dir)
+	pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+		VALUES ('impl-new', 'maquinista', 'impl-new', 'FRESH', 'stopped', 'implementor')
+	`)
+	// Stale claim whose agent is genuinely live → kept.
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, worktree_path, claimed_at)
+		VALUES ('LIVE', 'x', 'claimed', $1, NOW() - INTERVAL '10 minutes')`, dir)
+	pool.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+		VALUES ('impl-live', 'maquinista', 'impl-live', 'LIVE', 'working', 'implementor')
+	`)
+
+	reaped, err := ReapStaleClaims(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reaped != 1 {
+		t.Fatalf("reaped=%d, want 1", reaped)
+	}
+
+	var status string
+	pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id='STALE'`).Scan(&status)
+	if status != "ready" {
+		t.Errorf("STALE status=%q, want ready", status)
+	}
+	var claimedBy *string
+	pool.QueryRow(ctx, `SELECT claimed_by FROM tasks WHERE id='STALE'`).Scan(&claimedBy)
+	if claimedBy != nil {
+		t.Errorf("STALE claimed_by=%v, want NULL", *claimedBy)
+	}
+	pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id='FRESH'`).Scan(&status)
+	if status != "claimed" {
+		t.Errorf("FRESH status=%q, want claimed (fresh spawn window)", status)
+	}
+	pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id='LIVE'`).Scan(&status)
+	if status != "claimed" {
+		t.Errorf("LIVE status=%q, want claimed (agent still working)", status)
+	}
+
+	// End-to-end: the reaped task is immediately re-claimable despite the
+	// stopped row, and that claim releases the row (acceptance 1).
+	cfg := Config{EnsureAgent: func(_ context.Context, role, taskID string) (string, error) {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+			VALUES ($1, 'maquinista', $1, $2, 'working', $3)
+		`, "impl-"+taskID, taskID, role)
+		return "impl-" + taskID, err
+	}}
+	if ok, err := DispatchOne(ctx, pool, cfg); err != nil || !ok {
+		t.Fatalf("re-dispatch after reap: ok=%v err=%v", ok, err)
+	}
+}
+
+// syncBuffer is a thread-safe-ish log sink for tests.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // Regression (EX-07 round 2): a claimed task whose inbox prompt is owned by

@@ -69,7 +69,7 @@ func ParkUnspawnable(ctx context.Context, pool *pgxpool.Pool, grace time.Duratio
 			continue // raced to another status — leave it alone
 		}
 		log.Printf("taskscheduler: task %s parked needs-human: claimed >%s with no worktree_path and no live agent", taskID, grace)
-		pipeline.Notifyf(ctx, pool, "🆘 %s: claimed %s ago with no worktree_path and no live agent — unspawnable, parked needs-human. Provision the worktree, set tasks.worktree_path, flip the task back to 'ready'.",
+		pipeline.NotifyTaskf(ctx, pool, taskID, "🆘 %s: claimed %s ago with no worktree_path and no live agent — unspawnable, parked needs-human. Provision the worktree, set tasks.worktree_path, flip the task back to 'ready'.",
 			pipeline.TaskTitle(ctx, pool, taskID), grace)
 		parked++
 	}

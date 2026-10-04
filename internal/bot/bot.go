@@ -61,6 +61,12 @@ type Bot struct {
 
 	// Cloudflare Quick Tunnel manager (Phase 7 dashboard command).
 	tunnel *tunnel.Manager
+	// Approve-verb backend (MAQ-11): pipeline.ApproveRef wired with
+	// provider + gh by cmd_start. Nil → verb replies "not wired".
+	approveFn ApproveFunc
+	// Reply-comment backend (MAQ-24): pipeline.PostPRComment wired with gh
+	// by cmd_start. Nil → replies answer "not wired".
+	pipelineReplyFn PipelineReplyFunc
 	// tunnelNotify* stores the chat/thread the operator used to start the
 	// tunnel so expiry messages are sent to the right place.
 	tunnelNotifyMu       sync.Mutex
@@ -145,6 +151,7 @@ func (b *Bot) registerCommands() {
 		tgbotapi.BotCommand{Command: "t_batch", Description: "Work a list of tasks in order"},
 		tgbotapi.BotCommand{Command: "t_unclaim", Description: "Release a claimed task back to ready"},
 		tgbotapi.BotCommand{Command: "t_merge", Description: "Merge a branch (auto-resolve conflicts)"},
+		tgbotapi.BotCommand{Command: "approve", Description: "Approve a ready_to_merge pipeline task: /approve <task-id-prefix>"},
 		tgbotapi.BotCommand{Command: "t_plan", Description: "Plan and create tasks from a description"},
 		tgbotapi.BotCommand{Command: "plan", Description: "Open a planner session in this topic"},
 		tgbotapi.BotCommand{Command: "runner", Description: fmt.Sprintf("Show/switch default runner (%s)", runner.NamesJoined())},

@@ -133,6 +133,44 @@ func (c *LinearClient) TodoIssues(ctx context.Context, teamID string) ([]linearI
 	return out.Issues.Nodes, nil
 }
 
+// linearComment mirrors the GraphQL comment shape (MAQ-11). User is a
+// reference that can be null (deleted users) and its email is only visible
+// when the viewer has the right scope — the provider falls back to the
+// display name for the author identity.
+type linearComment struct {
+	ID        string    `json:"id"`
+	Body      string    `json:"body"`
+	CreatedAt time.Time `json:"createdAt"`
+	Issue     struct {
+		ID string `json:"id"`
+	} `json:"issue"`
+	User *struct {
+		Email       string `json:"email"`
+		Name        string `json:"name"`
+		DisplayName string `json:"displayName"`
+	} `json:"user"`
+}
+
+// Comments returns comments created since `since` on the given issues
+// (oldest first, capped — the caller's window is minutes, volumes are tiny).
+func (c *LinearClient) Comments(ctx context.Context, issueIDs []string, since time.Time) ([]linearComment, error) {
+	var out struct {
+		Comments struct {
+			Nodes []linearComment `json:"nodes"`
+		} `json:"comments"`
+	}
+	// Issue id is a UUID comparator ([UUID!] for `in`); DateTime for the
+	// createdAt comparator — same strictness noted on the query above.
+	doc := `query($ids: [UUID!], $since: DateTime!) { comments(
+	  filter: { issue: { id: { in: $ids } }, createdAt: { gte: $since } },
+	  orderBy: createdAt, first: 100
+	) { nodes { id body createdAt issue { id } user { email name displayName } } } }`
+	if err := c.gql(ctx, doc, map[string]any{"ids": issueIDs, "since": since.Format(time.RFC3339Nano)}, &out); err != nil {
+		return nil, err
+	}
+	return out.Comments.Nodes, nil
+}
+
 // WorkflowStates returns the team's workflow states as name → id.
 func (c *LinearClient) WorkflowStates(ctx context.Context, teamID string) (map[string]string, error) {
 	var out struct {
@@ -178,6 +216,21 @@ func (c *LinearClient) UpdateIssueState(ctx context.Context, issueID, stateID st
 		return "", err
 	}
 	return out.IssueUpdate.Issue.State.Name, nil
+}
+
+// CommentOnIssue posts a comment on the issue. Used by AddIssueLink: a
+// comment is one atomic write (no read-modify-write of the description),
+// which keeps the sync loop's exactly-once bookkeeping honest.
+func (c *LinearClient) CommentOnIssue(ctx context.Context, issueID, body string) error {
+	var out struct {
+		CommentCreate struct {
+			Success bool `json:"success"`
+		} `json:"commentCreate"`
+	}
+	doc := `mutation($i: String!, $b: String!) {
+	  commentCreate(input: { issueId: $i, body: $b }) { success }
+	}`
+	return c.gql(ctx, doc, map[string]any{"i": issueID, "b": body}, &out)
 }
 
 // linearProvider implements TicketProvider over the Linear API.
@@ -228,4 +281,43 @@ func (p *linearProvider) Columns(ctx context.Context, teamID string) (map[Column
 func (p *linearProvider) SetIssueColumn(ctx context.Context, issueID, columnID string) error {
 	_, err := p.client.UpdateIssueState(ctx, issueID, columnID)
 	return err
+}
+
+// AddIssueLink implements TicketProvider: the PR link lands as a comment —
+// one atomic write per call, deduped upstream by pr_url_synced.
+func (p *linearProvider) AddIssueLink(ctx context.Context, issueID, url string) error {
+	return p.client.CommentOnIssue(ctx, issueID, "🔗 PR: "+url)
+}
+
+// RecentComments implements CommentFetcher (MAQ-11). Author is the email
+// when the API exposes it, else the display name, else the account name.
+func (p *linearProvider) RecentComments(ctx context.Context, issueIDs []string, since time.Time) ([]IssueComment, error) {
+	if len(issueIDs) == 0 {
+		return nil, nil
+	}
+	nodes, err := p.client.Comments(ctx, issueIDs, since)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]IssueComment, 0, len(nodes))
+	for _, n := range nodes {
+		ic := IssueComment{
+			ID:        n.ID,
+			IssueID:   n.Issue.ID,
+			Body:      n.Body,
+			CreatedAt: n.CreatedAt,
+		}
+		if n.User != nil {
+			switch {
+			case n.User.Email != "":
+				ic.Author = n.User.Email
+			case n.User.DisplayName != "":
+				ic.Author = n.User.DisplayName
+			default:
+				ic.Author = n.User.Name
+			}
+		}
+		out = append(out, ic)
+	}
+	return out, nil
 }

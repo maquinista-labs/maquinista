@@ -23,6 +23,23 @@ make dashboard-test       # Go-side dashboard tests (supervisor, config, CLI)
 
 `SKIP_DASHBOARD=1 make build` skips the Next.js pipeline and uses the committed `standalone.tgz` tarball.
 
+## PR descriptions
+
+Every PR opened in this repo (pipeline agent or human) MUST carry a description with exactly two sections:
+
+````markdown
+## what?
+<Concrete summary of the change: files/behavior, not narrative.>
+
+## why?
+<Motivation: problem solved + reference to the Linear issue ID (MAQ-NN) it implements.>
+````
+
+- `## what?` states observable behavior — what a reviewer will see change, without reading the diff.
+- `## why?` anchors the change to its task/spec; always cite the Linear issue ID.
+
+`.github/pull_request_template.md` pre-fills this skeleton for human-opened PRs.
+
 ## First-run
 
 ```bash
@@ -111,3 +128,8 @@ Dashboard reads `agent_outbox` directly (no relay needed). Telegram reads via `c
 ### Configuration
 
 All config via `.env` (loaded by `internal/config/Load()`). Key vars: `TELEGRAM_BOT_TOKEN`, `ALLOWED_USERS`, `ALLOWED_GROUPS`, `DATABASE_URL`, `MAQUINISTA_DIR`, `TMUX_SESSION_NAME`.
+
+## PR & ticket conventions
+
+- Every PR title carries its Linear issue identifier — keep the task title's `[MAQ-n]` prefix or append `(MAQ-n)`. A PR whose title lacks the identifier gets request_changes.
+- PR bodies follow `.github/pull_request_template.md` (`## what?` / `## why?`), pipeline and human PRs alike.

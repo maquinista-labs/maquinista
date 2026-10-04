@@ -77,8 +77,8 @@ func EnsureIssueWorktree(repoRoot string, iss Issue) (string, error) {
 
 	base := "origin/main"
 	switch {
-	case git.RefExists(repoRoot, base):
-	case git.RefExists(repoRoot, "origin/HEAD"):
+	case git.RefExistsQuiet(repoRoot, base):
+	case git.RefExistsQuiet(repoRoot, "origin/HEAD"):
 		base = "origin/HEAD"
 	default:
 		base = "HEAD"
