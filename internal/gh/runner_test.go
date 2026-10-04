@@ -1,8 +1,11 @@
 package gh
 
 import (
+	"errors"
 	"testing"
 	"time"
+
+	"github.com/maquinista-labs/maquinista/internal/pipeline"
 )
 
 func TestParseComments(t *testing.T) {
@@ -99,6 +102,25 @@ func TestParseChecks(t *testing.T) {
 
 // MAQ-24: the reply-comment path quotes the URL gh prints for the new
 // comment back into the Pipeline topic.
+func TestParseUpdateBranchErr(t *testing.T) {
+	// 422: base cannot merge into the branch cleanly — a deterministic
+	// conflict, not infrastructure (MAQ-26).
+	if err := parseUpdateBranchErr("gh: Merge conflict (HTTP 422)"); !errors.Is(err, pipeline.ErrMergeUpConflict) {
+		t.Errorf("422 stderr → %v, want ErrMergeUpConflict", err)
+	}
+	// 409: the branch moved under expected_head_sha.
+	if err := parseUpdateBranchErr("gh: Expected head sha to be abc (HTTP 409)"); !errors.Is(err, pipeline.ErrMergeUpRace) {
+		t.Errorf("409 stderr → %v, want ErrMergeUpRace", err)
+	}
+	// Anything else is infrastructure — unclassified.
+	if err := parseUpdateBranchErr("gh: auth expired (HTTP 401)"); err != nil {
+		t.Errorf("401 stderr → %v, want nil (infra)", err)
+	}
+	if err := parseUpdateBranchErr(""); err != nil {
+		t.Errorf("empty stderr → %v, want nil (infra)", err)
+	}
+}
+
 func TestParsePRCommentURL(t *testing.T) {
 	got, err := parsePRCommentURL([]byte("https://github.com/o/r/pull/7#issuecomment-123456\n"))
 	if err != nil {
