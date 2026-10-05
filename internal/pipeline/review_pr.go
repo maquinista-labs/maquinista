@@ -125,14 +125,16 @@ const (
 )
 
 // renderHumanComments renders the human comments for the round prompt:
-// filters out bot authors and the pipeline's own `[review round N]`
-// comments, applies the cutoff (nil = no cutoff), trims oversized bodies,
-// and frames the section as input-not-verbs. Returns "" when nothing
-// survives (the prompt then ships without the section).
+// filters out bot authors and the pipeline's own comments (the `[review
+// round N]` verdicts — MAQ-16 — and the pickup markers — MAQ-25; the gh CLI
+// may be authenticated as a human account, so the marker, not the author,
+// identifies them), applies the cutoff (nil = no cutoff), trims oversized
+// bodies, and frames the section as input-not-verbs. Returns "" when
+// nothing survives (the prompt then ships without the section).
 func renderHumanComments(comments []PRComment, cutoff *time.Time) string {
 	kept := make([]PRComment, 0, len(comments))
 	for _, c := range comments {
-		if c.IsBot || strings.Contains(c.Body, reviewMarkerPrefix) {
+		if c.IsBot || isOwnPRComment(c.Body) {
 			continue
 		}
 		if cutoff != nil && !c.CreatedAt.After(*cutoff) {

@@ -19,6 +19,10 @@ Three scopes exist:
 `scope=shared` is the default for dashboard-spawned agents. Scope is set
 at agent creation time and stored in `agents.workspace_scope`.
 
+> Pipeline tasks are the exception: bridge-claimed tickets get **sibling**
+> worktrees (`<repoBase>.<slug>` next to the repo, branch `<slug>`) — see
+> [pipeline.md](pipeline.md) "Sibling worktree provisioning" (MAQ-13).
+
 ## Worktree lifecycle
 
 For `scope=agent` or `scope=task`, `agent.ResolveLayout` computes the

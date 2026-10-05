@@ -55,7 +55,7 @@ func NotifyTask(ctx context.Context, pool *pgxpool.Pool, taskID, text string) er
 	return tx.Commit(ctx)
 }
 
-// notifyf is the fire-and-forget form used inside transition arms: a failed
+// Notifyf is the fire-and-forget form used inside transition arms: a failed
 // notification is logged, never allowed to fail the pipeline transition it
 // reports (the state change is the system of record; the note is a courtesy).
 func notifyf(ctx context.Context, pool *pgxpool.Pool, format string, args ...any) {
@@ -71,6 +71,20 @@ func notifyTaskf(ctx context.Context, pool *pgxpool.Pool, taskID, format string,
 	}
 }
 
+// Notifyf is the exported fire-and-forget form for packages outside the
+// pipeline (taskscheduler park paths, MAQ-13): same contract — a failed
+// notification is logged, never fails the caller.
+func Notifyf(ctx context.Context, pool *pgxpool.Pool, format string, args ...any) {
+	notifyf(ctx, pool, format, args...)
+}
+
+// NotifyTaskf is Notifyf for notes about one task, exported for the same
+// out-of-package callers: the note rides the task_id so a Telegram reply to
+// it lands as a PR comment (MAQ-24).
+func NotifyTaskf(ctx context.Context, pool *pgxpool.Pool, taskID, format string, args ...any) {
+	notifyTaskf(ctx, pool, taskID, format, args...)
+}
+
 // taskTitle returns "<title> (<short-id>)" for summaries, tolerating a
 // missing row (best-effort label, never a reason to fail the transition).
 func taskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
@@ -80,6 +94,12 @@ func taskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
 		return taskID
 	}
 	return fmt.Sprintf("%s (%s)", title, taskID)
+}
+
+// TaskTitle is the exported form for out-of-package callers that compose
+// their own notify notes (taskscheduler park paths, MAQ-13).
+func TaskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
+	return taskTitle(ctx, pool, taskID)
 }
 
 // prLinkSuffix returns "\n🔗 PR: <url>" when the task has a pr_url, else "".
@@ -106,7 +126,7 @@ func prLinkSuffix(ctx context.Context, pool *pgxpool.Pool, taskID string) string
 func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdict, landed string, round, maxRounds int) {
 	label := title
 	if label == "" {
-		label = taskTitle(ctx, pool, taskID)
+		label = TaskTitle(ctx, pool, taskID)
 	}
 	pr := prLinkSuffix(ctx, pool, taskID)
 	// MAQ-24: every verdict note carries the task_id in its outbox content —

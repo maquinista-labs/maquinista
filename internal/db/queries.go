@@ -957,6 +957,26 @@ func BumpMergeAttempts(pool *pgxpool.Pool, id int64) (int, error) {
 	return attempts, nil
 }
 
+// BumpMergeUpAttempts increments the failed merge-up counter of a merge
+// queue entry and returns the new count. The gh conflict leg uses it to cap
+// auto merge-up retries before parking needs-human (MAQ-26). Deliberately a
+// separate counter from `attempts`: the CI/merger reclaim budget and the
+// merge-up budget must not consume each other's room.
+func BumpMergeUpAttempts(pool *pgxpool.Pool, id int64) (int, error) {
+	ctx := context.Background()
+	var attempts int
+	err := pool.QueryRow(ctx, `
+		UPDATE merge_queue
+		SET    mergeup_attempts = mergeup_attempts + 1
+		WHERE  id = $1
+		RETURNING mergeup_attempts
+	`, id).Scan(&attempts)
+	if err != nil {
+		return 0, fmt.Errorf("bumping merge-up attempts for entry %d: %w", id, err)
+	}
+	return attempts, nil
+}
+
 // GetPendingMergeEntryByTask returns the oldest pending merge queue entry for
 // a task, or nil if none is queued.
 func GetPendingMergeEntryByTask(pool *pgxpool.Pool, taskID string) (*MergeQueueEntry, error) {

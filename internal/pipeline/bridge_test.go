@@ -3,6 +3,10 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -43,7 +47,7 @@ func TestClaim_InsertsTaskRow(t *testing.T) {
 	ctx := context.Background()
 
 	iss := seedIssue(1)
-	created, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa")
+	created, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa", nil)
 	if err != nil {
 		t.Fatalf("ClaimIssue: %v", err)
 	}
@@ -78,7 +82,7 @@ func TestClaim_InsertsMapRow(t *testing.T) {
 	ctx := context.Background()
 
 	iss := seedIssue(2)
-	if created, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa"); err != nil || !created {
+	if created, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa", nil); err != nil || !created {
 		t.Fatalf("ClaimIssue: created=%v err=%v", created, err)
 	}
 
@@ -106,10 +110,10 @@ func TestClaim_Idempotent(t *testing.T) {
 	ctx := context.Background()
 
 	iss := seedIssue(3)
-	if _, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa"); err != nil {
+	if _, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa", nil); err != nil {
 		t.Fatalf("first claim: %v", err)
 	}
-	created, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa")
+	created, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa", nil)
 	if err != nil {
 		t.Fatalf("second claim: %v", err)
 	}
@@ -135,7 +139,7 @@ func TestClaim_SchedulerQueryMatches(t *testing.T) {
 	ctx := context.Background()
 
 	iss := seedIssue(4)
-	if _, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa"); err != nil {
+	if _, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa", nil); err != nil {
 		t.Fatalf("ClaimIssue: %v", err)
 	}
 
@@ -166,5 +170,135 @@ func TestClaim_SchedulerQueryMatches(t *testing.T) {
 	}
 	if role != nil {
 		t.Errorf("bridge task carries role %q, want NULL (EX-02 seeds souls)", *role)
+	}
+}
+
+// --- MAQ-13: bridge-claimed tasks must land with a usable sibling worktree.
+
+// initTestRepo builds a minimal git checkout with an origin/main remote
+// tracking ref — enough for EnsureIssueWorktree to branch from origin/main.
+func initTestRepo(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	dir := t.TempDir()
+	run := func(args ...string) {
+		t.Helper()
+		out, err := exec.Command("git", append([]string{"-C", dir}, args...)...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, out)
+		}
+	}
+	run("init", "-b", "main")
+	run("config", "user.email", "test@maquinista")
+	run("config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run("add", ".")
+	run("commit", "-m", "init")
+	// origin/main remote-tracking ref without a real remote.
+	sha := strings.TrimSpace(string(mustOut(t, ctx, "git", "-C", dir, "rev-parse", "HEAD")))
+	if out, err := exec.Command("git", "-C", dir, "update-ref", "refs/remotes/origin/main", sha).CombinedOutput(); err != nil {
+		t.Fatalf("update-ref: %v: %s", err, out)
+	}
+	return dir
+}
+
+func mustOut(t *testing.T, ctx context.Context, args ...string) []byte {
+	t.Helper()
+	out, err := exec.Command(args[0], args[1:]...).Output()
+	if err != nil {
+		t.Fatalf("%v: %v", args, err)
+	}
+	return out
+}
+
+func TestSlugFromKey(t *testing.T) {
+	cases := map[string]string{
+		"MAQ-13":    "maq13",
+		"BRISA-101": "brisa101",
+		"abc":       "abc",
+		"--":        "",
+	}
+	for in, want := range cases {
+		if got := SlugFromKey(in); got != want {
+			t.Errorf("SlugFromKey(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestSiblingDir(t *testing.T) {
+	got := SiblingDir("/home/u/code/maquinista", "maq13")
+	want := "/home/u/code/maquinista.maq13"
+	if got != want {
+		t.Errorf("SiblingDir = %q, want %q", got, want)
+	}
+}
+
+func TestEnsureIssueWorktree_CreatesFromOriginMain(t *testing.T) {
+	repo := initTestRepo(t)
+	iss := Issue{ID: "uuid-wt", Key: "MAQ-13", Title: "t"}
+
+	wt, err := EnsureIssueWorktree(repo, iss)
+	if err != nil {
+		t.Fatalf("EnsureIssueWorktree: %v", err)
+	}
+	// House convention: sibling dir, never inside the repo.
+	if want := filepath.Join(filepath.Dir(repo), filepath.Base(repo)+".maq13"); wt != want {
+		t.Errorf("worktree = %q, want %q", wt, want)
+	}
+	if fi, err := os.Stat(filepath.Join(wt, ".git")); err != nil || fi == nil {
+		t.Fatalf("created path is not a worktree (no .git): %v", err)
+	}
+	branch := strings.TrimSpace(string(mustOut(t, context.Background(), "git", "-C", wt, "branch", "--show-current")))
+	if branch != "maq13" {
+		t.Errorf("branch = %q, want maq13", branch)
+	}
+
+	// Idempotent: second call reuses the same worktree.
+	wt2, err := EnsureIssueWorktree(repo, iss)
+	if err != nil || wt2 != wt {
+		t.Errorf("reuse: wt2=%q err=%v, want %q", wt2, err, wt)
+	}
+}
+
+func TestEnsureIssueWorktree_AttachesExistingBranch(t *testing.T) {
+	repo := initTestRepo(t)
+	// Branch exists (worktree was removed, branch kept).
+	if out, err := exec.Command("git", "-C", repo, "branch", "maq7").CombinedOutput(); err != nil {
+		t.Fatalf("branch: %v: %s", err, out)
+	}
+	wt, err := EnsureIssueWorktree(repo, Issue{ID: "u", Key: "MAQ-7"})
+	if err != nil {
+		t.Fatalf("EnsureIssueWorktree: %v", err)
+	}
+	branch := strings.TrimSpace(string(mustOut(t, context.Background(), "git", "-C", wt, "branch", "--show-current")))
+	if branch != "maq7" {
+		t.Errorf("branch = %q, want maq7 (attach)", branch)
+	}
+}
+
+func TestClaim_SetsWorktreePath(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	repo := initTestRepo(t)
+	iss := seedIssue(9)
+	wt, err := EnsureIssueWorktree(repo, iss)
+	if err != nil {
+		t.Fatalf("EnsureIssueWorktree: %v", err)
+	}
+	created, err := ClaimIssue(ctx, pool, iss, "team-maq", "brisa", &wt)
+	if err != nil || !created {
+		t.Fatalf("ClaimIssue: created=%v err=%v", created, err)
+	}
+	var got *string
+	if err := pool.QueryRow(ctx,
+		`SELECT worktree_path FROM tasks WHERE metadata->>'ticket_issue_id' = $1`, iss.ID,
+	).Scan(&got); err != nil {
+		t.Fatalf("task row: %v", err)
+	}
+	if got == nil || *got != wt {
+		t.Errorf("worktree_path = %v, want %q", got, wt)
 	}
 }
