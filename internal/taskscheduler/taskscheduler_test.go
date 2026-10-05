@@ -70,6 +70,68 @@ func TestDispatchOne_ReadyTaskFlow(t *testing.T) {
 	}
 }
 
+// MAQ-22: a claim announces itself exactly once on the Pipeline topic.
+func TestDispatchOne_NotifyClaimed(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, worktree_path) VALUES ('NT', 'notify claim', 'ready', $1)`, dir)
+	cfg := Config{EnsureAgent: func(_ context.Context, role, taskID string) (string, error) {
+		_, err := pool.Exec(ctx, `
+			INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+			VALUES ($1, 'maquinista', $1, $2, 'working', $3)
+		`, "impl-"+taskID, taskID, role)
+		return "impl-" + taskID, err
+	}}
+
+	if ok, err := DispatchOne(ctx, pool, cfg); err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	texts := pipelineOutboxTexts(t, pool)
+	if len(texts) != 1 {
+		t.Fatalf("pipeline outbox = %d rows, want exactly 1", len(texts))
+	}
+	for _, want := range []string{"📋", "claimed by @impl-NT", "implementor", "notify claim"} {
+		if !strings.Contains(texts[0], want) {
+			t.Errorf("claim note %q missing %q", texts[0], want)
+		}
+	}
+}
+
+func TestDispatchOne_NotifyClaimed_ExecutorRole(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, worktree_path, metadata)
+		VALUES ('NR', 'role note', 'ready', $1, '{"role":"executor"}'::jsonb)`, dir)
+	cfg := Config{EnsureAgent: func(_ context.Context, role, taskID string) (string, error) {
+		if role != "executor" {
+			t.Errorf("EnsureAgent role=%q, want executor", role)
+		}
+		_, err := pool.Exec(ctx, `
+			INSERT INTO agents (id, tmux_session, tmux_window, task_id, status, role)
+			VALUES ($1, 'maquinista', $1, $2, 'working', $3)
+		`, "impl-"+taskID, taskID, role)
+		return "impl-" + taskID, err
+	}}
+
+	if ok, err := DispatchOne(ctx, pool, cfg); err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	texts := pipelineOutboxTexts(t, pool)
+	if len(texts) != 1 {
+		t.Fatalf("pipeline outbox = %d rows, want exactly 1", len(texts))
+	}
+	if !strings.Contains(texts[0], "(executor)") {
+		t.Errorf("claim note %q missing role \"(executor)\"", texts[0])
+	}
+	if strings.Contains(texts[0], "(implementor)") {
+		t.Errorf("claim note %q hard-codes \"(implementor)\"", texts[0])
+	}
+}
+
 func TestDispatchOne_DAGCascade(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()
@@ -366,6 +428,17 @@ func TestReapStaleClaims(t *testing.T) {
 	if status != "ready" {
 		t.Errorf("STALE status=%q, want ready", status)
 	}
+	// MAQ-22: the requeue-after-heal announces exactly once, only for the
+	// released task (FRESH and LIVE stay untouched, announce nothing).
+	texts := pipelineOutboxTexts(t, pool)
+	if len(texts) != 1 {
+		t.Fatalf("pipeline outbox = %d rows, want exactly 1 requeue note", len(texts))
+	}
+	for _, want := range []string{"🔄", "requeued to ready", "STALE"} {
+		if !strings.Contains(texts[0], want) {
+			t.Errorf("requeue note %q missing %q", texts[0], want)
+		}
+	}
 	var claimedBy *string
 	pool.QueryRow(ctx, `SELECT claimed_by FROM tasks WHERE id='STALE'`).Scan(&claimedBy)
 	if claimedBy != nil {
@@ -410,6 +483,33 @@ func (b *syncBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+// pipelineOutboxTexts reads the synthetic pipeline agent's outbox texts
+// (oldest first) — the MAQ-22 lifecycle one-liners land there.
+func pipelineOutboxTexts(t *testing.T, pool *pgxpool.Pool) []string {
+	t.Helper()
+	rows, err := pool.Query(context.Background(), `
+		SELECT content->>'text' FROM agent_outbox
+		WHERE agent_id = 'pipeline'
+		ORDER BY created_at, id
+	`)
+	if err != nil {
+		t.Fatalf("query pipeline outbox: %v", err)
+	}
+	defer rows.Close()
+	var texts []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		texts = append(texts, s)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return texts
 }
 
 // Regression (EX-07 round 2): a claimed task whose inbox prompt is owned by

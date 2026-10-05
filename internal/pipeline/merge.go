@@ -510,9 +510,10 @@ func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pro
 		return nil
 	case ChecksFailed:
 		// Cap the reclaim loop (EX-06): a red PR under AUTO_MERGE=1
-		// otherwise releases and re-claims forever. Below cap: silent
-		// release (the spam bug the cap exists for). At cap: entry
-		// failed, task parked needs-human, one question out.
+		// otherwise releases and re-claims forever. Below cap: release
+		// with exactly one 🟥 gate-red one-liner (the attempts bump bounds
+		// the note to once per distinct red, not once per pass). At cap:
+		// entry failed, task parked needs-human, one question out.
 		attempts, err := db.BumpMergeAttempts(pool, entry.ID)
 		if err != nil {
 			return fmt.Errorf("pipeline: bumping attempts %d: %w", entry.ID, err)
@@ -521,6 +522,12 @@ func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pro
 			if err := db.ReleaseMergeEntry(pool, entry.ID); err != nil {
 				return fmt.Errorf("pipeline: releasing %d: %w", entry.ID, err)
 			}
+			// MAQ-22: a red gate is a lifecycle transition, not just the
+			// final cap question. Each failure bumps attempts (bounded by
+			// maxAttempts), so the one-liner fires once per distinct red
+			// and cannot spam the way an unbounded release loop would.
+			notifyf(ctx, pool, "🟥 %s: gate red (ci) — PR #%d checks failed (attempt %d/%d) — released, will re-check.%s",
+				TaskTitle(ctx, pool, taskID), pr, attempts, maxAttempts, prLinkSuffix(ctx, pool, taskID))
 			log.Printf("pipeline: merge %s CI failed on PR #%d (attempt %d/%d) — will re-check", taskID, pr, attempts, cfg.MaxAttempts)
 			return nil
 		}

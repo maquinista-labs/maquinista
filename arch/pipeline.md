@@ -86,14 +86,23 @@ implementor:
   memory seed, tmux window, sidecar inbox goroutine
 - the scheduler then enqueues `/work-on-task <id>` (external_msg_id
   `task:<id>` dedup) and sets `tasks.claimed_by`; `HealMissingInbox` covers
-  the crash-between-claim-and-enqueue wedge
+  the crash-between-claim-and-enqueue wedge; once the spawn has an owner
+  the claim announces itself on the Pipeline topic (MAQ-22 one-liner,
+  `pipeline.Notifyf`; the exactly-once guard is the guarded claim itself —
+  one `ready`→`claimed` flip per claim — not the agent id: `EnsureAgent`
+  returns a non-empty id on both outcomes, so the `ErrAgentAlreadyLive`
+  path (a racing spawn's already-live pane, which the claim routes a fresh
+  /work-on-task to) announces too; the note interpolates the task's
+  `metadata->>'role'`, defaulting to implementor)
 - two MAQ-18 safety nets run each wake: `LogBlockedReadyTasks` journals
   every `ready` task skipped because a live agent still holds it (no
   silent skips), and `ReapStaleClaims` releases `claimed` tasks back to
   `ready` when all their task-scoped agent rows are non-live and the
   claim is older than 5 min (mid-flight implementor death; the bound
   protects fresh claims whose agent row is still in SpawnFresh's stopped
-  pre-registration phase)
+  pre-registration phase) — each release announces the requeue-after-heal
+  on the Pipeline topic (MAQ-22; the guarded UPDATE's RETURNING is the
+  exactly-once guard)
 
 The standalone `maquinista task-scheduler` subcommand keeps the
 orchestrator.EnsureAgent stub (row-only, no pty) for debugging alongside a
@@ -169,11 +178,13 @@ live reviewer agent:
 - spawns via `ReviewSpawner` (wraps `agentspawn.SpawnFresh`: agents row
   task-bound, soul clone, tmux pane, sidecar), then bumps
   `tasks.review_rounds` (autocommit — its presence makes the next tick a
-  no-op for the spawn pass), builds the round prompt (see **Human PR
-  comments**, below — deliberately with NO transaction open, so the gh
-  comment fetch never holds a DB tx), and enqueues the prompt in its own
-  tx (`external_msg_id = review:<task>:<round>` dedups). A crash between
-  bump and enqueue heals via the prompt pass
+  no-op for the spawn pass; the bump is also the exactly-once guard for
+  the MAQ-22 "reviewer claimed — review round N" one-liner), builds the
+  round prompt (see **Human PR comments**, below — deliberately with NO
+  transaction open, so the gh comment fetch never holds a DB tx), and
+  enqueues the prompt in its own tx (`external_msg_id =
+  review:<task>:<round>` dedups). A crash between bump and enqueue heals
+  via the prompt pass
 - on a `uq_agents_task_live` spawn failure, runs the **stuck-implementor
   self-heal (MAQ-14)**: if the blocking live row is the task's implementor
   whose last outbox activity is older than
@@ -270,7 +281,9 @@ session in the SAME worktree/PR:
   `MAQUINISTA_PI_MODEL`), spawns via the same `ReviewSpawner`
 - the episode is keyed by `review_rounds` (frozen while parked — it only
   bumps at the next reviewer spawn); a `task_context` fix row
-  (content `round <N>`) commits FIRST and stops re-spawning for the episode
+  (content `round <N>`) commits FIRST and stops re-spawning for the episode;
+  that marker is also the exactly-once guard for the MAQ-22
+  "fixer round N started" one-liner
 - the fix prompt (`external_msg_id = fix:<task>:<round>` dedup) embeds the
   reviewer's newest message tail (≤6000 chars — the soul contract puts the
   numbered findings at the top of the final reply); a prompt miss heals on
@@ -365,10 +378,12 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   best-effort board push to Done, then worktree + local + remote branch
   cleanup.
 - **CI gate** — pending checks release the entry back to `pending` (a later
-  pass retries); failed checks bump `attempts` and release silently below
-  the cap, at the cap (default 5, `MAQUINISTA_MERGE_ATTEMPTS_MAX`) the entry
-  fails, the task parks `pending_approval`, and the Pipeline topic gets the
-  question (EX-06). No checks configured counts as green.
+  pass retries); failed checks bump `attempts` and release below the cap
+  with a `🟥 gate red (ci)` one-liner (MAQ-22 — one per distinct red,
+  bounded by the cap); at the cap (default 5,
+  `MAQUINISTA_MERGE_ATTEMPTS_MAX`) the entry fails, the task parks
+  `pending_approval`, and the Pipeline topic gets the question (EX-06).
+  No checks configured counts as green.
 - **Quality gate (MAQ-20 build + MAQ-21 tests)** — between the CI gate and
   the squash, two legs in order (`runMergeGate`): the branch is never
   merged uncompiled or red. Both legs materialize `origin/<branch>` — the
@@ -470,7 +485,16 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   Every task mention that has a `pr_url` carries the link — verdict
   summaries (`notifyVerdict`), watchdog parks, and all merge-flow notes —
   via `prLinkSuffix`; tasks without a PR keep the old linkless text
-  (MAQ-10: no null/empty links).
+  (MAQ-10: no null/empty links). MAQ-22 extends the journey to EVERY
+  lifecycle transition, each emitted inside its guarded UPDATE branch so
+  it fires exactly once per transition: task claimed (implementor, task
+  scheduler; reviewer round N, review dispatch; fixer round N, fixer
+  pass — the merger arm was already announced at conflict time), PR opened
+  (`tools.SetPRUrl`'s guarded flip; a new URL re-announces, an idempotent
+  re-set does not), gate red (CI below cap), and requeue-after-heal (the
+  stale-claim reaper). Cross-package arms use the exported `Notifyf` /
+  `TaskTitle`; the dead-Telegram contract holds — a failed note is logged
+  and never fails the transition it reports.
 - GitHub is behind `pipeline.GhRunner` (interface: `PRChecks`,
   `PRMergeSquash`, MAQ-16's `PRComments` + `PRPostComment`, and MAQ-26's
   `PRUpdateBranch` — the update-branch endpoint, whose 422/409 map to

@@ -113,6 +113,76 @@ func TestMarkMerged_UnblocksDependents(t *testing.T) {
 	}
 }
 
+// MAQ-22: the PR-opened flip announces exactly once per transition —
+// idempotent re-set with the same URL is silent, a new URL re-announces.
+func TestSetPRUrl_NotifyOncePerTransition(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+	if err := CreateTask(ctx, pool, Task{ID: "PR1", Title: "pr opener"}); err != nil {
+		t.Fatal(err)
+	}
+	notifyTexts := func() []string {
+		t.Helper()
+		rows, err := pool.Query(ctx, `
+			SELECT content->>'text' FROM agent_outbox
+			WHERE agent_id = 'pipeline'
+			ORDER BY created_at, id
+		`)
+		if err != nil {
+			t.Fatalf("query outbox: %v", err)
+		}
+		defer rows.Close()
+		var texts []string
+		for rows.Next() {
+			var s string
+			if err := rows.Scan(&s); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			texts = append(texts, s)
+		}
+		return texts
+	}
+
+	// First set: the transition fires and announces once, with the URL.
+	if err := SetPRUrl(ctx, pool, "PR1", "https://x/pull/1"); err != nil {
+		t.Fatalf("first SetPRUrl: %v", err)
+	}
+	texts := notifyTexts()
+	if len(texts) != 1 {
+		t.Fatalf("after first set: %d notes, want 1", len(texts))
+	}
+	for _, want := range []string{"📤", "PR opened", "pr opener", "https://x/pull/1"} {
+		if !strings.Contains(texts[0], want) {
+			t.Errorf("note %q missing %q", texts[0], want)
+		}
+	}
+
+	// Idempotent re-set (same URL, same state): no new note.
+	if err := SetPRUrl(ctx, pool, "PR1", "https://x/pull/1"); err != nil {
+		t.Fatalf("idempotent SetPRUrl: %v", err)
+	}
+	if texts := notifyTexts(); len(texts) != 1 {
+		t.Fatalf("after re-set: %d notes, want still 1", len(texts))
+	}
+
+	// A NEW url is a new PR-opened transition: announces again.
+	if err := SetPRUrl(ctx, pool, "PR1", "https://x/pull/2"); err != nil {
+		t.Fatalf("new-url SetPRUrl: %v", err)
+	}
+	texts = notifyTexts()
+	if len(texts) != 2 || !strings.Contains(texts[1], "https://x/pull/2") {
+		t.Fatalf("after new url: %d notes %q, want second note with new url", len(texts), texts)
+	}
+
+	// Unknown task still errors.
+	if err := SetPRUrl(ctx, pool, "nope", "https://x/pull/3"); err == nil || !strings.Contains(err.Error(), "no task") {
+		t.Errorf("unknown task err = %v, want 'no task'", err)
+	}
+	if texts := notifyTexts(); len(texts) != 2 {
+		t.Fatalf("failed set produced a note: %d notes, want 2", len(texts))
+	}
+}
+
 func TestTaskByPR_LookupAndMiss(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()
