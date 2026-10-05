@@ -86,13 +86,19 @@ func (Runner) PRMergeSquash(ctx context.Context, pr int) error {
 // created after since, oldest first. The API's `since` filters on update
 // time (edited old comments resurface), so the result is re-filtered on
 // created_at here — one fetch, exact window. A zero since returns every
-// comment (the reviewer-prompt caller).
+// comment (the reviewer-prompt caller): the since parameter is omitted
+// entirely — GitHub 422s on since=0001-01-01T00:00:00Z (MAQ-28).
 func (Runner) PRComments(ctx context.Context, pr int, since time.Time) ([]pipeline.PRComment, error) {
-	uri := fmt.Sprintf("repos/{owner}/{repo}/issues/%d/comments?per_page=100&since=%s",
-		pr, since.UTC().Format(time.RFC3339))
-	out, err := exec.CommandContext(ctx, "gh", "api", uri).Output()
+	uri := fmt.Sprintf("repos/{owner}/{repo}/issues/%d/comments?per_page=100", pr)
+	if !since.IsZero() {
+		uri += "&since=" + since.UTC().Format(time.RFC3339)
+	}
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "gh", "api", uri)
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("gh api issue comments %d: %w", pr, err)
+		return nil, fmt.Errorf("gh api issue comments %d: %s: %w", pr, strings.TrimSpace(stderr.String()), err)
 	}
 	return parseComments(out, since)
 }
