@@ -134,6 +134,18 @@ func TestReviewPromptBody_IncludesHumanComments(t *testing.T) {
 	}
 }
 
+func TestReviewPromptBody_CarriesPRHygieneRules(t *testing.T) {
+	// MAQ-29: every round prompt restates the PR hygiene rules so an
+	// all-lowercase title or missing What?/Why? sections draws
+	// request_changes even if the reviewer never re-reads AGENTS.md.
+	prompt := reviewPromptBody("tp", 1, "")
+	for _, want := range []string{"all-lowercase", "## What?", "## Why?"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing PR hygiene rule %q: %s", want, prompt)
+		}
+	}
+}
+
 // ---- DB-backed: verdict → PR comment ------------------------------------
 
 // seedPRReview: a review task with a PR URL, one review round recorded, a

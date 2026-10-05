@@ -29,20 +29,23 @@ This repo runs as a state machine: builder/fixer → independent review → reba
 
 ## PR descriptions
 
-Every PR opened in this repo (pipeline agent or human) MUST carry a description with exactly two sections:
+Every PR opened in this repo (pipeline agent or human) MUST obey two rules:
+
+1. **Title case.** The title reads in sentence/title case — never all-lowercase (e.g. `[MAQ-29] PR hygiene: capitalize PR titles`, not `[maq-29] pr hygiene: ...`).
+2. **Two-section body.** The description carries exactly two sections:
 
 ````markdown
-## what?
+## What?
 <Concrete summary of the change: files/behavior, not narrative.>
 
-## why?
+## Why?
 <Motivation: problem solved + reference to the Linear issue ID (MAQ-NN) it implements.>
 ````
 
-- `## what?` states observable behavior — what a reviewer will see change, without reading the diff.
-- `## why?` anchors the change to its task/spec; always cite the Linear issue ID.
+- `## What?` states observable behavior — what a reviewer will see change, without reading the diff.
+- `## Why?` anchors the change to its task/spec; always cite the Linear issue ID.
 
-`.github/pull_request_template.md` pre-fills this skeleton for human-opened PRs.
+`.github/pull_request_template.md` pre-fills this skeleton for human-opened PRs. A PR whose title is all-lowercase or whose body misses either section gets request_changes.
 
 ## First-run
 
@@ -136,4 +139,5 @@ All config via `.env` (loaded by `internal/config/Load()`). Key vars: `TELEGRAM_
 ## PR & ticket conventions
 
 - Every PR title carries its Linear issue identifier — keep the task title's `[MAQ-n]` prefix or append `(MAQ-n)`. A PR whose title lacks the identifier gets request_changes.
-- PR bodies follow `.github/pull_request_template.md` (`## what?` / `## why?`), pipeline and human PRs alike.
+- PR titles use sentence/title case — never all-lowercase.
+- PR bodies follow `.github/pull_request_template.md` (`## What?` / `## Why?`), pipeline and human PRs alike. A PR missing either section gets request_changes.
