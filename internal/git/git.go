@@ -202,6 +202,35 @@ func RevParse(dir, ref string) (string, error) {
 	return revParse(dir, ref)
 }
 
+// MergeBase returns the best common ancestor of two commits (git
+// merge-base). Used by the merge gate to diff a branch against the exact
+// point it forked from the base.
+func MergeBase(dir, a, b string) (string, error) {
+	cmd := exec.Command("git", "-C", dir, "merge-base", a, b)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git merge-base %s %s in %s: %w", a, b, dir, err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// DiffNameOnly lists the files changed between two commits (git diff
+// --name-only), one path per line, repo-root relative.
+func DiffNameOnly(dir, from, to string) ([]string, error) {
+	cmd := exec.Command("git", "-C", dir, "diff", "--name-only", from, to)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("git diff --name-only %s %s in %s: %w", from, to, dir, err)
+	}
+	var files []string
+	for _, line := range strings.Split(string(out), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			files = append(files, line)
+		}
+	}
+	return files, nil
+}
+
 // RefExists reports whether ref resolves (e.g. "origin/feature" before the
 // branch has ever been pushed — callers treat a missing remote ref as
 // "nothing to fast-path on", not as an error).

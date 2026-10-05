@@ -903,6 +903,43 @@ func ReleaseMergeEntry(pool *pgxpool.Pool, id int64) error {
 	return nil
 }
 
+// ReleaseStaleMergeEntries returns merge-queue entries stuck in 'merging'
+// with a claim older than the threshold back to 'pending', returning their
+// ids. A crashed executor (daemon or approve CLI killed mid-pass) never
+// releases or completes its claim, and nothing else would heal it: claims
+// are not leased, EnqueueMerge dedups on pending/merging ("vanished after
+// enqueue"), and every claimer only picks 'pending'. The threshold must
+// exceed the longest legitimate claim hold — one full pass: fetch/rebase +
+// CI check + quality gate (10m build + 10m test budgets) — so an in-flight
+// pass is never stolen out from under its executor.
+func ReleaseStaleMergeEntries(pool *pgxpool.Pool, olderThan time.Duration) ([]int64, error) {
+	ctx := context.Background()
+	rows, err := pool.Query(ctx, `
+		UPDATE merge_queue
+		SET    status = 'pending', started_at = NULL
+		WHERE  status = 'merging'
+		  AND  started_at IS NOT NULL
+		  AND  started_at < NOW() - $1::interval
+		RETURNING id
+	`, olderThan)
+	if err != nil {
+		return nil, fmt.Errorf("releasing stale merge entries: %w", err)
+	}
+	defer rows.Close()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("releasing stale merge entries: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("releasing stale merge entries: %w", err)
+	}
+	return ids, nil
+}
+
 // BumpMergeAttempts increments the retry counter of a merge queue entry and
 // returns the new count. The gh CI gate uses it to cap red-PR churn (EX-06).
 func BumpMergeAttempts(pool *pgxpool.Pool, id int64) (int, error) {
