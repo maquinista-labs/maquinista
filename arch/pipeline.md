@@ -233,7 +233,8 @@ so the PR page reads as a timeline while a round is mid-flight:
   round N picked this up - <first finding line>` — the reason is distilled
   from the reviewer's findings (`fixPickupReason`: first non-blank,
   non-`VERDICT:` line, capped at 120 chars; fallback "addressing review
-  findings")
+  findings"). A MAQ-30 comment-triggered round posts the same line with
+  the triggering comment as the reason (`commentPickupReason`)
 - merge leg (in `ProcessMergeGH`, after the human-gate/status/merger-episode
   guards pass): `🚀 [MAQ-n] merge gate running`
 
@@ -541,7 +542,8 @@ task via `tasks.pr_url`).
 
 - **Parser** (`ParseCommentCommand`) — first non-empty line, case-
   insensitive, tolerant of a leading `/` and whitespace. Anything else is
-  prose and ignored entirely (never claimed, never counted).
+  prose — which since MAQ-30 is itself a trigger candidate (see the
+  re-round leg, below), not dead traffic.
 - **Dispatch table** — verb → `CommentVerbHandler` via
   `RegisterCommentVerb`; `approve` and `resolve` ship. Adding a verb is exactly one
   registration call: parser, auth, resolution, idempotency and acks are
@@ -587,6 +589,57 @@ task via `tasks.pr_url`).
 - GitHub specifics live behind `pipeline.CommentSource` (interface:
   `PRComments` + `IsCollaborator` + `ReactToComment` + `PRHeadBranch`);
   production is the same gh CLI wrapper (`internal/gh`).
+
+### Comment-driven re-round (MAQ-30)
+
+A plain (non-verb) comment from an allowed login on a watched PR is itself
+a trigger: it re-opens a round on the task behind the PR (`reround.go`,
+routed from `DispatchCommentCommand` when the body parses as no verb). The
+target flow it closes: PR comment → round, so a parked task revives on
+human feedback and a human objection gates the merge.
+
+- **State machine** (`triggerCommentRound`) on the task behind the PR:
+  - `pending_approval` / `changes_requested` → a fresh **fixer round**
+    keyed to the current review episode (`fixer-<task>[-rN]`,
+    `pipeline-fixer` soul, same worktree/PR), the comment quoted as the
+    prompt's work order (plus the latest request_changes findings as
+    context, when a verdict row exists) and as the MAQ-25 pickup reason
+    (`commentPickupReason` — `fixPickupReason`'s line-walker applied to the
+    comment body; fallback "addressing human PR feedback"). A
+    `pending_approval` park is flipped to `changes_requested` in the same
+    tx that inserts the episode's fix row — the state every fixer leg
+    (watchdog arm, prompt heal, candidates) keys on. The existing loop
+    closure re-enters review; the cap still applies at the next verdict.
+  - `ready_to_merge` → guarded flip back to **review**; the dispatch loop's
+    spawn pass then mints the fresh reviewer (posting the MAQ-25 🔁 marker
+    and folding the comment into the prompt as MAQ-16 gate input). Any
+    PENDING `merge_queue` entry is failed in the same tx — the drain can
+    neither merge over the objection nor churn claim-and-release behind a
+    task that left `ready_to_merge` — and an entry already held in
+    `merging` wins (the flip is skipped; the objection was too late for
+    that drain).
+  - `review` → no-op (a round is in flight; the next prompt build reads the
+    comment). `done`, non-pipeline tasks, unknown statuses → no-op.
+- **Guards, in order** — bot authors (claimed no-op, no gh calls), the
+  shared auth (`PIPELINE_GH_ALLOWED_LOGINS` / collaborator fallback;
+  non-allowed claimed `unauthorized`), id-less task resolution, then per
+  leg: `worktree_path` non-empty (never bypassed — a round without a
+  worktree cannot spawn), pipeline task (`metadata.ticket_issue_id`), and
+  for the fixer leg the merger-episode guard (a rebase resolution in
+  flight must not be corrupted) plus the episode dedup shared with
+  `fixerCandidatesSQL` (live fixer pane, or a fix row for the current
+  episode → the comment rides the next reviewer prompt instead — one fixer
+  per review episode, never two rounds for one comment).
+- **Exactly-once** — the same `gh_comment_commands` claim (PK = GitHub
+  comment id), audited with verb `reround`; a verb comment is claimed
+  under the verb's own row first, so `maquinista approve` never ALSO
+  triggers a round. A comment never touches `review_rounds`, so it cannot
+  reset or bypass `MAQUINISTA_REVIEW_ROUNDS_MAX` — at cap the task parks
+  as today; each further cycle needs a fresh (claimable) comment.
+- **Notify** — the flip leg posts one 💬 one-liner ("back to review … the
+  objection gates the merge"); the fixer leg posts the MAQ-22 🔧
+  "fixer round N started — re-round on @<author>'s PR comment" one-liner,
+  deduped by the fix row exactly like the standard fixer's.
 
 ## Role souls
 
