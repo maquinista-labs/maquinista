@@ -165,15 +165,17 @@ func TestRunMergeDrainPass_AttemptsCapParksNeedsHuman(t *testing.T) {
 	gh := &fakeGh{checks: ChecksFailed}
 	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, MaxAttempts: 2, Gh: gh}
 
-	// Attempt 1 (below cap): silent release — no notify churn.
+	// Attempt 1 (below cap): released with the MAQ-22 gate-red one-liner —
+	// one per distinct red, bounded by the cap.
 	if processed, err := RunMergeDrainPass(ctx, pool, cfg, &fakeProvider{}, "team-1"); err != nil || !processed {
 		t.Fatalf("attempt 1: processed=%v err=%v", processed, err)
 	}
 	if got := entryStatus(t, pool, entry.ID); got != "pending" {
 		t.Fatalf("attempt 1: entry = %q, want released to pending", got)
 	}
-	if texts := pipelineNotifyTextsPool(t, pool); len(texts) != 0 {
-		t.Fatalf("attempt 1 notified: %q (below-cap release stays silent)", texts)
+	texts := pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 1 || !strings.Contains(texts[0], "gate red (ci)") || !strings.Contains(texts[0], "attempt 1/2") {
+		t.Fatalf("attempt 1 notified: %q, want exactly the gate-red one-liner", texts)
 	}
 
 	// Attempt 2 (at cap): entry failed, task parked, exactly one question.
@@ -189,9 +191,9 @@ func TestRunMergeDrainPass_AttemptsCapParksNeedsHuman(t *testing.T) {
 	if gh.mergeCalls != 0 {
 		t.Errorf("merge fired %d times on a red PR", gh.mergeCalls)
 	}
-	texts := pipelineNotifyTextsPool(t, pool)
-	if len(texts) != 1 || !strings.Contains(texts[0], "CI failed 2 times") {
-		t.Fatalf("attempt 2 notes = %q, want exactly one CI-cap question", texts)
+	texts = pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 2 || !strings.Contains(texts[1], "CI failed 2 times") {
+		t.Fatalf("attempt 2 notes = %q, want gate-red + exactly one CI-cap question", texts)
 	}
 }
 
