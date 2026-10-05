@@ -225,6 +225,12 @@ func RunCommentApprovals(ctx context.Context, pool *pgxpool.Pool, prov TicketPro
 	if interval <= 0 {
 		interval = 10 * time.Second
 	}
+	// MAQ-27: an empty approver list is a config accident made invisible —
+	// the poll runs green, nothing ever approves, no error anywhere. State
+	// it loudly once per start so the inert feature shows in the journal.
+	if len(ca.Approvers) == 0 {
+		log.Println("pipeline: comment approvals: MAQUINISTA_TICKETS_APPROVERS is empty — approve-by-comment is INERT (fail-closed); add comma-separated Linear emails/usernames to .env and restart")
+	}
 	log.Printf("pipeline: comment approvals polling every %s (%d approver(s) configured)", interval, len(ca.Approvers))
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

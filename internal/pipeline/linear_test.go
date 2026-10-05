@@ -230,6 +230,15 @@ func TestLinearProvider_RecentComments(t *testing.T) {
 	if !strings.Contains(cap.query, "comments(") || !strings.Contains(cap.query, "createdAt") {
 		t.Errorf("query %q does not fetch comments with a createdAt filter", cap.query)
 	}
+	// Schema types are load-bearing (MAQ-27): on this query [UUID!] and
+	// DateTime! are GraphQL type errors — Linear 400s every poll tick and
+	// the pass never sees a comment.
+	if !strings.Contains(cap.query, "$ids: [ID!]") || !strings.Contains(cap.query, "$since: DateTimeOrDuration") {
+		t.Errorf("query %q must declare vars with the Linear schema types [ID!] + DateTimeOrDuration", cap.query)
+	}
+	if strings.Contains(cap.query, "[UUID!]") || strings.Contains(cap.query, "DateTime!") {
+		t.Errorf("query %q uses GraphQL types Linear rejects ([UUID!]/DateTime! → 400 every tick)", cap.query)
+	}
 	ids, _ := cap.vars["ids"].([]any)
 	if len(ids) != 2 {
 		t.Errorf("vars.ids = %v, want both candidate issues", cap.vars["ids"])

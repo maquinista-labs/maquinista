@@ -623,7 +623,13 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   `maquinista approve`, punctuation-tolerant — prose mentioning the word
   never merges) → approver gate (`MAQUINISTA_TICKETS_APPROVERS`, email or
   display name, case-insensitive, empty = fail-closed) → consume →
-  approve.
+  approve. Linear's GraphQL is strict about variable types (MAQ-27): the
+  comments query must declare `$ids: [ID!]` and `$since:
+  DateTimeOrDuration` — `[UUID!]`/`DateTime!` are type errors that 400
+  every poll tick, and the poller logs the error without crashing (which
+  is how it spams instead of failing). An empty approver list logs an
+  explicit INERT warning once per start, so fail-closed never ships
+  silently.
 - **Exactly-once** — the comment id is consumed into `ticket_comment_log`
   (INSERT ON CONFLICT DO NOTHING + RETURNING) BEFORE the verb runs, so a
   second identical comment or a pagination overlap loses the race and never
