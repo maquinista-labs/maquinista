@@ -202,7 +202,7 @@ func LogBlockedReadyTasks(ctx context.Context, pool *pgxpool.Pool) (int, error) 
 // are left alone: DispatchOne's claim-TX release handles them when the
 // task is re-claimed.
 func ReapStaleClaims(ctx context.Context, pool *pgxpool.Pool) (int, error) {
-	tag, err := pool.Exec(ctx, `
+	rows, err := pool.Query(ctx, `
 		UPDATE tasks t
 		SET status = 'ready', claimed_by = NULL, claimed_at = NULL
 		WHERE t.status = 'claimed'
@@ -211,11 +211,30 @@ func ReapStaleClaims(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 		        SELECT 1 FROM agents a
 		        WHERE a.task_id = t.id AND a.status IN (`+liveAgentStatusSQL+`)
 		      )
+		RETURNING t.id
 	`)
 	if err != nil {
 		return 0, fmt.Errorf("reap stale claims: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+	defer rows.Close()
+	var reaped []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return 0, err
+		}
+		reaped = append(reaped, id)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, id := range reaped {
+		// MAQ-22: the guarded UPDATE above flips the row exactly once per
+		// release, so the requeue-after-heal one-liner is exactly-once too.
+		pipeline.Notifyf(ctx, pool, "🔄 %s: requeued to ready — stale claim healed (agent died mid-flight).",
+			pipeline.TaskTitle(ctx, pool, id))
+	}
+	return len(reaped), nil
 }
 
 // DispatchOne claims one ready task that has no live agent and routes it.
@@ -311,6 +330,18 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 		// Attempt to revert the task so it can be retried.
 		_, _ = pool.Exec(ctx, `UPDATE tasks SET status='ready' WHERE id=$1 AND status='claimed'`, taskID)
 		return true, fmt.Errorf("ensure_agent %s: %w", taskID, err)
+	}
+	// MAQ-22: the claim announces itself. The exactly-once guard is the
+	// guarded claim above (FOR UPDATE SKIP LOCKED + 'ready'→'claimed'
+	// flip): one winner per claim, one note. EnsureAgent returns a
+	// non-empty id on both outcomes — a freshly minted pane, or the
+	// already-live pane (ErrAgentAlreadyLive) that a racing spawn created
+	// and this claim then routes a fresh /work-on-task to — so both paths
+	// are genuine claims and both announce; the empty check below is
+	// defensiveness against a future EnsureAgent change, not the guard.
+	if agentID != "" {
+		pipeline.Notifyf(ctx, pool, "📋 %s: claimed by @%s (%s) — /work-on-task dispatched.",
+			pipeline.TaskTitle(ctx, pool, taskID), agentID, role)
 	}
 
 	// Enqueue the implementor's starting prompt + mark task.claimed_by.
