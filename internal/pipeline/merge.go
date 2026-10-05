@@ -10,6 +10,7 @@ package pipeline
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -38,9 +39,21 @@ const (
 	ChecksNone    = "none" // no checks configured — vacuously green
 )
 
+// ErrMergeUpConflict: the PR's base cannot be merged into the branch
+// cleanly — GitHub reports HTTP 422 on the update-branch endpoint (MAQ-26).
+// A deterministic conflict, not infrastructure: the local merge-up fallback
+// would conflict on the same three-way inputs, so it is skipped.
+var ErrMergeUpConflict = errors.New("merge-up conflict")
+
+// ErrMergeUpRace: the branch moved since the merge-up's expected head SHA
+// (HTTP 409) — e.g. a fixer pushed mid-flight. State changed underneath, so
+// the entry is released for a fresh pass instead of consuming budget.
+var ErrMergeUpRace = errors.New("merge-up race: branch moved")
+
 // GhRunner abstracts the GitHub side (gh CLI in production, a fake in
 // tests). Kept minimal: two reads, two writes (MAQ-16 added the PR-comment
-// pair — verdict posts + human-comment reads).
+// pair — verdict posts + human-comment reads; MAQ-26 added the branch
+// update for the auto merge-up).
 type GhRunner interface {
 	// PRChecks returns the aggregate state of the PR's CI checks.
 	PRChecks(ctx context.Context, pr int) (string, error)
@@ -52,6 +65,12 @@ type GhRunner interface {
 	PRComments(ctx context.Context, pr int, since time.Time) ([]PRComment, error)
 	// PRPostComment posts body as a new comment on the PR.
 	PRPostComment(ctx context.Context, pr int, body string) error
+	// PRUpdateBranch merges the PR's base branch into the PR branch (the
+	// "Update branch" button; MAQ-26). expectedHeadSHA is the branch tip the
+	// caller observed — GitHub rejects with HTTP 409 when the branch has
+	// moved (mapped to ErrMergeUpRace). A 422 — base cannot merge cleanly —
+	// maps to ErrMergeUpConflict.
+	PRUpdateBranch(ctx context.Context, pr int, expectedHeadSHA string) error
 }
 
 // MergeConfig carries the merge-mode knobs plus the GhRunner. Gh is nil in
@@ -290,7 +309,13 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	}
 	wt := info.WorktreePath
 
-	// 1. Sync the branch with the remote and rebase onto origin's default.
+	// MAQ-25: the merge leg's pickup marker on the PR — the gate is about
+	// to run for real (human gate, status guard and merger-episode guard
+	// all passed). Best effort, deduped once per PR by needle scan: the
+	// release-and-reclaim loop re-runs this pass per attempt.
+	postPickupComment(ctx, pool, cfg.Gh, taskID, mergePickupNeedle, mergePickupBody(taskIssueKey(ctx, pool, taskID)))
+
+	// 1. Sync the branch with the remote and fold the base in.
 	base, err := defaultBranch(wt)
 	if err != nil {
 		base = entry.BaseBranch
@@ -298,24 +323,60 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	if err := git.Fetch(wt, "origin"); err != nil {
 		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("git fetch failed: %v", err))
 	}
-	if _, err := git.Rebase(wt, "origin/"+base); err != nil {
-		conflictErr, ok := err.(*git.ConflictError)
-		if !ok {
-			return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("rebase onto %s failed: %v", base, err))
+	// Up-to-date fast path (MAQ-26): the remote branch already contains the
+	// base — a prior pass's clean rebase-push, or an auto merge-up waiting
+	// out its CI. Skip the rebase: it could only re-conflict (or silently
+	// drop the merge-up's merge commit) and re-push what is already on the
+	// remote. Everything downstream reads origin/<branch>, so what is gated
+	// and merged is exactly what GitHub holds. A branch never pushed at all
+	// (approve-verb paths work off a local-only branch) has nothing to
+	// fast-path on — the rebase leg runs and the push creates the ref.
+	upToDate := false
+	if exists, err := git.RefExists(wt, "origin/"+entry.Branch); err != nil {
+		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("mergeability check failed: %v", err))
+	} else if exists {
+		upToDate, err = git.IsAncestor(wt, "origin/"+base, "origin/"+entry.Branch)
+		if err != nil {
+			return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("mergeability check failed: %v", err))
 		}
-		// MAQ-15: under PIPELINE_MERGE_AGENT the conflict arms a merger
-		// episode (marker + released entry; the dispatch loop spawns the
-		// agent) instead of parking needs-human immediately.
-		if cfg.MergeAgent {
-			return armMergeConflictAgent(ctx, pool, cfg, entry, base, conflictErr)
+	}
+	if !upToDate {
+		if _, err := git.Rebase(wt, "origin/"+base); err != nil {
+			conflictErr, ok := err.(*git.ConflictError)
+			if !ok {
+				return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("rebase onto %s failed: %v", base, err))
+			}
+			// MAQ-15: under PIPELINE_MERGE_AGENT the conflict arms a merger
+			// episode (marker + released entry; the dispatch loop spawns the
+			// agent) instead of parking needs-human immediately.
+			if cfg.MergeAgent {
+				return armMergeConflictAgent(ctx, pool, cfg, entry, base, conflictErr)
+			}
+			// MAQ-26: otherwise attempt an automatic merge-up before any
+			// human gets pinged — a stale branch that merges cleanly heals
+			// here, on the branch ref, never in the task worktree.
+			return mergeUpAfterConflict(ctx, pool, cfg, prov, teamID, entry, info, wt, base, pr, conflictErr)
 		}
-		return parkMergeConflict(ctx, pool, taskID, entry, conflictErr)
+
+		// 2. Publish the rebased branch (lease-guarded force push).
+		if err := git.PushForceWithLease(wt, entry.Branch, "origin"); err != nil {
+			return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("push failed: %v", err))
+		}
 	}
 
-	// 2. Publish the rebased branch (lease-guarded force push).
-	if err := git.PushForceWithLease(wt, entry.Branch, "origin"); err != nil {
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("push failed: %v", err))
-	}
+	// 3–7. Gates, squash, bookkeeping, cleanup.
+	return finishMergeGH(ctx, pool, cfg, prov, teamID, entry, info, wt, base, pr)
+}
+
+// finishMergeGH runs steps 3–7 of the gh merge flow (CI gate → build gate →
+// squash-merge → bookkeeping → board sync → cleanup) for a branch whose
+// remote tip already contains the base: either the caller's clean rebase +
+// lease push, or an auto merge-up (MAQ-26) that folded the base in on the
+// ref. Every git read targets origin/<branch> — the remote state — never
+// the task worktree copy, which the merge-up path deliberately leaves
+// untouched (a fixer may be working there).
+func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, prov TicketProvider, teamID string, entry *db.MergeQueueEntry, info *taskMergeInfo, wt, base string, pr int) error {
+	taskID := entry.TaskID
 
 	// 3. CI gate: pending → release for a later pass; failed → park needs-human.
 	checks, err := cfg.Gh.PRChecks(ctx, pr)
@@ -375,8 +436,8 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		}
 		db.AddObservation(pool, taskID, "merger",
 			fmt.Sprintf("CI failed %d times on PR #%d — parked needs-human.", attempts, pr))
-		notifyf(ctx, pool, "🆘 %s: CI failed %d times on PR #%d — parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
-			TaskTitle(ctx, pool, taskID), attempts, pr, taskID, prLinkSuffix(ctx, pool, taskID))
+		notifyTaskf(ctx, pool, taskID, "🆘 %s: CI failed %d times on PR #%d — parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
+			taskTitle(ctx, pool, taskID), attempts, pr, taskID, prLinkSuffix(ctx, pool, taskID))
 		log.Printf("pipeline: merge %s CI failed %d times on PR #%d — parked needs-human", taskID, attempts, pr)
 		return nil
 	default:
@@ -423,8 +484,8 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	}
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("PR #%d squash-merged into %s (%s).", pr, base, mergeSHA))
-	notifyf(ctx, pool, "✅ %s merged: PR #%d squash-merged into %s (%s).%s",
-		TaskTitle(ctx, pool, taskID), pr, base, mergeSHA, prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "✅ %s merged: PR #%d squash-merged into %s (%s).%s",
+		taskTitle(ctx, pool, taskID), pr, base, mergeSHA, prLinkSuffix(ctx, pool, taskID))
 
 	// 6. Board sync (best-effort — the sync loop self-heals on next tick).
 	if prov != nil && info.IssueID != "" {
@@ -479,8 +540,8 @@ func parkMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID string, e
 	// EX-06: the needs-human question carries the conflict files so the
 	// human can decide without opening the worktree. (Conflict →
 	// merger-agent resolution stays deferred; the plan records why.)
-	notifyf(ctx, pool, "🆘 %s: rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.%s",
-		TaskTitle(ctx, pool, taskID), entry.Branch, strings.Join(conflictErr.Files, "\n"), prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.%s",
+		taskTitle(ctx, pool, taskID), entry.Branch, strings.Join(conflictErr.Files, "\n"), prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s conflict: %v", taskID, conflictErr)
 	return nil
 }
@@ -493,8 +554,8 @@ func failMerge(ctx context.Context, pool *pgxpool.Pool, entryID int64, taskID, m
 	if err := db.FailMerge(pool, entryID, msg); err != nil {
 		return fmt.Errorf("pipeline: failing merge %d: %w", entryID, err)
 	}
-	notifyf(ctx, pool, "⚠️ %s: merge failed — %s. The queue entry is failed; reply `approve %s` here (or comment `approve` on the ticket issue) to re-enqueue the merge.%s",
-		TaskTitle(ctx, pool, taskID), msg, shortTaskID(taskID), prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "⚠️ %s: merge failed — %s. The queue entry is failed; reply `approve %s` here (or comment `approve` on the ticket issue) to re-enqueue the merge.%s",
+		taskTitle(ctx, pool, taskID), msg, shortTaskID(taskID), prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s failed: %s", taskID, msg)
 	return nil
 }

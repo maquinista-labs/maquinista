@@ -27,7 +27,17 @@ const NotifyAgentID = "pipeline"
 // Pipeline topic — with the standard dedup/retry machinery; nothing here
 // knows about Telegram addressing.
 func Notify(ctx context.Context, pool *pgxpool.Pool, text string) error {
-	content, err := json.Marshal(map[string]string{"type": "text", "text": text})
+	return NotifyTask(ctx, pool, "", text)
+}
+
+// NotifyTask is Notify with the task reference stamped into the outbox
+// content ("task_id" key). The extra key is inert for every consumer — the
+// dispatcher renders "text" only, the dashboard reads it too — but it is
+// what makes a notification reply-commentable (MAQ-24): the bot resolves a
+// replied-to Telegram message back to the task via this key alone, never by
+// parsing notification prose.
+func NotifyTask(ctx context.Context, pool *pgxpool.Pool, taskID, text string) error {
+	content, err := json.Marshal(map[string]string{"type": "text", "text": text, "task_id": taskID})
 	if err != nil {
 		return fmt.Errorf("pipeline: notify encode: %w", err)
 	}
@@ -45,34 +55,51 @@ func Notify(ctx context.Context, pool *pgxpool.Pool, text string) error {
 	return tx.Commit(ctx)
 }
 
-// Notifyf is the exported fire-and-forget form used inside guarded
-// transition arms — including ones that live outside this package
-// (MAQ-22: the task scheduler's implementor claim / stale-claim requeue
-// and tools.SetPRUrl's PR-opened flip): a failed notification is logged,
-// never allowed to fail the pipeline transition it reports (the state
-// change is the system of record; the note is a courtesy).
-func Notifyf(ctx context.Context, pool *pgxpool.Pool, format string, args ...any) {
-	if err := Notify(ctx, pool, fmt.Sprintf(format, args...)); err != nil {
+// Notifyf is the fire-and-forget form used inside transition arms: a failed
+// notification is logged, never allowed to fail the pipeline transition it
+// reports (the state change is the system of record; the note is a courtesy).
+func notifyf(ctx context.Context, pool *pgxpool.Pool, format string, args ...any) {
+	notifyTaskf(ctx, pool, "", format, args...)
+}
+
+// notifyTaskf is notifyf for notes about one task: the task_id rides in the
+// outbox content so a Telegram reply to the note can be posted as a PR
+// comment (MAQ-24). Same fire-and-forget contract.
+func notifyTaskf(ctx context.Context, pool *pgxpool.Pool, taskID, format string, args ...any) {
+	if err := NotifyTask(ctx, pool, taskID, fmt.Sprintf(format, args...)); err != nil {
 		log.Printf("pipeline: notify: %v", err)
 	}
 }
 
-// notifyf is the in-package spelling of Notifyf.
-func notifyf(ctx context.Context, pool *pgxpool.Pool, format string, args ...any) {
-	Notifyf(ctx, pool, format, args...)
+// Notifyf is the exported fire-and-forget form for packages outside the
+// pipeline (taskscheduler park paths, MAQ-13): same contract — a failed
+// notification is logged, never fails the caller.
+func Notifyf(ctx context.Context, pool *pgxpool.Pool, format string, args ...any) {
+	notifyf(ctx, pool, format, args...)
 }
 
-// TaskTitle returns "<title> (<short-id>)" for summaries, tolerating a
+// NotifyTaskf is Notifyf for notes about one task, exported for the same
+// out-of-package callers: the note rides the task_id so a Telegram reply to
+// it lands as a PR comment (MAQ-24).
+func NotifyTaskf(ctx context.Context, pool *pgxpool.Pool, taskID, format string, args ...any) {
+	notifyTaskf(ctx, pool, taskID, format, args...)
+}
+
+// taskTitle returns "<title> (<short-id>)" for summaries, tolerating a
 // missing row (best-effort label, never a reason to fail the transition).
-// Exported for the MAQ-22 lifecycle one-liners emitted outside this
-// package (task scheduler claim/requeue, tools.SetPRUrl).
-func TaskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
+func taskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
 	var title string
 	if err := pool.QueryRow(ctx,
 		`SELECT title FROM tasks WHERE id = $1`, taskID).Scan(&title); err != nil {
 		return taskID
 	}
 	return fmt.Sprintf("%s (%s)", title, taskID)
+}
+
+// TaskTitle is the exported form for out-of-package callers that compose
+// their own notify notes (taskscheduler park paths, MAQ-13).
+func TaskTitle(ctx context.Context, pool *pgxpool.Pool, taskID string) string {
+	return taskTitle(ctx, pool, taskID)
 }
 
 // prLinkSuffix returns "\n🔗 PR: <url>" when the task has a pr_url, else "".
@@ -102,21 +129,23 @@ func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdi
 		label = TaskTitle(ctx, pool, taskID)
 	}
 	pr := prLinkSuffix(ctx, pool, taskID)
+	// MAQ-24: every verdict note carries the task_id in its outbox content —
+	// a plain reply to it lands as a PR comment.
 	switch {
 	case landed == "pending_approval":
-		notifyf(ctx, pool, "🆘 %s: review round cap %d reached (%s) — parked needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
+		notifyTaskf(ctx, pool, taskID, "🆘 %s: review round cap %d reached (%s) — parked needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
 			label, maxRounds, verdict, taskID, taskID, pr)
 	case verdict == VerdictApprove:
 		// MAQ-11: the proposal teaches the comment verbs (short id — typeable
 		// from a phone) instead of the CLI-only form. MAQ-10: the PR link
 		// rides along on every verdict.
-		notifyf(ctx, pool, "✅ %s approved (review round %d) → ready_to_merge. Merge proposal: reply `approve %s` here or comment `approve` on the ticket issue — or set PIPELINE_AUTO_MERGE=1 for autonomous merges.%s",
+		notifyTaskf(ctx, pool, taskID, "✅ %s approved (review round %d) → ready_to_merge. Merge proposal: reply `approve %s` here or comment `approve` on the ticket issue — or set PIPELINE_AUTO_MERGE=1 for autonomous merges.%s",
 			label, round, shortTaskID(taskID), pr)
 	case verdict == VerdictRequestChanges:
-		notifyf(ctx, pool, "🔁 %s: request_changes (review round %d) — fixer spawning.%s",
+		notifyTaskf(ctx, pool, taskID, "🔁 %s: request_changes (review round %d) — fixer spawning.%s",
 			label, round, pr)
 	default: // needs_human
-		notifyf(ctx, pool, "🆘 %s: reviewer escalated needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
+		notifyTaskf(ctx, pool, taskID, "🆘 %s: reviewer escalated needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
 			label, taskID, taskID, pr)
 	}
 }

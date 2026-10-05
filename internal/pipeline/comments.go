@@ -241,8 +241,8 @@ func approveCommentHandler(ctx context.Context, hc CommentContext) error {
 	// The merge flow posts its own result note; this one attributes the
 	// approval to the GitHub commenter. RunMergeOnApprove has already run
 	// the merge synchronously by the time this posts.
-	notifyf(ctx, hc.Pool, "👍 %s: approved via PR #%d comment by @%s — merge completed.",
-		TaskTitle(ctx, hc.Pool, hc.TaskID), hc.PR, hc.Actor)
+	notifyTaskf(ctx, hc.Pool, hc.TaskID, "👍 %s: approved via PR #%d comment by @%s — merge completed.",
+		taskTitle(ctx, hc.Pool, hc.TaskID), hc.PR, hc.Actor)
 	hc.ack(ctx)
 	return nil
 }
@@ -319,8 +319,8 @@ func resolveCommentHandler(ctx context.Context, hc CommentContext) error {
 		return fmt.Errorf("pipeline: resolve comment: record episode %s (merger %s spawned, prompt may be missing): %w",
 			hc.TaskID, agentID, err)
 	}
-	notifyf(ctx, hc.Pool, "🔧 %s: resolve session %s spawned (PR #%d, branch %s) by @%s — rebase + pending comments; approve re-merges after.",
-		TaskTitle(ctx, hc.Pool, hc.TaskID), agentID, hc.PR, branch, hc.Actor)
+	notifyTaskf(ctx, hc.Pool, hc.TaskID, "🔧 %s: resolve session %s spawned (PR #%d, branch %s) by @%s — rebase + pending comments; approve re-merges after.",
+		taskTitle(ctx, hc.Pool, hc.TaskID), agentID, hc.PR, branch, hc.Actor)
 	hc.ack(ctx)
 	return nil
 }

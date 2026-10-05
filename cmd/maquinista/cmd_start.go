@@ -497,6 +497,14 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			}
 			return out.Ran, out.Status, nil
 		})
+
+		// MAQ-24 reply comments: a plain reply to a pipeline notification in
+		// the Pipeline topic lands as a PR comment on the task's open PR.
+		// gh is the poster (the gh CLI account authors the comment, which is
+		// what makes MAQ-16's reviewer weigh it as human input).
+		b.SetPipelineReplyFunc(func(ctx context.Context, taskID, text string) (int, string, error) {
+			return pipeline.PostPRComment(ctx, pool, gh.New(), taskID, text)
+		})
 	}
 	if tCfg := pipeline.FromEnv(); tCfg.Enabled() && pool != nil {
 		// Review dispatch (EX-03): spawn zero-author reviewers for pipeline

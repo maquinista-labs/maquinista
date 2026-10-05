@@ -230,7 +230,7 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := verdictPass(ctx, pool, cfg.Gh, cfg.MaxReviewRounds, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: verdict pass: %v", err)
 		}
-		if err := fixerPass(ctx, pool, spawn, cfg.ImplementorIdleAfter); err != nil {
+		if err := fixerPass(ctx, pool, cfg.Gh, spawn, cfg.ImplementorIdleAfter); err != nil {
 			log.Printf("pipeline: dispatch: fixer pass: %v", err)
 		}
 		if err := mergerPass(ctx, pool, spawn); err != nil {
@@ -320,9 +320,15 @@ func dispatchPass(ctx context.Context, pool *pgxpool.Pool, g GhRunner, spawn Rev
 			log.Printf("pipeline: dispatch: spawn reviewer %s for %s: %v", agentID, c.taskID, err)
 			continue
 		}
-		if err := recordReviewRound(ctx, pool, g, agentID, c.taskID); err != nil {
+		round, err := recordReviewRound(ctx, pool, g, agentID, c.taskID)
+		if err != nil {
 			log.Printf("pipeline: dispatch: record round %s: %v", c.taskID, err)
+			continue
 		}
+		// MAQ-25: the round's pickup marker on the PR — best effort, before
+		// the reviewer starts work (a dead GitHub path never blocks the round).
+		postPickupComment(ctx, pool, g, c.taskID,
+			reviewPickupNeedle(round), reviewPickupBody(taskIssueKey(ctx, pool, c.taskID), round))
 		log.Printf("pipeline: dispatch: spawned reviewer %s for task %s (worktree %s)", agentID, c.taskID, c.worktree)
 	}
 	return nil
@@ -390,8 +396,8 @@ func retireStuckImplementor(ctx context.Context, pool *pgxpool.Pool, taskID stri
 	if tag.RowsAffected() == 0 {
 		return false, true, nil // raced to dead elsewhere — no notification
 	}
-	notifyf(ctx, pool, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.%s",
-		TaskTitle(ctx, pool, taskID), agentID, idleAfter, prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.%s",
+		taskTitle(ctx, pool, taskID), agentID, idleAfter, prLinkSuffix(ctx, pool, taskID))
 	return true, true, nil
 }
 
@@ -504,22 +510,22 @@ func ResolveExec(cfgRunner, extrasRunner, reasoningClass, modelHigh, modelStd st
 	return runner, modelStd
 }
 
-// recordReviewRound increments review_rounds and enqueues the review prompt.
-// Two commits, deliberately: the bump commits FIRST (its presence makes the
-// next tick a no-op for the spawn pass), then the prompt is built (the MAQ-16
-// human-comment fetch runs with NO transaction open — GitHub latency must
-// never hold a DB tx) and enqueued in its own tx. A crash between the two
-// heals via promptPass: the round's prompt row is missing and the heal's
-// EnqueueInbox dedup (origin_channel, external_msg_id) re-enqueues exactly
-// once.
-func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agentID, taskID string) error {
+// recordReviewRound increments review_rounds and enqueues the review prompt,
+// returning the round it recorded. Two commits, deliberately: the bump
+// commits FIRST (its presence makes the next tick a no-op for the spawn
+// pass), then the prompt is built (the MAQ-16 human-comment fetch runs with
+// NO transaction open — GitHub latency must never hold a DB tx) and enqueued
+// in its own tx. A crash between the two heals via promptPass: the round's
+// prompt row is missing and the heal's EnqueueInbox dedup (origin_channel,
+// external_msg_id) re-enqueues exactly once.
+func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agentID, taskID string) (int, error) {
 	var round int
 	if err := pool.QueryRow(ctx, `
 		UPDATE tasks SET review_rounds = review_rounds + 1
 		WHERE id = $1
 		RETURNING review_rounds
 	`, taskID).Scan(&round); err != nil {
-		return fmt.Errorf("bump review_rounds: %w", err)
+		return 0, fmt.Errorf("bump review_rounds: %w", err)
 	}
 	// MAQ-22: the round's claim announces itself exactly once — this bump
 	// runs once per spawned reviewer (the spawn pass's no-live-reviewer
@@ -535,11 +541,11 @@ func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agen
 		"prompt":  buildReviewPrompt(ctx, pool, g, taskID, round, agentID),
 	})
 	if err != nil {
-		return err
+		return round, err
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {
-		return err
+		return round, err
 	}
 	defer tx.Rollback(ctx)
 	_, _, err = mailbox.EnqueueInbox(ctx, tx, mailbox.InboxMessage{
@@ -551,9 +557,9 @@ func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agen
 		Content:       content,
 	})
 	if err != nil {
-		return err
+		return round, err
 	}
-	return tx.Commit(ctx)
+	return round, tx.Commit(ctx)
 }
 
 // reviewPromptBody is the per-round task briefing. The reviewer soul carries
@@ -840,7 +846,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration
 		}
 		if applied {
 			log.Printf("pipeline: dispatch: watchdog retired stalled reviewer %s on %s → needs_human", r.agentID, r.taskID)
-			notifyf(ctx, pool, "🆘 %s: %s%s", r.taskTitle,
+			notifyTaskf(ctx, pool, r.taskID, "🆘 %s: %s%s", r.taskTitle,
 				fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout),
 				prLinkSuffix(ctx, pool, r.taskID))
 			killReviewerPane(sessionName, r.session, r.window, killWindow)
@@ -859,7 +865,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration
 		}
 		if applied {
 			log.Printf("pipeline: dispatch: watchdog retired stalled fixer %s on %s → needs_human", r.agentID, r.taskID)
-			notifyf(ctx, pool, "🆘 %s: %s%s", r.taskTitle,
+			notifyTaskf(ctx, pool, r.taskID, "🆘 %s: %s%s", r.taskTitle,
 				fmt.Sprintf("watchdog: fix stalled past %s — needs human", timeout),
 				prLinkSuffix(ctx, pool, r.taskID))
 			killReviewerPane(sessionName, r.session, r.window, killWindow)
@@ -962,7 +968,7 @@ WHERE t.status = 'changes_requested'
 // reply; the tail keeps the prompt bounded).
 const maxFindingsChars = 6000
 
-func fixerPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner, idleAfter time.Duration) error {
+func fixerPass(ctx context.Context, pool *pgxpool.Pool, g GhRunner, spawn ReviewSpawner, idleAfter time.Duration) error {
 	rows, err := pool.Query(ctx, fixerCandidatesSQL)
 	if err != nil {
 		return err
@@ -1021,6 +1027,11 @@ func fixerPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner, idl
 			// Prompt miss heals on the next tick (fixerPromptHealSQL).
 			log.Printf("pipeline: dispatch: record fix episode %s: %v", c.taskID, err)
 		}
+		// MAQ-25: the episode's pickup marker on the PR — best effort, with
+		// the one-line reason distilled from the reviewer's findings.
+		postPickupComment(ctx, pool, g, c.taskID,
+			fixerPickupNeedle(round),
+			fixerPickupBody(taskIssueKey(ctx, pool, c.taskID), round, fixPickupReason(ctx, pool, c.reviewerAgent)))
 		log.Printf("pipeline: dispatch: spawned fixer %s for task %s (round %d, worktree %s)", agentID, c.taskID, round, c.worktree)
 	}
 	return fixerPromptPass(ctx, pool)

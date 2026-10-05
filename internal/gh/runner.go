@@ -86,13 +86,19 @@ func (Runner) PRMergeSquash(ctx context.Context, pr int) error {
 // created after since, oldest first. The API's `since` filters on update
 // time (edited old comments resurface), so the result is re-filtered on
 // created_at here — one fetch, exact window. A zero since returns every
-// comment (the reviewer-prompt caller).
+// comment (the reviewer-prompt caller): the since parameter is omitted
+// entirely — GitHub 422s on since=0001-01-01T00:00:00Z (MAQ-28).
 func (Runner) PRComments(ctx context.Context, pr int, since time.Time) ([]pipeline.PRComment, error) {
-	uri := fmt.Sprintf("repos/{owner}/{repo}/issues/%d/comments?per_page=100&since=%s",
-		pr, since.UTC().Format(time.RFC3339))
-	out, err := exec.CommandContext(ctx, "gh", "api", uri).Output()
+	uri := fmt.Sprintf("repos/{owner}/{repo}/issues/%d/comments?per_page=100", pr)
+	if !since.IsZero() {
+		uri += "&since=" + since.UTC().Format(time.RFC3339)
+	}
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "gh", "api", uri)
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("gh api issue comments %d: %w", pr, err)
+		return nil, fmt.Errorf("gh api issue comments %d: %s: %w", pr, strings.TrimSpace(stderr.String()), err)
 	}
 	return parseComments(out, since)
 }
@@ -136,6 +142,78 @@ func (Runner) PRPostComment(ctx context.Context, pr int, body string) error {
 		return fmt.Errorf("gh pr comment %d: %s: %w", pr, string(out), err)
 	}
 	return nil
+}
+
+// PRPostCommentURL posts body as a new PR comment and returns the comment's
+// URL (gh prints it on success) — the delivery confirmation the MAQ-24
+// Telegram-reply path quotes back into the Pipeline topic.
+func (r Runner) PRPostCommentURL(ctx context.Context, pr int, body string) (string, error) {
+	cmd := exec.CommandContext(ctx, "gh", "pr", "comment", fmt.Sprint(pr), "--body", body)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr comment %d: %w", pr, err)
+	}
+	return parsePRCommentURL(out)
+}
+
+// parsePRCommentURL extracts the comment URL from `gh pr comment` stdout
+// (e.g. https://github.com/o/r/pull/7#issuecomment-123456).
+func parsePRCommentURL(out []byte) (string, error) {
+	url := strings.TrimSpace(string(out))
+	if url == "" {
+		return "", fmt.Errorf("gh pr comment: empty output — no comment url")
+	}
+	if !strings.Contains(url, "#issuecomment-") {
+		return "", fmt.Errorf("gh pr comment: unexpected output %q — no comment url", url)
+	}
+	return url, nil
+}
+
+// PRUpdateBranch merges the PR's base branch into the PR branch via the
+// update-branch endpoint (the "Update branch" button). expectedHeadSHA makes
+// GitHub reject the request when the branch moved underneath us (HTTP 409).
+// A 422 — base cannot be merged into the branch cleanly — maps to
+// pipeline.ErrMergeUpConflict (a deterministic conflict, not infrastructure);
+// a 409 maps to pipeline.ErrMergeUpRace (state changed, retry from scratch).
+func (Runner) PRUpdateBranch(ctx context.Context, pr int, expectedHeadSHA string) error {
+	uri := fmt.Sprintf("repos/{owner}/{repo}/pulls/%d/update-branch", pr)
+	var stderr bytes.Buffer
+	cmd := exec.CommandContext(ctx, "gh", "api", uri, "-X", "PUT", "-f", "expected_head_sha="+expectedHeadSHA)
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if classified := parseUpdateBranchErr(stderr.String()); classified != nil {
+			return classified
+		}
+		return fmt.Errorf("gh api update-branch %d: %s: %w", pr, strings.TrimSpace(stderr.String()), err)
+	}
+	return nil
+}
+
+// parseUpdateBranchErr classifies an update-branch failure from gh's stderr:
+// 422 = base cannot merge into the branch cleanly; 409 = the head branch
+// moved since expected_head_sha. nil = everything else (infrastructure —
+// the caller decides).
+func parseUpdateBranchErr(stderr string) error {
+	switch {
+	case strings.Contains(stderr, "(HTTP 422"):
+		return pipeline.ErrMergeUpConflict
+	case strings.Contains(stderr, "(HTTP 409"):
+		return pipeline.ErrMergeUpRace
+	default:
+		return nil
+	}
+}
+
+// PRState returns the PR's state: "OPEN", "CLOSED" or "MERGED" (the MAQ-24
+// reply-comment guard: only an open PR accepts comments that a review round
+// will weigh).
+func (Runner) PRState(ctx context.Context, pr int) (string, error) {
+	out, err := exec.CommandContext(ctx, "gh", "pr", "view", fmt.Sprint(pr),
+		"--json", "state", "--jq", ".state").Output()
+	if err != nil {
+		return "", fmt.Errorf("gh pr view %d state: %w", pr, err)
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 // IsCollaborator reports whether login is a repo collaborator — the default

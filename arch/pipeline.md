@@ -19,10 +19,25 @@ provider implementation (`linear.go` for Linear).
 - `ClaimIssue` inserts, in ONE transaction:
   - a `tasks` row — status `ready`, project `MAQUINISTA_TICKETS_PROJECT`
     (fallback `MAQUINISTA_PROJECT`), title `[<Key>] <title>`, metadata
-    `ticket_issue_id` + `ticket_url`
+    `ticket_issue_id` + `ticket_url`, and — since MAQ-13 — `worktree_path`
+    pointing at the issue's sibling worktree
   - a `ticket_issue_map` row — `pending_state` = "In Progress"
 - the map row's primary key is the provider issue ID, so the INSERT **is**
   the claim: `ON CONFLICT DO NOTHING` + rollback makes re-claims no-ops
+- **Sibling worktree provisioning (MAQ-13):** before claiming, the bridge
+  provisions the issue's worktree (`EnsureIssueWorktree`,
+  `internal/pipeline/worktree.go`) — house convention: `<repoBase>.<slug>`
+  sibling of the repo root (e.g. `~/code/maquinista.maq13`), branch `<slug>`
+  (`maq13`), branched from `origin/main` (fallback `origin/HEAD`, `HEAD`);
+  slug = lowercased issue key with non-alphanumerics stripped. Idempotent:
+  existing worktrees are reused, existing branches are attached, non-git
+  directories at the target path are refused. The repo root comes from
+  `MAQUINISTA_TICKETS_REPO`, defaulting to the orchestrator cwd's git root;
+  unresolvable is logged once at startup. Provisioning is best effort: a
+  failure claims the task WITHOUT `worktree_path` and the task scheduler
+  parks it needs-human (below) — the loud path, never a spawn wedge. This
+  replaces the manual `git worktree add` + SQL fix the MAQ-9..12 incident
+  needed
 - claimed tasks flow through the task-scheduler → EnsureAgent → agent_inbox
   path (wired in `orchestrator start` since EX-07, see "Task scheduler"
   below); bridge tasks carry no `metadata.role` yet (default `implementor`,
@@ -49,6 +64,17 @@ implementor:
 - worktree guard: the task must have a usable `worktree_path` — SpawnFresh
   does not stat; a bad path fails the spawn with a readable error and
   DispatchOne reverts the task to `ready` for the next tick
+- **worktree-less park (MAQ-13):** a `ready` task with no `worktree_path` is
+  never claimed at all — DispatchOne parks it `pending_approval` inside the
+  claim tx with a `task_context` verdict note and ONE Pipeline-topic ping.
+  This replaced the old revert-to-`ready` loop that spun ensure_agent errors
+  at ~43 lines/sec during the MAQ-9..12 incident
+- **unspawnable backstop (MAQ-13):** `taskscheduler.ParkUnspawnable` runs on
+  every scheduler wake and parks `claimed` tasks that have no
+  `worktree_path`, no live agent, and have been claimed longer than
+  `MAQUINISTA_WORKTREE_GRACE` (default 10m) — legacy wedged rows and tasks
+  that lost the race between claim and ensure. Exactly once by guarded
+  transition (`claimed` → `pending_approval` + note in one tx)
 - id mint: `<role>-<taskID>[-rN]` via `pipeline.MintWorkerID` (same shape as
   the reviewer mint; role default `implementor`, overridable via
   `tasks.metadata->>'role'`)
@@ -183,9 +209,10 @@ verdict INPUT:
   `started_at` is the row's creation time). No prior reviewer row (round 1)
   = the PR-open baseline: every human comment counts.
 - **filters** — bot authors (all three spellings: `is_bot`, `__typename
-  Bot`, `[bot]` login suffix), the pipeline's own `[review round N]`
-  comments (the gh CLI may be authenticated as a human account, so the
-  marker — not the author — identifies them), blank bodies, and everything
+  Bot`, `[bot]` login suffix), the pipeline's own comments — the MAQ-16
+  `[review round N]` verdicts and the MAQ-25 pickup markers (the gh CLI may
+  be authenticated as a human account, so the marker — not the author —
+  identifies them; `isOwnPRComment`), blank bodies, and everything
   at/before the cutoff.
 - **framing** — the section is rendered explicitly as INPUT ONLY (never
   approve/request_changes verbs; the verb surface stays MAQ-11's
@@ -194,6 +221,28 @@ verdict INPUT:
   comments.
 - **degradation** — no `GhRunner` wired, no `pr_url`, or any gh failure →
   the prompt ships without the section; nothing else changes.
+
+**Spawn pickup markers (MAQ-25).** At spawn time — before the agent does
+any work — dispatch posts a one-line pickup comment on the task's open PR
+(`postPickupComment`, the MAQ-16 `PRComments`+`PRPostComment` transport),
+so the PR page reads as a timeline while a round is mid-flight:
+
+- reviewer round N (in the spawn pass, after the round bump): `🔁 [MAQ-n]
+  review round N started`
+- fixer episode (in the fixer pass, after the fix row): `🔧 [MAQ-n] fixer
+  round N picked this up - <first finding line>` — the reason is distilled
+  from the reviewer's findings (`fixPickupReason`: first non-blank,
+  non-`VERDICT:` line, capped at 120 chars; fallback "addressing review
+  findings")
+- merge leg (in `ProcessMergeGH`, after the human-gate/status/merger-episode
+  guards pass): `🚀 [MAQ-n] merge gate running`
+
+The `[MAQ-n]` tag is the task's Linear issue key (`ticket_issue_map
+.issue_key`, title-prefix fallback; keyless tasks ship without it). Exactly
+one comment per spawn: a round-scoped needle scan of the PR's existing
+comments (`reviewPickupNeedle` / `fixerPickupNeedle` / `mergePickupNeedle`)
+dedups reposts; every failure — no PR, gh outage — only logs and never
+blocks or fails the spawn/record path.
 
 **Verdict pass.** Scans each live reviewer's newest outbox rows for the
 contract verdict line (`ParseVerdict`, line-anchored, exact three-value
@@ -267,6 +316,8 @@ the backstop — and a stalled fixer is bounded the same way.
 | `MAQUINISTA_TICKETS_API_KEY` | ticket-system API key | required to enable |
 | `MAQUINISTA_TICKETS_TEAM_ID` | team/board id intake polls | required to enable |
 | `MAQUINISTA_TICKETS_PROJECT` | project_id stamped on claimed tasks | falls back to `MAQUINISTA_PROJECT` |
+| `MAQUINISTA_TICKETS_REPO` | repo root the bridge provisions sibling worktrees from (MAQ-13) | the orchestrator cwd's git root |
+| `MAQUINISTA_WORKTREE_GRACE` | how long an unspawnable claimed task (no worktree, no live agent) sits before the scheduler parks it needs-human | `10m` |
 | `MAQUINISTA_TICKETS_APPROVERS` | ticket-system identities (email or display name, comma-separated) allowed to drive comment verbs; empty = fail-closed | (nobody) |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
 | `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound (reviewers + fixers) | `2h` |
@@ -297,12 +348,14 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   with a PR URL and a worktree get an entry (branch derived from the
   worktree's HEAD, base from `origin/HEAD`).
 - **Processing** — `maquinista merge` (or the approve verb, below) claims an
-  entry and drives the remote: `fetch` → `rebase origin/<base>` →
-  `push --force-with-lease` → CI gate (`gh pr view statusCheckRollup`) →
-  `gh pr merge --squash`. After the squash lands: entry `merged` with the
-  squash SHA, task `ready_to_merge → done` with `pr_state=merged`, one
-  observation, a best-effort board push to Done, then worktree + local +
-  remote branch cleanup.
+  entry and drives the remote: `fetch` → up-to-date fast path (MAQ-26: if
+  `origin/<base>` is already an ancestor of `origin/<branch>`, skip the
+  rewrite) → `rebase origin/<base>` → `push --force-with-lease` → CI gate
+  (`gh pr view statusCheckRollup`) → `gh pr merge --squash`. After the
+  squash lands: entry `merged` with the squash SHA, task
+  `ready_to_merge → done` with `pr_state=merged`, one observation, a
+  best-effort board push to Done, then worktree + local + remote branch
+  cleanup.
 - **CI gate** — pending checks release the entry back to `pending` (a later
   pass retries); failed checks bump `attempts` and release below the cap
   with a `🟥 gate red (ci)` one-liner (MAQ-22 — one per distinct red,
@@ -329,6 +382,29 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   after a MAQ-15 conflict resolution. Added latency is one warm
   `go build ./...` (~60-90s on the box, inside the approve fast-path
   budget).
+- **Conflicts — auto merge-up leg (MAQ-26)** — with `PIPELINE_MERGE_AGENT=0`
+  (default), a rebase conflict no longer parks needs-human instantly: the
+  gate first tries an automatic merge-up, folding `origin/<base>` into the
+  BRANCH REF (never the task worktree — a fixer may be mid-episode in it).
+  GitHub's update-branch API first (`GhRunner.PRUpdateBranch`, with the
+  observed head SHA so a racing push 409s into a free re-release), then a
+  local fallback: `origin/<branch>` materialized in a detached throwaway
+  worktree (`maquinista-mergeup-*`), `--no-ff` merge of the base, published
+  as a strict fast-forward push. Success is re-verified (`origin/<base>`
+  must be an ancestor of `origin/<branch>` after a fetch — a claimed-but-
+  unsynced API success counts as a failure, never as mergeable) and the
+  normal gate → squash path resumes on the healed ref (the gates and
+  `finishMergeGH` read `origin/<branch>` throughout). Each FAILED attempt
+  consumes one unit of `merge_queue.mergeup_attempts` (migration 040,
+  deliberately separate from the CI/merger `attempts` budget) and comments
+  on the PR through `GhRunner.PRPostComment` — what was tried, the
+  conflicting files, the budget state. At the cap (N=2, a constant — a
+  tunable parking cap would be argued down) the conflict parks needs-human
+  exactly as before: a conflict surviving two merge-ups is a semantic
+  overlap, which is what the park is for (a `maquinista resolve` comment
+  still spawns a merger session). Below the cap the entry is released for
+  a later pass. The MAQ-15 merger-agent leg, when armed, takes precedence
+  and is unchanged.
 - **Conflicts — merger-agent leg (MAQ-15)** — under `PIPELINE_MERGE_AGENT=1`, a
   rebase conflict no longer parks immediately: the processor bumps the
   entry's `attempts` (the same budget as the CI cap), parks a
@@ -351,8 +427,8 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   guard on task status and on in-flight episodes (live merger or unconsumed
   marker → release untouched), so no merge can complete behind a
   needs-human verdict and no worktree is touched mid-resolution. With
-  `PIPELINE_MERGE_AGENT=0` (default) conflicts park needs-human exactly as
-  before.
+  `PIPELINE_MERGE_AGENT=0` (default) conflicts take the MAQ-26 merge-up leg
+  above.
 - **Human gate** — `PIPELINE_AUTO_MERGE=0` (default) makes every processing
   pass release the entry untouched; `maquinista approve <task>` on a
   `ready_to_merge` task runs the full flow immediately, overriding the gate
@@ -379,10 +455,12 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   `TaskTitle`; the dead-Telegram contract holds — a failed note is logged
   and never fails the transition it reports.
 - GitHub is behind `pipeline.GhRunner` (interface: `PRChecks`,
-  `PRMergeSquash`, plus MAQ-16's `PRComments` + `PRPostComment`); production
-  uses the gh CLI (`internal/gh`). The dispatch loop gets the same runner
-  wired in `orchestrator start` (`DispatchConfig.Gh`) for the MAQ-16 PR
-  surface; a nil runner disables it.
+  `PRMergeSquash`, MAQ-16's `PRComments` + `PRPostComment`, and MAQ-26's
+  `PRUpdateBranch` — the update-branch endpoint, whose 422/409 map to
+  `ErrMergeUpConflict`/`ErrMergeUpRace`); production uses the gh CLI
+  (`internal/gh`). The dispatch loop gets the same runner wired in
+  `orchestrator start` (`DispatchConfig.Gh`) for the MAQ-16 PR surface; a
+  nil runner disables it.
 
 ## GitHub comment commands (MAQ-12)
 
@@ -491,6 +569,11 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   agent, so ordinary agent conversations are never hijacked. The ack is
   immediate; the merge runs async and its outcome rides the standard
   notifier notes into the same topic.
+- **Reply comments (MAQ-24)** — a plain reply to a pipeline notification in
+  the Pipeline topic is posted verbatim as a PR comment on that task's open
+  PR (`internal/bot/pipeline_reply.go` intercept, after the verb arm;
+  `internal/pipeline/telegram_comment.go` for resolution/claim/post). See
+  "Telegram reply → PR comment" below.
 - **Ticket comments** — `RunCommentApprovals` polls at the sync cadence
   (10 s, same pass family). Each pass: ready_to_merge tasks with a
   `ticket_issue_map` row → `CommentFetcher.RecentComments` (optional
@@ -513,6 +596,40 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   Notes about `pending_approval` tasks (round cap, needs-human escalation,
   CI-cap) keep the CLI-only form — the comment verb deliberately does not
   act on `pending_approval`.
+
+## Telegram reply → PR comment (MAQ-24)
+
+Feedback no longer requires a browser: a non-verb reply to a pipeline
+notification in the Pipeline topic lands as a PR comment on that task's
+open PR, and the next review round weighs it through MAQ-16's existing
+human-comment machinery (the comment is authored by the gh CLI account and
+carries no `[review round N]` marker, so it counts as human INPUT
+unchanged).
+
+- **Target resolution, no prose parsing** — task-aware notifications stamp
+  their task id into the outbox content (`NotifyTask`/`notifyTaskf`; every
+  verdict/merge/watchdog note uses them). The bot resolves a replied-to
+  Telegram message via `channel_deliveries.external_msg_id` (the message id
+  the dispatcher recorded) → `agent_outbox` → `content->>'task_id'`. A miss
+  (not a notification, or a legacy row without the stamp) falls through to
+  the routing ladder exactly as before.
+- **Exactly-once** — `telegram_pr_comments` (migration `039`): PK
+  `(chat_id, message_id)`, the INSERT is the claim made BEFORE posting, so
+  a retried/redelivered update of the same reply never double-posts.
+  `disposition` audits the outcome (`ok` / `no_op` / `error`), and the
+  comment URL is stored + quoted back into the topic as the delivery
+  confirmation.
+- **Open-PR guard** — `pipeline.PostPRComment` gates on `tasks.pr_url`
+  being a GitHub pull URL and the PR state being OPEN (`gh pr view
+  --json state`); anything else is `ErrNoOpenPR` → one graceful "no open
+  PR" reply, nothing posted (AC: no-PR tasks are safe). gh specifics live
+  behind `pipeline.PRCommentPoster` (`PRState` + `PRPostCommentURL`);
+  production is the shared gh CLI wrapper (`internal/gh`), which captures
+  the comment URL `gh pr comment` prints.
+- **Verbs stay MAQ-11's** — the in-topic `approve <ref>` intercept runs
+  first (handlers.go ordering), and `maquinista <verb>`-shaped replies are
+  refused here: posting them would arm the MAQ-12 GitHub comment-command
+  surface from chat text. approve/reject/resolve behavior is unchanged.
 
 ## TODO
 

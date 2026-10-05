@@ -166,8 +166,8 @@ func armMergeConflictAgent(ctx context.Context, pool *pgxpool.Pool, cfg MergeCon
 		return err
 	}
 
-	notifyf(ctx, pool, "🔀 %s: rebase conflict on branch %s — merger agent resolving (attempt %d/%d). Conflicting files:\n%s%s",
-		TaskTitle(ctx, pool, taskID), entry.Branch, attempts, maxAttempts,
+	notifyTaskf(ctx, pool, taskID, "🔀 %s: rebase conflict on branch %s — merger agent resolving (attempt %d/%d). Conflicting files:\n%s%s",
+		taskTitle(ctx, pool, taskID), entry.Branch, attempts, maxAttempts,
 		strings.Join(conflictErr.Files, "\n"), prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s conflict: armed merger episode attempt %d/%d (%v)", taskID, attempts, maxAttempts, conflictErr)
 	return nil
@@ -326,8 +326,8 @@ func mergerSpawnPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawne
 			}
 			if applied {
 				log.Printf("pipeline: merger: stale episode on %s → needs_human", c.taskID)
-				notifyf(ctx, pool, "🆘 %s: merger episode (attempt %d) never dispatched — parked needs-human. Resolve by hand or re-approve.%s",
-					TaskTitle(ctx, pool, c.taskID), c.marker.Attempt, prLinkSuffix(ctx, pool, c.taskID))
+				notifyTaskf(ctx, pool, c.taskID, "🆘 %s: merger episode (attempt %d) never dispatched — parked needs-human. Resolve by hand or re-approve.%s",
+					taskTitle(ctx, pool, c.taskID), c.marker.Attempt, prLinkSuffix(ctx, pool, c.taskID))
 			}
 			continue
 		}
@@ -515,7 +515,7 @@ func mergerVerdictPass(ctx context.Context, pool *pgxpool.Pool, sessionName stri
 				if label == "" {
 					label = TaskTitle(ctx, pool, m.taskID)
 				}
-				notifyf(ctx, pool, "🔀 %s: merger agent resolved the rebase conflict (attempt %d) — re-entering the merge queue.%s",
+				notifyTaskf(ctx, pool, m.taskID, "🔀 %s: merger agent resolved the rebase conflict (attempt %d) — re-entering the merge queue.%s",
 					label, m.marker.Attempt, prLinkSuffix(ctx, pool, m.taskID))
 				log.Printf("pipeline: merger: verdict merged on %s (%s) — merge path resumes", m.taskID, m.agentID)
 			}
@@ -531,7 +531,7 @@ func mergerVerdictPass(ctx context.Context, pool *pgxpool.Pool, sessionName stri
 				if label == "" {
 					label = TaskTitle(ctx, pool, m.taskID)
 				}
-				notifyf(ctx, pool, "🆘 %s: merger agent could not resolve the rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.%s",
+				notifyTaskf(ctx, pool, m.taskID, "🆘 %s: merger agent could not resolve the rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.%s",
 					label, m.marker.Branch, strings.Join(m.marker.Files, "\n"), prLinkSuffix(ctx, pool, m.taskID))
 				log.Printf("pipeline: merger: verdict needs_human on %s (%s) — parked", m.taskID, m.agentID)
 			}
@@ -714,7 +714,7 @@ func mergerWatchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Du
 				label = TaskTitle(ctx, pool, m.taskID)
 			}
 			log.Printf("pipeline: merger: watchdog retired stalled merger %s on %s → needs_human", m.agentID, m.taskID)
-			notifyf(ctx, pool, "🆘 %s: %s%s", label, note, prLinkSuffix(ctx, pool, m.taskID))
+			notifyTaskf(ctx, pool, m.taskID, "🆘 %s: %s%s", label, note, prLinkSuffix(ctx, pool, m.taskID))
 			killReviewerPane(sessionName, m.session, m.window, killWindow)
 		}
 	}

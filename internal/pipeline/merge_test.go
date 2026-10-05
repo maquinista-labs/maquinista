@@ -29,6 +29,13 @@ type fakeGh struct {
 	mergeCalls int
 	mergeErr   error
 
+	updateCalls     int
+	updateErr       error
+	lastExpectedSHA string
+	// updateBranchFn, when updateErr is nil, stands in for GitHub performing
+	// the merge-and-push server-side (the fake cannot move git refs).
+	updateBranchFn func()
+
 	comments     []PRComment // returned by PRComments
 	commentsErr  error
 	postedBodies []string // bodies passed to PRPostComment, in order
@@ -50,6 +57,18 @@ func (f *fakeGh) PRPostComment(ctx context.Context, pr int, body string) error {
 		return f.postErr
 	}
 	f.postedBodies = append(f.postedBodies, body)
+	return nil
+}
+
+func (f *fakeGh) PRUpdateBranch(ctx context.Context, pr int, expectedHeadSHA string) error {
+	f.updateCalls++
+	f.lastExpectedSHA = expectedHeadSHA
+	if f.updateErr != nil {
+		return f.updateErr
+	}
+	if f.updateBranchFn != nil {
+		f.updateBranchFn()
+	}
 	return nil
 }
 
@@ -323,46 +342,386 @@ func TestProcessMergeGH_HappyPath(t *testing.T) {
 	}
 }
 
-// ---- rebase conflict (C5) ----
+// ---- MAQ-26: auto merge-up on rebase conflict ----
 
-func TestProcessMergeGH_Conflict(t *testing.T) {
-	pool := testPool(t)
-	_, worktree := initRemoteTrio(t, "conflict")
-	entry := seedReadyTask(t, pool, worktree)
-	taskID := entry.TaskID
-
-	// Advance main with a change that collides with the branch.
+// conflictingFixture advances main and the branch onto the same lines of
+// feature.txt — the shape that conflicts on rebase AND on merge (a
+// semantic overlap the merge-up must not paper over).
+func conflictingFixture(t *testing.T, worktree, branch string) {
+	t.Helper()
 	admin := gitRepoRoot(t, worktree)
 	gitRun(t, admin, "checkout", "main")
 	gitCommitFile(t, admin, "feature.txt", "main wins\n")
 	gitRun(t, admin, "push", "origin", "main")
 	gitCommitFile(t, worktree, "feature.txt", "branch wins\n")
-	gitRun(t, worktree, "push", "origin", entry.Branch)
+	gitRun(t, worktree, "push", "origin", branch)
+}
 
-	gh := &fakeGh{checks: ChecksGreen}
+// mergeableStalenessFixture builds the MAQ-26 healing shape: rebase
+// conflicts, but the branch's FINAL tree merges cleanly with main. Merge
+// base carries feature.txt v0 (the branch fast-forwards onto it before its
+// own commits); main rewrites line 1; the branch rewrites line 1 (C1 —
+// collides with main's edit → rebase conflict) then restores it to v0 and
+// appends a line (C2 — the branch's final tree no longer touches line 1 →
+// a merge of main is clean).
+func mergeableStalenessFixture(t *testing.T, admin, worktree, branch string) {
+	t.Helper()
+	gitRun(t, admin, "checkout", "main")
+	gitCommitFile(t, admin, "feature.txt", "line1\nline2\n") // merge-base v0
+	gitRun(t, admin, "push", "origin", "main")
+	gitRun(t, worktree, "fetch", "origin")
+	gitRun(t, worktree, "rebase", "origin/main") // ff the branch onto v0
+	gitCommitFile(t, worktree, "feature.txt", "branch-line1\nline2\n") // C1: rebase-conflicts
+	gitCommitFile(t, worktree, "feature.txt", "line1\nline2\nextra\n") // C2: merge-clean final tree
+	gitRun(t, worktree, "push", "origin", branch)
+	gitRun(t, admin, "fetch", "origin")
+	gitCommitFile(t, admin, "feature.txt", "main-line1\nline2\n")
+	gitRun(t, admin, "push", "origin", "main")
+}
+
+// fakeGitHubMergeUp performs the side effect GitHub's update-branch API has
+// on success: merge origin/base into origin/branch and push the merge
+// commit fast-forward — server-side, on the refs only.
+func fakeGitHubMergeUp(t *testing.T, admin, branch, base string) {
+	t.Helper()
+	wt := filepath.Join(t.TempDir(), "up")
+	gitRun(t, admin, "fetch", "origin")
+	gitRun(t, admin, "worktree", "add", "--detach", wt, "origin/"+branch)
+	defer func() {
+		gitRun(t, admin, "worktree", "remove", "--force", wt)
+		gitRun(t, admin, "worktree", "prune")
+	}()
+	gitRun(t, wt, "merge", "--no-ff", "-m",
+		fmt.Sprintf("Merge %s into %s (github update-branch)", base, branch), "origin/"+base)
+	gitRun(t, wt, "push", "origin", "HEAD:refs/heads/"+branch)
+}
+
+// assertNoMergeUpLeak is the merge-up mirror of assertNoGateLeak: no
+// throwaway merge-up worktree survives on disk or in the repo registry.
+func assertNoMergeUpLeak(t *testing.T, admin string) {
+	t.Helper()
+	if leftovers, _ := filepath.Glob(filepath.Join(os.TempDir(), mergeUpDirPrefix+"*")); len(leftovers) != 0 {
+		t.Errorf("merge-up worktree(s) leaked under %s: %v", os.TempDir(), leftovers)
+	}
+	if out := gitRun(t, admin, "worktree", "list", "--porcelain"); strings.Contains(out, mergeUpDirPrefix) {
+		t.Errorf("merge-up worktree still registered in the repo:\n%s", out)
+	}
+}
+
+func mergerObservations(t *testing.T, pool *pgxpool.Pool, taskID string) []string {
+	t.Helper()
+	rows, err := pool.Query(context.Background(),
+		`SELECT content FROM task_context WHERE task_id = $1 AND agent_id = 'merger' ORDER BY id`, taskID)
+	if err != nil {
+		t.Fatalf("reading merger observations: %v", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			t.Fatalf("scanning observation: %v", err)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+func mergeUpAttempts(t *testing.T, pool *pgxpool.Pool, id int64) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT mergeup_attempts FROM merge_queue WHERE id = $1`, id).Scan(&n); err != nil {
+		t.Fatalf("reading mergeup_attempts for %d: %v", id, err)
+	}
+	return n
+}
+
+// TestProcessMergeGH_Conflict (MAQ-26 rework of C5): a semantic overlap —
+// the same lines changed on both sides — fails BOTH merge-up mechanisms
+// deterministically. Below the cap: PR comment + released entry, task stays
+// ready_to_merge. At the cap (N=2): parked needs-human exactly as before.
+func TestProcessMergeGH_Conflict(t *testing.T) {
+	pool := testPool(t)
+	_, worktree := initRemoteTrio(t, "conflict")
+	entry := seedReadyTask(t, pool, worktree)
+	taskID := entry.TaskID
+	admin := gitRepoRoot(t, worktree)
+	conflictingFixture(t, worktree, entry.Branch)
+
+	// GitHub 422s the update-branch (base cannot merge cleanly) — the fake
+	// models the deterministic answer; the local fallback then really
+	// conflicts in git.
+	gh := &fakeGh{checks: ChecksGreen, updateErr: ErrMergeUpConflict}
+	prov := &fakeProvider{}
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}
+
+	// Attempt 1: conflict → comment on the PR, entry released, task NOT parked.
+	if err := ProcessMergeGH(context.Background(), pool, cfg, prov, "team-1", entry); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "pending" {
+		t.Fatalf("attempt 1: entry = %q, want released to pending", got)
+	}
+	if status, _ := taskRow(t, pool, taskID); status != "ready_to_merge" {
+		t.Fatalf("attempt 1: task = %s, want ready_to_merge (below cap)", status)
+	}
+	if n := mergeUpAttempts(t, pool, entry.ID); n != 1 {
+		t.Fatalf("attempt 1: mergeup_attempts = %d, want 1", n)
+	}
+	attempt1 := withoutPickup(gh.postedBodies)
+	if len(attempt1) != 1 || !strings.Contains(attempt1[0], "attempt 1/2") ||
+		!strings.Contains(attempt1[0], "feature.txt") {
+		t.Fatalf("attempt 1: PR comments = %q, want one attempt-1 comment naming feature.txt", gh.postedBodies)
+	}
+	// Worktree must be left usable (rebase aborted, merge-up never touched it).
+	if out := gitRun(t, worktree, "status", "--porcelain"); out != "" {
+		t.Errorf("worktree dirty after conflict: %q", out)
+	}
+	assertNoMergeUpLeak(t, admin)
+
+	// Attempt 2: same overlap → cap reached → parked needs-human, entry conflict.
+	claimed, err := db.ClaimMergeEntryByID(pool, entry.ID)
+	if err != nil || claimed == nil {
+		t.Fatalf("re-claim: %v (%v)", err, claimed)
+	}
+	if err := ProcessMergeGH(context.Background(), pool, cfg, prov, "team-1", claimed); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := taskRow(t, pool, taskID)
+	if status != "pending_approval" {
+		t.Errorf("attempt 2: task status = %q, want pending_approval (needs human)", status)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "conflict" {
+		t.Errorf("attempt 2: entry status = %q, want conflict", got)
+	}
+	if gh.mergeCalls != 0 || len(prov.calls) != 0 {
+		t.Errorf("merge/board must not fire on conflict (gh=%d, board=%v)", gh.mergeCalls, prov.calls)
+	}
+	attempt2 := withoutPickup(gh.postedBodies)
+	if len(attempt2) != 2 || !strings.Contains(attempt2[1], "attempt 2/2") {
+		t.Errorf("attempt 2: PR comments = %q, want one attempt-2 comment", gh.postedBodies)
+	}
+	if observationCount(t, pool, taskID, "merger") == 0 {
+		t.Error("expected a conflict observation")
+	}
+	if out := gitRun(t, worktree, "status", "--porcelain"); out != "" {
+		t.Errorf("worktree dirty after park: %q", out)
+	}
+}
+
+// TestProcessMergeGH_MergeUpHealsStaleBranch (MAQ-26 acceptance): rebase
+// conflicts but the branch's final tree merges cleanly — the GitHub
+// update-branch API folds main in on the ref, mergeability is re-checked,
+// and the gates + squash proceed. No human, no park.
+func TestProcessMergeGH_MergeUpHealsStaleBranch(t *testing.T) {
+	pool := testPool(t)
+	admin, worktree := initRemoteTrio(t, "heal")
+	entry := seedReadyTask(t, pool, worktree)
+	taskID := entry.TaskID
+	admin = gitRepoRoot(t, worktree)
+	mergeableStalenessFixture(t, admin, worktree, entry.Branch)
+
+	gh := &fakeGh{checks: ChecksGreen, updateBranchFn: func() {
+		fakeGitHubMergeUp(t, admin, entry.Branch, "main")
+	}}
 	prov := &fakeProvider{}
 	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}
 
 	if err := ProcessMergeGH(context.Background(), pool, cfg, prov, "team-1", entry); err != nil {
 		t.Fatal(err)
 	}
+	status, prState := taskRow(t, pool, taskID)
+	if status != "done" || prState != "merged" {
+		t.Fatalf("task = %s/%s, want done/merged (merge-up must heal)", status, prState)
+	}
+	if gh.updateCalls != 1 {
+		t.Errorf("update-branch calls = %d, want 1", gh.updateCalls)
+	}
+	if gh.lastExpectedSHA == "" {
+		t.Error("update-branch must carry the observed head SHA")
+	}
+	if n := len(withoutPickup(gh.postedBodies)); n != 0 {
+		t.Errorf("a healed merge-up must not comment, got %q", gh.postedBodies)
+	}
+	var found bool
+	for _, o := range mergerObservations(t, pool, taskID) {
+		if strings.Contains(o, "github update-branch") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected a merge-up observation naming the method")
+	}
+	assertNoMergeUpLeak(t, admin)
+}
 
-	status, _ := taskRow(t, pool, taskID)
-	if status != "pending_approval" {
-		t.Errorf("task status = %q, want pending_approval (needs human)", status)
+// TestProcessMergeGH_MergeUpLocalFallback: the update-branch API is down
+// (infrastructure error) → the local ref-merge fallback heals the staleness
+// with a real merge commit, pushed fast-forward from a throwaway worktree —
+// the task worktree stays untouched.
+func TestProcessMergeGH_MergeUpLocalFallback(t *testing.T) {
+	pool := testPool(t)
+	admin, worktree := initRemoteTrio(t, "fallback")
+	entry := seedReadyTask(t, pool, worktree)
+	taskID := entry.TaskID
+	admin = gitRepoRoot(t, worktree)
+	mergeableStalenessFixture(t, admin, worktree, entry.Branch)
+	staleTip := gitRun(t, worktree, "rev-parse", "HEAD")
+
+	gh := &fakeGh{checks: ChecksGreen, updateErr: errors.New("gh api hung up")}
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}
+
+	if err := ProcessMergeGH(context.Background(), pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
+		t.Fatal(err)
 	}
-	if got := entryStatus(t, pool, entry.ID); got != "conflict" {
-		t.Errorf("entry status = %q, want conflict", got)
+	if status, _ := taskRow(t, pool, taskID); status != "done" {
+		t.Fatalf("task = %s, want done (local fallback must heal)", status)
 	}
-	if gh.mergeCalls != 0 || len(prov.calls) != 0 {
-		t.Errorf("merge/board must not fire on conflict (gh=%d, board=%v)", gh.mergeCalls, prov.calls)
+	var found bool
+	for _, o := range mergerObservations(t, pool, taskID) {
+		if strings.Contains(o, "local merge") {
+			found = true
+		}
 	}
-	if observationCount(t, pool, taskID, "merger") == 0 {
-		t.Error("expected a conflict observation")
+	if !found {
+		t.Error("expected a merge-up observation naming the local method")
 	}
-	// Worktree must be left usable (rebase aborted, clean).
+	assertNoMergeUpLeak(t, admin)
+	_ = staleTip // (worktree removed post-merge; tip checked in the CI-pending test)
+}
+
+// TestProcessMergeGH_MergeUpUnverifiedCountsAsFailure: an update-branch 200
+// whose side effect did not land (stub without one) must NOT proceed — the
+// mergeability re-check counts the attempt, comments, releases.
+func TestProcessMergeGH_MergeUpUnverifiedCountsAsFailure(t *testing.T) {
+	pool := testPool(t)
+	_, worktree := initRemoteTrio(t, "unverified")
+	entry := seedReadyTask(t, pool, worktree)
+	taskID := entry.TaskID
+	conflictingFixture(t, worktree, entry.Branch)
+
+	gh := &fakeGh{checks: ChecksGreen} // updateErr nil → "success", but no side effect
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}
+
+	if err := ProcessMergeGH(context.Background(), pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "pending" {
+		t.Fatalf("entry = %q, want released to pending", got)
+	}
+	if n := mergeUpAttempts(t, pool, entry.ID); n != 1 {
+		t.Fatalf("mergeup_attempts = %d, want 1 (unverified success is a failure)", n)
+	}
+	if n := len(withoutPickup(gh.postedBodies)); n != 1 {
+		t.Fatalf("PR comments = %q, want one", gh.postedBodies)
+	}
+	if status, _ := taskRow(t, pool, taskID); status != "ready_to_merge" {
+		t.Errorf("task = %s, want ready_to_merge", status)
+	}
+}
+
+// TestProcessMergeGH_MergeUpThenCI: the healed branch waits out its CI on a
+// released entry; the next pass takes the up-to-date fast path (no rebase,
+// no re-push) straight through the gates. Also proves the worktree-discipline:
+// the checked-out task worktree keeps its stale tip while the ref moves.
+func TestProcessMergeGH_MergeUpThenCI(t *testing.T) {
+	pool := testPool(t)
+	admin, worktree := initRemoteTrio(t, "muci")
+	entry := seedReadyTask(t, pool, worktree)
+	taskID := entry.TaskID
+	admin = gitRepoRoot(t, worktree)
+	mergeableStalenessFixture(t, admin, worktree, entry.Branch)
+	staleTip := gitRun(t, worktree, "rev-parse", "HEAD")
+
+	gh := &fakeGh{checks: ChecksPending, updateBranchFn: func() {
+		fakeGitHubMergeUp(t, admin, entry.Branch, "main")
+	}}
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}
+
+	// Pass 1: healed, CI pending → released.
+	if err := ProcessMergeGH(context.Background(), pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "pending" {
+		t.Fatalf("pass 1: entry = %q, want released (CI pending)", got)
+	}
+	// Ref moved, worktree did not — the fixer in the pane never notices.
+	if got := gitRun(t, worktree, "rev-parse", "HEAD"); got != staleTip {
+		t.Errorf("worktree HEAD moved to %s, want stale %s", got, staleTip)
+	}
 	if out := gitRun(t, worktree, "status", "--porcelain"); out != "" {
-		t.Errorf("worktree dirty after conflict: %q", out)
+		t.Errorf("worktree dirty after merge-up: %q", out)
+	}
+
+	// Pass 2: CI green → fast path → merged.
+	gh.checks = ChecksGreen
+	claimed, err := db.ClaimMergeEntryByID(pool, entry.ID)
+	if err != nil || claimed == nil {
+		t.Fatalf("re-claim: %v (%v)", err, claimed)
+	}
+	if err := ProcessMergeGH(context.Background(), pool, cfg, &fakeProvider{}, "team-1", claimed); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := taskRow(t, pool, taskID)
+	if status != "done" {
+		t.Fatalf("pass 2: task = %s, want done", status)
+	}
+	if gh.updateCalls != 1 {
+		t.Errorf("update-branch calls = %d, want 1 (fast path must not re-merge)", gh.updateCalls)
+	}
+}
+
+// TestProcessMergeGH_MergeUpRace: the branch moved under the merge-up
+// (HTTP 409) — state changed, so the entry releases WITHOUT consuming
+// budget; the next pass re-fetches and re-decides.
+func TestProcessMergeGH_MergeUpRace(t *testing.T) {
+	pool := testPool(t)
+	_, worktree := initRemoteTrio(t, "race")
+	entry := seedReadyTask(t, pool, worktree)
+	conflictingFixture(t, worktree, entry.Branch)
+
+	gh := &fakeGh{checks: ChecksGreen, updateErr: ErrMergeUpRace}
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}
+
+	if err := ProcessMergeGH(context.Background(), pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
+		t.Fatal(err)
+	}
+	if got := entryStatus(t, pool, entry.ID); got != "pending" {
+		t.Fatalf("entry = %q, want released to pending", got)
+	}
+	if n := mergeUpAttempts(t, pool, entry.ID); n != 0 {
+		t.Errorf("mergeup_attempts = %d, want 0 (races are free)", n)
+	}
+	if n := len(withoutPickup(gh.postedBodies)); n != 0 {
+		t.Errorf("PR comments = %q, want none on a race", gh.postedBodies)
+	}
+}
+
+// TestProcessMergeGH_RebaseCleanStillPushes: a behind-but-mergeable branch
+// (non-overlapping change) still takes the rebase + lease-push leg — the
+// fast path is for refs that already contain the base, not a general skip.
+func TestProcessMergeGH_RebaseCleanStillPushes(t *testing.T) {
+	pool := testPool(t)
+	admin, worktree := initRemoteTrio(t, "rebase")
+	entry := seedReadyTask(t, pool, worktree)
+	taskID := entry.TaskID
+	admin = gitRepoRoot(t, worktree)
+
+	// Diverge non-overlapping: main edits README, branch adds feature.txt.
+	gitRun(t, admin, "checkout", "main")
+	gitCommitFile(t, admin, "README.md", "# main advanced\n")
+	gitRun(t, admin, "push", "origin", "main")
+	gitCommitFile(t, worktree, "feature.txt", "branch only\n")
+	gitRun(t, worktree, "push", "origin", entry.Branch)
+
+	gh := &fakeGh{checks: ChecksGreen}
+	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}
+	if err := ProcessMergeGH(context.Background(), pool, cfg, &fakeProvider{}, "team-1", entry); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := taskRow(t, pool, taskID); status != "done" {
+		t.Fatalf("task = %s, want done", status)
 	}
 }
 
@@ -602,4 +961,17 @@ func gitRepoRoot(t *testing.T, dir string) string {
 		t.Fatalf("common dir of %s: %v", dir, err)
 	}
 	return admin
+}
+
+// withoutPickup filters the MAQ-25 pickup marker ("merge gate running") out
+// of recorded PR comments: the marker is orthogonal to merge-up commentary,
+// and these tests assert only the latter.
+func withoutPickup(bodies []string) []string {
+	out := make([]string, 0, len(bodies))
+	for _, b := range bodies {
+		if !strings.Contains(b, mergePickupNeedle) {
+			out = append(out, b)
+		}
+	}
+	return out
 }

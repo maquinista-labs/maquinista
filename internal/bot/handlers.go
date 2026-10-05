@@ -36,6 +36,12 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 	if b.handlePipelineApproveText(msg) {
 		return
 	}
+	// Pipeline-topic reply comments (MAQ-24): a plain reply to a pipeline
+	// notification lands as a PR comment. Same placement constraints as the
+	// verb arm; non-replies fall through to the ladder untouched.
+	if b.handlePipelineReplyText(msg) {
+		return
+	}
 
 	cancelBashCapture(msg.From.ID, getThreadID(msg))
 

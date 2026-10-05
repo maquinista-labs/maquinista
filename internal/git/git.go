@@ -1,6 +1,7 @@
 package git
 
 import (
+	"errors"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -109,6 +110,16 @@ func WorktreeAdd(repoRoot, worktreeDir, branch string) error {
 	return nil
 }
 
+// WorktreeAddFrom creates a new worktree with a new branch starting at
+// startRef (e.g. "origin/main") instead of HEAD.
+func WorktreeAddFrom(repoRoot, worktreeDir, branch, startRef string) error {
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", "-b", branch, worktreeDir, startRef)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add -b %s %s %s: %s: %w", branch, worktreeDir, startRef, string(out), err)
+	}
+	return nil
+}
+
 // WorktreeAddDetached creates a detached worktree checked out at ref (a
 // commit-ish like "origin/main"), for throwaway verification builds — no
 // branch is created or checked out anywhere.
@@ -116,6 +127,15 @@ func WorktreeAddDetached(repoRoot, worktreeDir, ref string) error {
 	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", "--detach", worktreeDir, ref)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git worktree add --detach %s %s: %s: %w", worktreeDir, ref, string(out), err)
+	}
+	return nil
+}
+
+// WorktreeAttach creates a worktree checking out an existing branch.
+func WorktreeAttach(repoRoot, worktreeDir, branch string) error {
+	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", worktreeDir, branch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git worktree add %s %s: %s: %w", worktreeDir, branch, string(out), err)
 	}
 	return nil
 }
@@ -128,6 +148,14 @@ func WorktreePrune(repoRoot string) error {
 		return fmt.Errorf("git worktree prune in %s: %s: %w", repoRoot, string(out), err)
 	}
 	return nil
+}
+
+// RefExists reports whether ref resolves in dir (no-op quiet probe) — the
+// boolean convenience form of the (bool, error) variant below, for
+// best-effort probes like worktree base selection (MAQ-13) where an
+// unexpected git failure and "ref missing" degrade the same way.
+func RefExistsQuiet(dir, ref string) bool {
+	return exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", ref+"^{commit}").Run() == nil
 }
 
 // WorktreeRemove removes a worktree directory.
@@ -174,6 +202,28 @@ func RevParse(dir, ref string) (string, error) {
 	return revParse(dir, ref)
 }
 
+// RefExists reports whether ref resolves (e.g. "origin/feature" before the
+// branch has ever been pushed — callers treat a missing remote ref as
+// "nothing to fast-path on", not as an error).
+func RefExists(dir, ref string) (bool, error) {
+	cmd := exec.Command("git", "-C", dir, "rev-parse", "--verify", "--quiet", ref)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	switch {
+	case err == nil:
+		return true, nil
+	case err == exec.ErrNotFound:
+		return false, fmt.Errorf("git rev-parse: %w", err)
+	default:
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return false, nil // --quiet: documented code for "no such ref"
+		}
+		return false, fmt.Errorf("git rev-parse --verify %s in %s: %s: %w", ref, dir, strings.TrimSpace(stderr.String()), err)
+	}
+}
+
 // Rebase rebases the current branch onto upstream (e.g. "origin/main").
 // Returns the new HEAD SHA on success, or a *ConflictError if the rebase
 // hits conflicts (the rebase is aborted before returning, leaving the
@@ -198,6 +248,62 @@ func AbortRebase(dir string) error {
 	cmd := exec.Command("git", "-C", dir, "rebase", "--abort")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("git rebase --abort: %s: %w", string(out), err)
+	}
+	return nil
+}
+
+// MergeRefs merges fromRef into the current HEAD (which may be detached) as
+// a --no-ff merge commit. The committer identity is pinned so the command
+// never depends on ambient repo config (auto merge-up commits are
+// pipeline-authored by definition). Returns the merge commit SHA, or a
+// *ConflictError — with the merge aborted and HEAD left where it was — when
+// the merge conflicts.
+func MergeRefs(dir, fromRef, message string) (string, error) {
+	cmd := exec.Command("git", "-C", dir,
+		"-c", "user.name=maquinista-merger", "-c", "user.email=merger@maquinista.local",
+		"merge", "--no-ff", fromRef, "-m", message)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		outStr := string(out)
+		if strings.Contains(outStr, "CONFLICT") || strings.Contains(outStr, "Automatic merge failed") {
+			files := conflictFiles(dir)
+			AbortMerge(dir)
+			return "", &ConflictError{Files: files}
+		}
+		return "", fmt.Errorf("git merge --no-ff %s in %s: %s: %w", fromRef, dir, outStr, err)
+	}
+	return revParse(dir, "HEAD")
+}
+
+// IsAncestor reports whether ancestorRef is an ancestor of descendantRef —
+// the mergeability re-check for the auto merge-up (base contained in the
+// branch ref means the PR is no longer stale).
+func IsAncestor(dir, ancestorRef, descendantRef string) (bool, error) {
+	err := exec.Command("git", "-C", dir, "merge-base", "--is-ancestor", ancestorRef, descendantRef).Run()
+	switch {
+	case err == nil:
+		return true, nil
+	case err == exec.ErrNotFound:
+		return false, fmt.Errorf("git merge-base: %w", err)
+	default:
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return false, nil // documented code: not an ancestor
+		}
+		return false, fmt.Errorf("git merge-base --is-ancestor %s %s in %s: %w", ancestorRef, descendantRef, dir, err)
+	}
+}
+
+// PushHEAD pushes the current HEAD (typically a detached throwaway worktree)
+// to remote's branch as a strict fast-forward — no force. The auto merge-up
+// uses it to publish a merge commit created on top of the remote branch tip;
+// a non-fast-forward rejection (remote moved underneath) surfaces as a
+// normal error.
+func PushHEAD(dir, remote, branch string) error {
+	refspec := "HEAD:refs/heads/" + branch
+	cmd := exec.Command("git", "-C", dir, "push", remote, refspec)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git push %s %s in %s: %s: %w", remote, refspec, dir, string(out), err)
 	}
 	return nil
 }

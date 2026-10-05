@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/db"
@@ -367,7 +369,7 @@ func TestLogBlockedReadyTasks(t *testing.T) {
 	var logBuf syncBuffer
 	log.SetOutput(&logBuf)
 	n, err := LogBlockedReadyTasks(ctx, pool)
-	log.SetOutput(nil)
+	log.SetOutput(os.Stderr) // nil would leave the default logger panicking on the next log call
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,5 +547,110 @@ func TestHealMissingInbox_RepointsStaleRow(t *testing.T) {
 	pool.QueryRow(ctx, `SELECT agent_id, status FROM agent_inbox WHERE origin_channel='task' AND external_msg_id='task:T'`).Scan(&agentID, &status)
 	if agentID != "impl-T" || status != "pending" {
 		t.Errorf("agent=%q status=%q, want impl-T/pending", agentID, status)
+	}
+}
+
+// --- MAQ-13: unspawnable (worktree-less) tasks park needs-human exactly once.
+
+func TestDispatchOne_ParksWithoutWorktree(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	// Ready task with NO worktree_path — structurally unspawnable.
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status) VALUES ('T', 'x', 'ready')`)
+
+	ensureCalled := false
+	cfg := Config{
+		EnsureAgent: func(ctx context.Context, role, taskID string) (string, error) {
+			ensureCalled = true
+			return "impl-" + taskID, nil
+		},
+	}
+
+	ok, err := DispatchOne(ctx, pool, cfg)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if ensureCalled {
+		t.Error("EnsureAgent must not be called for a worktree-less task")
+	}
+
+	var status string
+	pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id='T'`).Scan(&status)
+	if status != "pending_approval" {
+		t.Errorf("status = %q, want pending_approval (parked needs-human)", status)
+	}
+	var notes int
+	pool.QueryRow(ctx, `SELECT count(*) FROM task_context WHERE task_id='T' AND kind='verdict'`).Scan(&notes)
+	if notes != 1 {
+		t.Errorf("task_context notes = %d, want exactly 1", notes)
+	}
+	var agents, inbox int
+	pool.QueryRow(ctx, `SELECT count(*) FROM agents WHERE task_id='T'`).Scan(&agents)
+	pool.QueryRow(ctx, `SELECT count(*) FROM agent_inbox WHERE external_msg_id='task:T'`).Scan(&inbox)
+	if agents != 0 || inbox != 0 {
+		t.Errorf("agents=%d inbox=%d, want 0/0 (no half-spawned pane)", agents, inbox)
+	}
+	// Pipeline topic ping: exactly one outbox row on the synthetic notifier.
+	var pings int
+	pool.QueryRow(ctx, `SELECT count(*) FROM agent_outbox WHERE agent_id='pipeline' AND content->>'text' LIKE '%T%'`).Scan(&pings)
+	if pings != 1 {
+		t.Errorf("pipeline pings = %d, want 1", pings)
+	}
+}
+
+func TestDispatchOne_WorktreelessTaskNotReclaimed(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status) VALUES ('T', 'x', 'ready')`)
+	cfg := Config{EnsureAgent: func(ctx context.Context, role, taskID string) (string, error) {
+		return "impl-" + taskID, nil
+	}}
+
+	// First dispatch parks it; a second tick must find nothing (no loop).
+	if ok, err := DispatchOne(ctx, pool, cfg); err != nil || !ok {
+		t.Fatalf("first: ok=%v err=%v", ok, err)
+	}
+	if ok, _ := DispatchOne(ctx, pool, cfg); ok {
+		t.Error("parked task must not be re-claimed")
+	}
+}
+
+func TestParkUnspawnable_GraceAndOnce(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+
+	// Old claimed task, no worktree, no live agent → parked.
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, claimed_at) VALUES ('OLD', 'x', 'claimed', NOW() - interval '20 minutes')`)
+	// Young claimed task → still inside grace, left alone.
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, claimed_at) VALUES ('NEW', 'x', 'claimed', NOW())`)
+	// Old claimed task WITH worktree → has nothing to do with this pass.
+	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, claimed_at, worktree_path) VALUES ('WT', 'x', 'claimed', NOW() - interval '20 minutes', $1)`, t.TempDir())
+
+	parked, err := ParkUnspawnable(ctx, pool, 10*time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parked != 1 {
+		t.Fatalf("parked=%d, want 1", parked)
+	}
+	var status string
+	pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id='OLD'`).Scan(&status)
+	if status != "pending_approval" {
+		t.Errorf("OLD status=%q, want pending_approval", status)
+	}
+	pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id='NEW'`).Scan(&status)
+	if status != "claimed" {
+		t.Errorf("NEW status=%q, want claimed (inside grace)", status)
+	}
+	pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id='WT'`).Scan(&status)
+	if status != "claimed" {
+		t.Errorf("WT status=%q, want claimed (has worktree)", status)
+	}
+
+	// Exactly once: second pass finds nothing to park.
+	if parked, _ := ParkUnspawnable(ctx, pool, 10*time.Minute); parked != 0 {
+		t.Errorf("second pass parked=%d, want 0", parked)
 	}
 }

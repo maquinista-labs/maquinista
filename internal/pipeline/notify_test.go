@@ -34,11 +34,11 @@ func TestNotifyf_SwallowsDeadPool(t *testing.T) {
 	pool := testPool(t)
 	pool.Close() // subsequent ops error
 
-	notifyf(context.Background(), pool, "this must not panic: %d", 42)
+	Notifyf(context.Background(), pool, "this must not panic: %d", 42)
 }
 
 // TestNotify_MissingPipelineAgentFails: without migration 036's seed the
-// FK fails — Notify surfaces the error (notifyf logs it).
+// FK fails — Notify surfaces the error (Notifyf logs it).
 func TestNotify_MissingPipelineAgentFails(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
@@ -243,7 +243,7 @@ func TestReviewRound_NotifyClaimed(t *testing.T) {
 	seedReviewTask(t, pool, "tc", "uuid-c", "/tmp/wt")
 	seedReviewer(t, pool, "reviewer-tc", "tc")
 
-	if err := recordReviewRound(ctx, pool, nil, "reviewer-tc", "tc"); err != nil {
+	if _, err := recordReviewRound(ctx, pool, nil, "reviewer-tc", "tc"); err != nil {
 		t.Fatalf("recordReviewRound: %v", err)
 	}
 	texts := pipelineNotifyTextsPool(t, pool)
@@ -257,7 +257,7 @@ func TestReviewRound_NotifyClaimed(t *testing.T) {
 	}
 
 	// A second bump (the next round's reviewer) announces the NEW round.
-	if err := recordReviewRound(ctx, pool, nil, "reviewer-tc", "tc"); err != nil {
+	if _, err := recordReviewRound(ctx, pool, nil, "reviewer-tc", "tc"); err != nil {
 		t.Fatalf("recordReviewRound 2: %v", err)
 	}
 	texts = pipelineNotifyTextsPool(t, pool)

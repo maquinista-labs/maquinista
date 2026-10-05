@@ -213,6 +213,13 @@ re-read pass never re-notifies (exactly-once per verdict/merge outcome).
 Notification failures are logged and swallowed: a dead Telegram path never
 fails a pipeline pass.
 
+Task-aware notes (`pipeline.NotifyTask`) additionally stamp `task_id` into
+the outbox content — inert for rendering (the dispatcher reads `text`
+only), but it is what makes a notification **reply-commentable** (MAQ-24):
+replied-to Telegram message id → `channel_deliveries` → outbox → task_id,
+and the reply lands as a PR comment (see `arch/pipeline.md`, "Telegram
+reply → PR comment").
+
 ## in_reply_to is a routing hint, not required
 
 The relay's binding leg does not need `in_reply_to`. An agent with an
