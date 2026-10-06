@@ -284,6 +284,39 @@ func TestHealRestartCohort(t *testing.T) {
 	}
 }
 
+// TestHealRestartCohort_PostBootTranscriptSpared pins the sweep's MAQ-9
+// veto: a pre-boot row (last_seen predates the boot, past the spawn grace,
+// zero outbox rows ever) whose transcript GREW after the boot is a pane
+// that survived the crash and is mid-turn — the monitor re-bound it and it
+// streams tool events, not outbox text. Not a ghost; the sweep must leave
+// it to the continuous arms.
+func TestHealRestartCohort_PostBootTranscriptSpared(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+	boot := time.Now()
+
+	seedClaim(t, pool, "GS", "impl-gs")
+	exec(t, pool, `
+		UPDATE agents SET last_seen = $1,
+		                  last_transcript_at = $2
+		WHERE id='impl-gs'
+	`, boot.Add(-time.Minute), boot.Add(time.Minute))
+
+	healed, err := HealRestartCohort(ctx, pool, boot, 10*time.Minute, "maquinista", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if healed != 0 {
+		t.Fatalf("healed = %d, want 0 (post-boot transcript growth = alive)", healed)
+	}
+	if got := agentStatus(t, pool, "impl-gs"); got != "running" {
+		t.Fatalf("streaming survivor status = %q, want running", got)
+	}
+	if n := pipelineNotifyCount(t, pool, "restart cohort"); n != 0 {
+		t.Fatalf("🆘 notes = %d, want 0 (a spared agent is never notified)", n)
+	}
+}
+
 // TestHealRestartCohort_EmptyWhenClean: a graceful stop deletes task agents
 // outright, so a clean restart sweeps nothing.
 func TestHealRestartCohort_EmptyWhenClean(t *testing.T) {

@@ -111,10 +111,13 @@ implementor:
   retire) so the reaper's all-rows-non-live check passes on the same wake
   and the claim requeues to `ready` for a fresh `-rN` implementor.
   `HealRestartCohort` runs once at unit start: live task rows whose
-  `last_seen` predates the boot and that never streamed (the crash-
-  restart cohort) are healed on the first pass — implementor ghosts via
+  `last_seen` predates the boot and that never signaled post-boot — no
+  outbox row ever AND no transcript growth since the boot (the crash-
+  restart cohort) — are healed on the first pass — implementor ghosts via
   the reaper, reviewer ghosts via dispatchPass, fixer episodes re-armed
-  (fix row released atomically with the retire), newborns spared
+  (fix row released atomically with the retire), newborns spared; a pane
+  that survived the crash and is mid-turn re-binds and streams, so its
+  post-boot transcript growth vetoes the heal (MAQ-9, boot-relative)
 
 The standalone `maquinista task-scheduler` subcommand keeps the
 orchestrator.EnsureAgent stub (row-only, no pty) for debugging alongside a
@@ -332,9 +335,13 @@ notifies; silence is never a heal. The merger freeze still parks
 needs-human (the money path keeps a human gate). A **restart-cohort sweep**
 (`taskscheduler.HealRestartCohort`) runs once at unit start: live task rows
 whose `last_seen` predates the boot (crash restart — a graceful stop
-deletes task agents outright) and that never streamed a single outbox row
-are healed on the first pass instead of waiting for a human to notice a
-stalled board; rows younger than the spawn grace are left to the
+deletes task agents outright) and that never signaled post-boot — no
+outbox row ever AND no transcript growth since the boot — are healed on
+the first pass instead of waiting for a human to notice a stalled board.
+The boot-relative transcript veto keeps the sweep honest about panes that
+SURVIVED the crash: one that is mid-turn re-binds and streams tool events
+(never outbox text) moments after start, and growth since the boot is
+liveness — not a ghost. Rows younger than the spawn grace are left to the
 continuous arm (the 04/10 lesson: never murder a newborn on sight). The
 malformed-verdict case is still left to the watchdog: the parser never
 guesses, the freeze bound is the backstop.

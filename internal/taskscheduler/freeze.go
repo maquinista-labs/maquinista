@@ -15,12 +15,16 @@
 //   - HealRestartCohort runs once at unit start (MAQ-31 AC 3): live
 //     task-scoped rows whose last_seen predates THIS process (crash
 //     restart — a graceful `maquinista stop` deletes task agents outright)
-//     and that never streamed a single outbox row are the frozen cohort the
-//     previous process left behind; they are healed on the first pass
-//     instead of waiting for a human to notice a stalled board. Rows
-//     younger than SpawnGrace are left to the continuous arm: a newborn
-//     mid-boot at crash time is not provably frozen (the 04/10
-//     newborn-kill class — never murder on sight).
+//     and that never signaled post-boot — no outbox row ever AND no
+//     transcript growth since the boot — are the frozen cohort the previous
+//     process left behind; they are healed on the first pass instead of
+//     waiting for a human to notice a stalled board. The transcript veto
+//     (same MAQ-9 channel the continuous arms honor) keeps the boot-race
+//     honest: a pane that SURVIVED the crash and is mid-turn re-binds and
+//     streams tool events within moments, while a true ghost's transcript
+//     froze with the old process. Rows younger than SpawnGrace are left to
+//     the continuous arm: a newborn mid-boot at crash time is not provably
+//     frozen (the 04/10 newborn-kill class — never murder on sight).
 //
 // Freeze semantics are documented in pipeline/freeze.go; this file only
 // applies them to the claimed/implementor phase.
@@ -86,8 +90,14 @@ func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 }
 
 // restartCohortSQL: live task-scoped rows that predate `boot` ($1) and
-// never streamed a single outbox row — the crash-restart cohort. Rows
-// younger than the spawn grace ($2) are excluded: not provably frozen.
+// never signaled post-boot — no outbox row ever AND no transcript growth
+// since the boot — the crash-restart cohort. Rows younger than the spawn
+// grace ($2) are excluded: not provably frozen. The last_transcript_at
+// clause is the MAQ-9 veto in boot-relative form: a pre-boot pane that
+// survived the crash and is mid-turn streams tool events (never outbox
+// text) as soon as the monitor re-binds it; killing it on a last_seen
+// technicality would be the newborn-kill class in an older disguise. A
+// true ghost's transcript froze with the old process — veto passes.
 const restartCohortSQL = `
 SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title
 FROM agents a
@@ -97,7 +107,8 @@ WHERE a.task_id IS NOT NULL
   AND a.last_seen < $1
   AND a.started_at < NOW() - make_interval(secs => $2)
   AND NOT EXISTS (
-        SELECT 1 FROM agent_outbox o WHERE o.agent_id = a.id)`
+        SELECT 1 FROM agent_outbox o WHERE o.agent_id = a.id)
+  AND (a.last_transcript_at IS NULL OR a.last_transcript_at < $1)`
 
 // HealRestartCohort sweeps the crash-restart cohort once, at unit start.
 // The per-role re-dispatch needs no special casing beyond the shared retire
