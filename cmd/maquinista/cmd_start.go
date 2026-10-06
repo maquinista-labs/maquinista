@@ -523,6 +523,13 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		go func() {
 			if err := taskscheduler.Run(ctx, pool, taskscheduler.Config{
 				EnsureAgent: ensureTaskWorker(pool, cfg, sidecarMgr),
+				// MAQ-31 freeze arms: pane cleanup on auto-retires.
+				SessionName: cfg.TmuxSessionName,
+				KillWindow:  tmux.KillWindow,
+				// Restart-cohort sweep grace derives from the monitor's
+				// cadence: the sweep must not run before the monitor's first
+				// poll, or the boot-relative transcript veto is dead code.
+				MonitorPollInterval: time.Duration(cfg.MonitorPollInterval * float64(time.Second)),
 			}); err != nil && ctx.Err() == nil {
 				log.Printf("task-scheduler: %v", err)
 			}

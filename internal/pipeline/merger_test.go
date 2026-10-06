@@ -555,7 +555,7 @@ func TestMergerPass_StaleMarkerParks(t *testing.T) {
 
 // ---- watchdog ----
 
-func TestMergerWatchdog_ParksStalledMerger(t *testing.T) {
+func TestMergerWatchdog_ParksFrozenMerger(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	taskID := fmt.Sprintf("t-%d", nextTaskNum())
@@ -574,7 +574,7 @@ func TestMergerWatchdog_ParksStalledMerger(t *testing.T) {
 	seedMerger(t, pool, "merger-"+taskID, taskID, "")
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - INTERVAL '3 hours' WHERE id = $1`, "merger-"+taskID)
 
-	if err := mergerWatchdogPass(ctx, pool, 2*time.Hour, "sess", nil); err != nil {
+	if err := mergerWatchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
 		t.Fatal(err)
 	}
 	if status, _ := taskRow(t, pool, taskID); status != "pending_approval" {

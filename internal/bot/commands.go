@@ -295,7 +295,7 @@ func (b *Bot) handleTopicClose(msg *tgbotapi.Message) {
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_, _ = pool.Exec(ctx, `
 				UPDATE agents SET status='stopped', last_seen=NOW()
-				WHERE tmux_session=$1 AND tmux_window=$2
+				WHERE tmux_session=$1 AND tmux_window=$2 AND status <> 'dead'
 			`, b.config.TmuxSessionName, windowID)
 			cancel()
 		}
@@ -364,7 +364,6 @@ func (b *Bot) handleTopicClose(msg *tgbotapi.Message) {
 func (b *Bot) SetMonitorState(ms *state.MonitorState) {
 	b.monitorState = ms
 }
-
 
 // windowIDFromKey extracts the window ID from a session map key ("session:@N" → "@N").
 func windowIDFromKey(key string) string {

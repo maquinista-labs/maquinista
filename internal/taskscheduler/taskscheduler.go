@@ -40,6 +40,18 @@ type Config struct {
 	// (MAQ-13 backstop). <= 0 → default 10m, overridable via
 	// MAQUINISTA_WORKTREE_GRACE.
 	ParkGrace time.Duration
+	// SessionName is the tmux session frozen-agent panes are killed from
+	// (MAQ-31 freeze arms; used when the row's own tmux_session is empty).
+	SessionName string
+	// KillWindow is best-effort pane cleanup on freeze retires (MAQ-31;
+	// tmux.KillWindow-shaped). nil skips it — the row still retires.
+	KillWindow func(session, windowID string) error
+	// MonitorPollInterval mirrors config.Config.MonitorPollInterval (the
+	// transcript monitor's poll cadence, MONITOR_POLL_INTERVAL). The
+	// restart-cohort sweep defers until a few intervals after boot so the
+	// monitor's first poll can touch post-boot transcripts before the
+	// sweep judges silence. <= 0 → default 2s (config's default).
+	MonitorPollInterval time.Duration
 }
 
 // liveAgentStatusSQL is the set of agents.status values that mean "a pane
@@ -82,6 +94,9 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 			}
 		}
 	}
+	if cfg.MonitorPollInterval <= 0 {
+		cfg.MonitorPollInterval = 2 * time.Second
+	}
 
 	listener, err := pool.Acquire(ctx)
 	if err != nil {
@@ -92,7 +107,36 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		return fmt.Errorf("LISTEN: %w", err)
 	}
 
+	// Freeze bounds + respawn cap (MAQ-31): shared with the pipeline's
+	// dispatch watchdog — one env trio tunes every freeze arm.
+	idleAfter, spawnGrace := pipeline.FreezeBoundsFromEnv()
+	respawnCap := pipeline.FreezeRespawnCapFromEnv()
+
+	// MAQ-31 AC 3: heal the crash-restart cohort ONCE per boot — but not
+	// immediately. The sweep's transcript veto (spare a crash-surviving
+	// pane that is mid-turn) can only observe post-boot growth after the
+	// monitor's first poll, which lands ~one poll interval after `go
+	// mon.Run` and only fires on offset advance. A sweep at +0s races (and
+	// structurally always beats) the monitor: every pre-boot row still has
+	// a pre-boot/NULL last_transcript_at, the veto is dead code, and a live
+	// mid-turn pane is murdered on sight — the 04/10 newborn-kill class in
+	// a new disguise. So the sweep waits out a small grace of a few monitor
+	// polls and runs on the first wake past it: a true ghost heals at
+	// +~30s instead of +0s (no functional loss); a streaming survivor's
+	// post-boot touch lands inside the grace and vetoes the heal.
+	started := time.Now()
+	sweepGrace := 3 * cfg.MonitorPollInterval
+	swept := false
+
 	for {
+		if !swept && time.Since(started) >= sweepGrace {
+			swept = true
+			if healed, err := HealRestartCohort(ctx, pool, started, spawnGrace, cfg.SessionName, cfg.KillWindow); err != nil {
+				log.Printf("taskscheduler: restart cohort sweep: %v", err)
+			} else if healed > 0 {
+				log.Printf("taskscheduler: restart cohort sweep healed %d frozen agent(s)", healed)
+			}
+		}
 		if err := drain(ctx, pool, cfg); err != nil {
 			log.Printf("taskscheduler: %v", err)
 		}
@@ -112,6 +156,15 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 			log.Printf("taskscheduler: heal missing inbox: %v", herr)
 		} else if healed > 0 {
 			log.Printf("taskscheduler: healed %d task(s) with missing inbox prompt", healed)
+		}
+		// MAQ-31: retire implementor-phase freezes (claimed tasks whose live
+		// agent row went silent past the freeze bounds) BEFORE the reaper —
+		// the retire is what lets the reaper's all-rows-non-live check pass
+		// on the next line, same wake.
+		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, respawnCap, cfg.SessionName, cfg.KillWindow); ferr != nil {
+			log.Printf("taskscheduler: retire frozen claims: %v", ferr)
+		} else if retired > 0 {
+			log.Printf("taskscheduler: retired %d frozen claim agent(s)", retired)
 		}
 		// Reaper: a claimed task whose agent row died mid-flight (pane
 		// vanished, daemon restart raced the spawn) is released back to
@@ -259,7 +312,7 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 		WHERE status = 'ready'
 		  AND NOT EXISTS (
 		        SELECT 1 FROM agents a
-		        WHERE a.task_id = t.id AND a.status IN (` + liveAgentStatusSQL + `)
+		        WHERE a.task_id = t.id AND a.status IN (`+liveAgentStatusSQL+`)
 		      )
 		ORDER BY priority DESC, created_at
 		FOR UPDATE SKIP LOCKED

@@ -290,30 +290,35 @@ func TestMarkDone_FixerCompletedGoesToReview(t *testing.T) {
 	t.Log("PASS TestMarkDone_FixerCompletedGoesToReview")
 }
 
-// C8 (AC 8): a stalled fixer parks the task with a watchdog note; an active
-// one is untouched.
-func TestFixerWatchdog_StallParks(t *testing.T) {
+// C8 (AC 8, MAQ-31 semantics): a frozen fixer is retired and its episode
+// re-armed (fix row released, task stays changes_requested); an active one
+// is untouched.
+func TestFixerWatchdog_FrozenReArms(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	seedFixEpisode(t, pool, "f9", "uuid-f9", "/tmp/wt-f9", 1)
 	seedFixer(t, pool, "fixer-f9", "f9")
-	// Backdate past the stall bound (young-agent guard exempts fresh agents).
+	// Backdate past the spawn grace; the episode's fix row blocks respawn
+	// until the freeze releases it.
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='fixer-f9'`)
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('f9', 'fixer-f9', 'fix', 'round 1')
+	`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
-	if got := taskCol(t, pool, "f9", "status"); got != "pending_approval" {
-		t.Fatalf("PASS-check: stalled fix task = %q, want pending_approval", got)
+	if got := taskCol(t, pool, "f9", "status"); got != "changes_requested" {
+		t.Fatalf("PASS-check: frozen fix task = %q, want changes_requested (episode re-arms, no park)", got)
 	}
-	var content string
-	if err := pool.QueryRow(ctx, `SELECT content FROM task_context
-		WHERE task_id='f9' AND kind='verdict'
-		ORDER BY created_at DESC LIMIT 1`).Scan(&content); err != nil {
-		t.Fatalf("watchdog row: %v", err)
+	var fixRows int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM task_context
+		WHERE task_id='f9' AND kind='fix'`).Scan(&fixRows); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(content, "fix stalled") {
-		t.Fatalf("PASS-check: watchdog content = %q, want fix-stall note", content)
+	if fixRows != 0 {
+		t.Fatalf("PASS-check: fix rows = %d, want 0 (episode re-armed)", fixRows)
 	}
 	var status string
 	if err := pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='fixer-f9'`).Scan(&status); err != nil {
@@ -322,7 +327,7 @@ func TestFixerWatchdog_StallParks(t *testing.T) {
 	if status != "dead" {
 		t.Fatalf("PASS-check: fixer status = %q, want dead", status)
 	}
-	t.Log("PASS TestFixerWatchdog_StallParks")
+	t.Log("PASS TestFixerWatchdog_FrozenReArms")
 }
 
 // TestFixerWatchdog_TranscriptGrowthKeepsAlive pins the MAQ-9 liveness
@@ -340,7 +345,7 @@ func TestFixerWatchdog_TranscriptGrowthKeepsAlive(t *testing.T) {
 		                   last_transcript_at = NOW() - interval '5 minutes'
 		WHERE id='fixer-fb'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "fb", "status"); got != "changes_requested" {
@@ -359,13 +364,64 @@ func TestFixerWatchdog_InsideTimeoutUntouched(t *testing.T) {
 		VALUES ('fixer-fa', '{"text":"fixing finding 1"}'::jsonb)
 	`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "fa", "status"); got != "changes_requested" {
 		t.Fatalf("PASS-check: active fix task = %q, want changes_requested (untouched)", got)
 	}
 	t.Log("PASS TestFixerWatchdog_InsideTimeoutUntouched")
+}
+
+// TestFixerWatchdog_RespawnCapParks pins the circuit breaker on the fixer
+// arm: an episode whose re-arm budget is spent parks needs-human (with the
+// fix row released, so a human flipping the task back to changes_requested
+// re-arms clean) instead of looping freeze→re-arm forever.
+func TestFixerWatchdog_RespawnCapParks(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedFixEpisode(t, pool, "fc", "uuid-fc", "/tmp/wt-fc", 1)
+	seedFixer(t, pool, "fixer-fc", "fc")
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='fixer-fc'`)
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('fc', 'fixer-fc', 'fix', 'round 1')
+	`)
+	for i := 0; i < 3; i++ {
+		execOK(t, pool, `
+			INSERT INTO task_context (task_id, agent_id, kind, content)
+			VALUES ('fc', 'fixer-fc', 'observation',
+			        'watchdog: fixer frozen (round 1) — no outbox activity; auto-retired')
+		`)
+	}
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	if got := taskCol(t, pool, "fc", "status"); got != "pending_approval" {
+		t.Fatalf("capped fix task = %q, want pending_approval (circuit breaker)", got)
+	}
+	if got := agentStatus(t, pool, "fixer-fc"); got != "dead" {
+		t.Fatalf("capped fixer status = %q, want dead", got)
+	}
+	var parks int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM task_context
+		WHERE task_id='fc' AND kind='verdict' AND content LIKE '%parking needs-human%'`).Scan(&parks); err != nil {
+		t.Fatal(err)
+	}
+	if parks != 1 {
+		t.Fatalf("park verdict rows = %d, want 1", parks)
+	}
+	// The episode is released with the park — a flip back to
+	// changes_requested re-arms clean instead of staying shadowed.
+	var fixRows int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM task_context
+		WHERE task_id='fc' AND kind='fix'`).Scan(&fixRows); err != nil {
+		t.Fatal(err)
+	}
+	if fixRows != 0 {
+		t.Fatalf("fix rows = %d, want 0 (episode released with the park)", fixRows)
+	}
 }
 
 // C9 (AC 9): the generalized resolver reads the named template's frozen
