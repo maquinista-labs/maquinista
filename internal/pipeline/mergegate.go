@@ -10,9 +10,15 @@ package pipeline
 // test-only dependency or a red test slips past the build leg alone). Both
 // legs materialize the pushed branch (origin/<branch> — the exact tree a
 // squash-merge takes, rebase included) in a detached throwaway worktree.
-// Deterministic failure: no merge — the entry fails, the task parks
-// needs-human, and the question names the failing step and carries the
-// first ~20 lines of output. The worktree is removed on every outcome.
+// Deterministic failure: no merge — the entry fails and the task flows back
+// through the state machine: changes_requested (fresh fixer → reviewer →
+// queue again), parking needs-human only after maxGateFixRounds failures.
+// The question names the failing step and carries the first ~20 lines of
+// output. The worktree is removed on every outcome. Gate subprocesses run
+// under a strict env allowlist (gateEnv): the orchestrator's runtime config
+// (DATABASE_URL, bot tokens, pipeline knobs) must never leak into a test
+// run — a gate that behaves differently from a developer shell or CI gates
+// nothing.
 // Deliberately no config knob: a gate that could be switched off in the
 // default deployment would reintroduce the bug it exists to prevent.
 
@@ -28,6 +34,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/git"
@@ -55,6 +62,14 @@ const (
 	// but loud in compiler output; a red test's first failure names itself
 	// within the same budget).
 	maxBuildErrLines = 20
+	// maxGateFixRounds bounds how many gate failures (build or test legs)
+	// a single task may burn before it stops looping through the fixer and
+	// parks needs-human. The count includes the failure just recorded, so
+	// failures 1..N-1 route the task back to changes_requested (fresh
+	// fixer → reviewer → queue again) and failure N parks it
+	// pending_approval — the runaway guard for a break the fixer cannot
+	// fix.
+	maxGateFixRounds = 3
 	// maxGatePkgsRendered caps how many package paths the failing-step
 	// command renders in the needs-human payload before collapsing the
 	// rest into a count — the step must be nameable, not a wall of paths.
@@ -158,6 +173,7 @@ func runBuildGate(ctx context.Context, worktreeDir, ref string) (passed bool, ou
 	defer cancel()
 	cmd := exec.CommandContext(buildCtx, buildGateCmd[0], buildGateCmd[1:]...)
 	cmd.Dir = dir
+	cmd.Env = gateEnv()
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return true, "", nil
@@ -213,6 +229,7 @@ func runTestGate(ctx context.Context, worktreeDir, ref, baseRef string) (passed 
 	args := append(append([]string{}, testGateCmd[1:]...), pkgs...)
 	cmd := exec.CommandContext(testCtx, testGateCmd[0], args...)
 	cmd.Dir = dir
+	cmd.Env = gateEnv()
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return true, gateCmd, "", nil
@@ -320,12 +337,50 @@ func trimLines(s string, n int) string {
 	return fmt.Sprintf("%s\n… (+%d more lines)", strings.Join(lines[:n], "\n"), len(lines)-n)
 }
 
+// gateEnv allowlists the environment handed to gate subprocesses (both
+// legs). The orchestrator process carries runtime config and secrets
+// (DATABASE_URL, TELEGRAM_BOT_TOKEN, MAQUINISTA_*/PIPELINE_* knobs, API
+// keys): leaking those into `go test` makes the gate run the suite against
+// different inputs than every developer shell and CI — e.g. a DB-backed
+// test reading DATABASE_URL quietly runs against prod inside the gate while
+// passing everywhere else. An env-dependent gate gates nothing. Keep only
+// toolchain plumbing (PATH/HOME, GO*/SSH agent, locale, tmpdir); a test
+// that legitimately needs a variable sets it itself (t.Setenv), it does
+// not inherit the daemon's runtime config.
+func gateEnv() []string {
+	keepExact := map[string]bool{
+		"PATH": true, "HOME": true, "USER": true, "SHELL": true,
+		"LOGNAME": true, "TMPDIR": true, "LANG": true,
+	}
+	keepPrefix := []string{"GO", "SSH_", "LC_"}
+	env := make([]string, 0, 16)
+	for _, kv := range os.Environ() {
+		k, _, _ := strings.Cut(kv, "=")
+		if keepExact[k] {
+			env = append(env, kv)
+			continue
+		}
+		for _, p := range keepPrefix {
+			if strings.HasPrefix(k, p) {
+				env = append(env, kv)
+				break
+			}
+		}
+	}
+	return env
+}
+
 // parkGateFailure records a gate rejection (MAQ-20 build / MAQ-21 test):
 // the queue entry fails (terminal — the branch must change, so an immediate
 // retry cannot succeed and re-approval after a fix enqueues a fresh entry),
-// the task parks needs-human, and the human question names the failing step
-// (AC 2: "the failing step named in the observation") and carries the first
-// output lines so the fix needs no worktree spelunking.
+// and the task flows back through the STATE MACHINE instead of parking
+// needs-human: status → changes_requested spawns a fresh fixer, closing the
+// builder → independent review → rebaser/merger loop with no human in the
+// middle. Only the maxGateFixRounds-th failure for the same task parks
+// pending_approval — the runaway guard for a break the fixer cannot fix.
+// Either way the payload names the failing step (AC 2: "the failing step
+// named in the observation") and carries the first output lines so the
+// fixer needs no worktree spelunking.
 func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, entry *db.MergeQueueEntry, step, gateCmd, output string) error {
 	cause, outLabel, stepHead := "does not compile", "Compiler output", "Build"
 	if step == testGateStep {
@@ -334,17 +389,39 @@ func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, ent
 	if err := db.FailMerge(pool, entry.ID, fmt.Sprintf("%s gate failed on branch %s: `%s` %s", step, entry.Branch, gateCmd, cause)); err != nil {
 		return fmt.Errorf("pipeline: failing %d: %w", entry.ID, err)
 	}
-	if _, err := pool.Exec(ctx, `
-		UPDATE tasks
-		SET    status = 'pending_approval'
-		WHERE  id = $1 AND status = 'ready_to_merge'
-	`, taskID); err != nil {
-		return fmt.Errorf("pipeline: parking %s after %s gate: %w", taskID, step, err)
+	// One atomic state-machine transition: the failure count is decided
+	// inside the UPDATE (fixer loop vs needs-human park), guarded on the
+	// task still sitting in ready_to_merge so a human who moved it keeps
+	// custody. The count includes the failure just recorded.
+	var landed string
+	var failed int
+	if err := pool.QueryRow(ctx, `
+		WITH failures AS (
+			SELECT count(*)::int AS n FROM merge_queue
+			WHERE task_id = $1 AND status = 'failed')
+		UPDATE tasks SET status = CASE
+			WHEN failures.n >= $2 THEN 'pending_approval'
+			ELSE 'changes_requested' END
+		FROM failures
+		WHERE tasks.id = $1 AND tasks.status = 'ready_to_merge'
+		RETURNING tasks.status, failures.n
+	`, taskID, maxGateFixRounds).Scan(&landed, &failed); err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("pipeline: routing %s after %s gate: %w", taskID, step, err)
+		}
+		// Task no longer in ready_to_merge (human or watchdog moved it):
+		// the entry still fails, but custody stays where it was put.
+		log.Printf("pipeline: merge %s not in ready_to_merge at %s-gate failure — leaving status untouched", taskID, step)
 	}
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("%s gate failed on branch %s — `%s` %s:\n%s", stepHead, entry.Branch, gateCmd, cause, output))
-	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s gate failed on branch %s — `%s` %s. %s (first %d lines):\n%s\nTask parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
-		taskTitle(ctx, pool, taskID), step, entry.Branch, gateCmd, cause, outLabel, maxBuildErrLines, output, taskID, prLinkSuffix(ctx, pool, taskID))
-	log.Printf("pipeline: merge %s %s gate failed on branch %s", taskID, step, entry.Branch)
+	next := fmt.Sprintf("Back to the fixer: gate-failure round %d of %d — it pushes a fix, the reviewer re-checks it, and the queue re-runs the gate.",
+		failed, maxGateFixRounds)
+	if landed == "pending_approval" {
+		next = fmt.Sprintf("Task parked needs-human after %d gate failures. Fix, re-push, then `maquinista approve %s` to retry the merge.", failed, taskID)
+	}
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s gate failed on branch %s — `%s` %s. %s (first %d lines):\n%s\n%s%s",
+		taskTitle(ctx, pool, taskID), step, entry.Branch, gateCmd, cause, outLabel, maxBuildErrLines, output, next, prLinkSuffix(ctx, pool, taskID))
+	log.Printf("pipeline: merge %s %s gate failed on branch %s → %s", taskID, step, entry.Branch, landed)
 	return nil
 }

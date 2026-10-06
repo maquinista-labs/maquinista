@@ -23,6 +23,10 @@ make dashboard-test       # Go-side dashboard tests (supervisor, config, CLI)
 
 `SKIP_DASHBOARD=1 make build` skips the Next.js pipeline and uses the committed `standalone.tgz` tarball.
 
+## State machine first (no manual case coverage)
+
+This repo runs as a state machine: builder/fixer → independent review → rebaser/merger (merge queue + quality gates). Recovery from any automated rejection flows through STATE TRANSITIONS — each hands the task to the next role with a round cap and a final `pending_approval` escape (needs human). Never patch a stuck instance by hand (shell SQL UPDATEs, hand-built queue rows, hand-merges): if a case lacks a transition, add the transition, not a one-off. Automated steps must not inherit ambient runtime config (`gateEnv` in `internal/pipeline/mergegate.go`) — a step that behaves differently from a developer shell or CI gates nothing.
+
 ## PR descriptions
 
 Every PR opened in this repo (pipeline agent or human) MUST carry a description with exactly two sections:

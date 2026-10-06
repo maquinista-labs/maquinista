@@ -70,8 +70,9 @@ func assertNoGateLeak(t *testing.T, admin string) {
 
 // TestProcessMergeGH_BuildGateBlocksBrokenBranch (MAQ-20 acceptance #1, #2,
 // #3, #4): a branch that redeclares an existing symbol must not reach
-// `gh pr merge --squash`; the entry fails, the task parks needs-human, and
-// both the notification and the task observation carry the compiler output.
+// `gh pr merge --squash`; the entry fails, the task routes back to the
+// fixer (changes_requested — fixer round 1), and both the notification and
+// the task observation carry the compiler output.
 func TestProcessMergeGH_BuildGateBlocksBrokenBranch(t *testing.T) {
 	pool := testPool(t)
 	admin, worktree := initRemoteTrio(t, "buildgate")
@@ -96,8 +97,8 @@ func TestProcessMergeGH_BuildGateBlocksBrokenBranch(t *testing.T) {
 	if got := entryStatus(t, pool, entry.ID); got != "failed" {
 		t.Errorf("entry status = %q, want failed", got)
 	}
-	if status, _ := taskRow(t, pool, taskID); status != "pending_approval" {
-		t.Errorf("task status = %q, want pending_approval (needs human)", status)
+	if status, _ := taskRow(t, pool, taskID); status != "changes_requested" {
+		t.Errorf("task status = %q, want changes_requested (fixer round 1)", status)
 	}
 	// Not merged: the remote branch survives for the fix + re-approve.
 	if out := gitRun(t, admin, "ls-remote", "--heads", "origin", entry.Branch); out == "" {
@@ -109,7 +110,7 @@ func TestProcessMergeGH_BuildGateBlocksBrokenBranch(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("emitted %d notes, want 1: %q", len(texts), texts)
 	}
-	for _, want := range []string{"🆘", "build gate failed", "go build ./...", "redeclared", "parked needs-human"} {
+	for _, want := range []string{"🆘", "build gate failed", "go build ./...", "redeclared", "Back to the fixer", "round 1 of 3"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("note %q missing %q", texts[0], want)
 		}
