@@ -249,6 +249,25 @@ verdict INPUT:
 - **degradation** — no `GhRunner` wired, no `pr_url`, or any gh failure →
   the prompt ships without the section; nothing else changes.
 
+**Repo review criteria (MAQ-35).** A repo may carry `MAQUINISTA.md` at its
+root — per-repository review criteria the reviewer must honor. Both prompt
+builders (spawn + heal share `buildReviewPrompt`) load it from the task
+worktree — the reviewer's repo root (`reviewcriteria.go`) — when present,
+and inject it as a BINDING section placed before the human-comments input:
+binding means the criteria constrain the verdict (unlike the comments,
+which are input only), and a criterion demanding human approval escalates
+(`request_changes` / `needs_human`) unless an explicit human approval is
+visible in the PR comments. Loading is best-effort: no file (the common
+case), no worktree, an unreadable file, or an oversized one (capped at
+4000 chars with a truncation marker) ships the prompt without or with a
+degraded section — criteria never block a round. The reviewed branch's own
+copy governs the round (a branch proposing new criteria is reviewed
+against its own proposal); a branch weakening or deleting its own copy is
+visible in the diff it ships, and the rest of the prompt's hygiene rules
+still apply. This repo's seeded `MAQUINISTA.md`: any change touching
+`DOMAIN.md` or `ARCH.md` requires human review/approval — the reviewer
+must not approve such a PR on its own.
+
 **Spawn pickup markers (MAQ-25).** At spawn time — before the agent does
 any work — dispatch posts a one-line pickup comment on the task's open PR
 (`postPickupComment`, the MAQ-16 `PRComments`+`PRPostComment` transport),

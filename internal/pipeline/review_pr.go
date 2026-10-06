@@ -217,16 +217,26 @@ func fetchHumanPRComments(ctx context.Context, pool *pgxpool.Pool, g GhRunner, t
 }
 
 // buildReviewPrompt composes the round prompt: the standard per-round
-// briefing plus the human PR comments newer than the previous reviewer's
-// start (MAQ-16). Best-effort on every auxiliary read.
+// briefing, the repo's binding review criteria (MAQUINISTA.md at the task
+// worktree root, MAQ-35), and the human PR comments newer than the previous
+// reviewer's start (MAQ-16). Best-effort on every auxiliary read: missing
+// criteria (the common case), a gh outage, or any lookup failure degrades
+// to today's plain prompt — never an error, never a blocked round.
 func buildReviewPrompt(ctx context.Context, pool *pgxpool.Pool, g GhRunner, taskID string, round int, currentAgentID string) string {
+	var criteria string
+	wt, err := taskWorktreePath(ctx, pool, taskID)
+	if err != nil {
+		log.Printf("pipeline: dispatch: worktree lookup %s: %v (prompt ships without review criteria)", taskID, err)
+	} else {
+		criteria = renderReviewCriteria(loadReviewCriteria(wt))
+	}
 	if g == nil {
-		return reviewPromptBody(taskID, round, "")
+		return reviewPromptBody(taskID, round, criteria, "")
 	}
 	cutoff, err := previousReviewerCutoff(ctx, pool, taskID, currentAgentID)
 	if err != nil {
 		log.Printf("pipeline: dispatch: reviewer cutoff %s: %v — treating as round 1", taskID, err)
 		cutoff = nil
 	}
-	return reviewPromptBody(taskID, round, fetchHumanPRComments(ctx, pool, g, taskID, cutoff))
+	return reviewPromptBody(taskID, round, criteria, fetchHumanPRComments(ctx, pool, g, taskID, cutoff))
 }

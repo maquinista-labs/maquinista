@@ -590,10 +590,13 @@ func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agen
 // the PR hygiene rules (MAQ-29: title must not be all-lowercase, body must
 // start with `## What?` / `## Why?`) so a violation draws request_changes
 // even if the reviewer never re-reads AGENTS.md.
+// criteria (rendered by renderReviewCriteria) is inserted when non-empty:
+// the repo's MAQUINISTA.md review criteria, BINDING (MAQ-35) — it precedes
+// the human comments so its "check the comments below" framing holds.
 // humanComments (rendered by renderHumanComments) is appended when non-empty:
 // the PR's human comments newer than the previous reviewer, framed as verdict
 // INPUT (MAQ-16 — they are never approve/request_changes verbs).
-func reviewPromptBody(taskID string, round int, humanComments string) string {
+func reviewPromptBody(taskID string, round int, criteria, humanComments string) string {
 	body := fmt.Sprintf(
 		"Review round %d for task %s. The implementation is committed in your cwd (the task worktree). "+
 			"Run `git fetch origin && git diff origin/main...HEAD` (plus `git log origin/main..HEAD`) to see the change, "+
@@ -602,6 +605,9 @@ func reviewPromptBody(taskID string, round int, humanComments string) string {
 			"and the body must start with `## What?` and `## Why?` sections; request_changes when either rule is broken. "+
 			"End your reply with exactly one line: VERDICT: approve | VERDICT: request_changes | VERDICT: needs_human.",
 		round, taskID)
+	if criteria != "" {
+		body += "\n\n" + criteria
+	}
 	if humanComments != "" {
 		body += "\n\n" + humanComments
 	}
