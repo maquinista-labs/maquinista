@@ -404,8 +404,11 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   the squash, two legs in order (`runMergeGate`): the branch is never
   merged uncompiled or red. Both legs materialize `origin/<branch>` — the
   exact tree a squash-merge takes, rebase included — in a detached
-  throwaway worktree under `os.TempDir()` (`maquinista-mergegate-*`) and
-  run there (`internal/pipeline/mergegate.go`):
+  worktree of a throwaway `--shared` clone under `os.TempDir()`
+  (`maquinista-gateclone-*`, own refs and own worktree registry — never a
+  worktree of the task repo: the suite's own leak checks run inside the
+  gate, and a gate tree they can see reds every pipeline-touching branch)
+  and run there (`internal/pipeline/mergegate.go`):
   1. **build** — `go build ./...` (MAQ-20: PR #21 redeclared consts across
      files and merged green; duplicate consts are invisible in a per-file
      diff read but loud in compiler output).

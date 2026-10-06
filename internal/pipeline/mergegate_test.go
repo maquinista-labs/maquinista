@@ -60,12 +60,80 @@ func pushGoBase(t *testing.T, admin string) {
 // failure paths.
 func assertNoGateLeak(t *testing.T, admin string) {
 	t.Helper()
-	if leftovers, _ := filepath.Glob(filepath.Join(os.TempDir(), mergeGateDirPrefix+"*")); len(leftovers) != 0 {
-		t.Errorf("gate worktree(s) leaked under %s: %v", os.TempDir(), leftovers)
+	// The suite may be RUNNING INSIDE a gate tree (every gate on a
+	// pipeline-touching branch runs the package from the gate's own
+	// materialized clone — see gateTree). That host tree is alive for the
+	// whole run and is not a leak; anything else under a gate prefix is.
+	// Skipping only the cwd's ancestor chain keeps the check honest: a
+	// tree abandoned by an earlier failed run is never an ancestor of the
+	// current cwd.
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
 	}
-	if out := gitRun(t, admin, "worktree", "list", "--porcelain"); strings.Contains(out, mergeGateDirPrefix) {
+	isHost := func(p string) bool { return p == cwd || strings.HasPrefix(cwd, p+string(filepath.Separator)) }
+	for _, prefix := range []string{mergeGateDirPrefix, gateCloneDirPrefix} {
+		var leaks []string
+		if leftovers, _ := filepath.Glob(filepath.Join(os.TempDir(), prefix+"*")); len(leftovers) != 0 {
+			for _, l := range leftovers {
+				if !isHost(l) {
+					leaks = append(leaks, l)
+				}
+			}
+		}
+		if len(leaks) != 0 {
+			t.Errorf("gate worktree(s) leaked under %s: %v", os.TempDir(), leaks)
+		}
+	}
+	if out := gitRun(t, admin, "worktree", "list", "--porcelain"); strings.Contains(out, mergeGateDirPrefix) || strings.Contains(out, gateCloneDirPrefix) {
 		t.Errorf("gate worktree still registered in the repo:\n%s", out)
 	}
+}
+
+// TestGateTree_InvisibleToLeakChecks (MAQ-29/30 regression): the gate used
+// to materialize its tree as a worktree of the TASK repo, under a
+// mergegate prefix in TempDir — so when the pipeline suite ran INSIDE that
+// tree (every gate on a pipeline-touching branch), the leak checks saw the
+// gate's own crime scene and went red: five consecutive gate reds while
+// every manual run of the same commits passed. The gate must materialize
+// from a throwaway shared clone under its own prefix — invisible to both
+// checks until cleanup removes it.
+func TestGateTree_InvisibleToLeakChecks(t *testing.T) {
+	admin, worktree := initRemoteTrio(t, "gatetree")
+	pushGoBase(t, admin)
+
+	dir, cleanup, err := gateTree(worktree, "origin/main")
+	if err != nil {
+		t.Fatalf("gateTree: %v", err)
+	}
+	defer cleanup()
+
+	// The materialized tree must NOT be a mergegate-prefixed path in
+	// TempDir, and must NOT be registered in the task repo's worktree
+	// registry — both are things the suite asserts on while running inside
+	// the gate.
+	if leftovers, _ := filepath.Glob(filepath.Join(os.TempDir(), mergeGateDirPrefix+"*")); len(leftovers) != 0 {
+		t.Errorf("gate tree visible to the mergegate leak glob: %v", leftovers)
+	}
+	if out := gitRun(t, admin, "worktree", "list", "--porcelain"); strings.Contains(out, dir) {
+		t.Errorf("gate tree registered in the task repo's worktree registry:\n%s", out)
+	}
+	// ...and it is the tree it claims to be: go.mod present, at origin/main.
+	if _, err := os.Stat(filepath.Join(dir, "go.mod")); err != nil {
+		t.Errorf("gate tree has no go.mod: %v", err)
+	}
+	want := gitRun(t, admin, "rev-parse", "origin/main")
+	if got := gitRun(t, dir, "rev-parse", "HEAD"); got != want {
+		t.Errorf("gate tree at %s, want origin/main %s", got, want)
+	}
+
+	// Cleanup removes the whole clone root — nothing left to leak.
+	root := filepath.Dir(dir)
+	cleanup()
+	if _, err := os.Stat(root); !os.IsNotExist(err) {
+		t.Errorf("clone root %s still exists after cleanup: %v", root, err)
+	}
+	assertNoGateLeak(t, admin)
 }
 
 // TestProcessMergeGH_BuildGateBlocksBrokenBranch (MAQ-20 acceptance #1, #2,
