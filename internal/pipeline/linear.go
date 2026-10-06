@@ -159,9 +159,11 @@ func (c *LinearClient) Comments(ctx context.Context, issueIDs []string, since ti
 			Nodes []linearComment `json:"nodes"`
 		} `json:"comments"`
 	}
-	// Issue id is a UUID comparator ([UUID!] for `in`); DateTime for the
-	// createdAt comparator — same strictness noted on the query above.
-	doc := `query($ids: [UUID!], $since: DateTime!) { comments(
+	// Issue id is an ID comparator ([ID!] for `in`); createdAt takes
+	// Linear's DateTimeOrDuration — same strictness as the query above.
+	// [UUID!] and DateTime! are type errors here: Linear 400s every tick
+	// (MAQ-27), verified against api.linear.app 03/10/2026.
+	doc := `query($ids: [ID!], $since: DateTimeOrDuration) { comments(
 	  filter: { issue: { id: { in: $ids } }, createdAt: { gte: $since } },
 	  orderBy: createdAt, first: 100
 	) { nodes { id body createdAt issue { id } user { email name displayName } } } }`
