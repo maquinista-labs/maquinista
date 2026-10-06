@@ -9,6 +9,8 @@ package pipeline
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -124,11 +126,11 @@ func TestRenderHumanComments_OverflowKeepsNewest(t *testing.T) {
 }
 
 func TestReviewPromptBody_IncludesHumanComments(t *testing.T) {
-	base := reviewPromptBody("tp", 1, "")
+	base := reviewPromptBody("tp", 1, "", "")
 	if strings.Contains(base, "Human comments") {
 		t.Errorf("empty section leaked the header: %q", base)
 	}
-	with := reviewPromptBody("tp", 2, "Human comments on the PR ...\n\n- alice: fix it")
+	with := reviewPromptBody("tp", 2, "", "Human comments on the PR ...\n\n- alice: fix it")
 	if !strings.Contains(with, "fix it") || !strings.Contains(with, "VERDICT: approve") {
 		t.Errorf("prompt lost comments or the verdict contract: %q", with)
 	}
@@ -138,11 +140,69 @@ func TestReviewPromptBody_CarriesPRHygieneRules(t *testing.T) {
 	// MAQ-29: every round prompt restates the PR hygiene rules so an
 	// all-lowercase title or missing What?/Why? sections draws
 	// request_changes even if the reviewer never re-reads AGENTS.md.
-	prompt := reviewPromptBody("tp", 1, "")
+	prompt := reviewPromptBody("tp", 1, "", "")
 	for _, want := range []string{"all-lowercase", "## What?", "## Why?"} {
 		if !strings.Contains(prompt, want) {
 			t.Errorf("prompt missing PR hygiene rule %q: %s", want, prompt)
 		}
+	}
+}
+
+func TestReviewPromptBody_CarriesReviewCriteria(t *testing.T) {
+	// MAQ-35: the repo's MAQUINISTA.md criteria are injected as a BINDING
+	// section, placed BEFORE the human-comments input it points to.
+	criteria := renderReviewCriteria("Never approve a diff touching ARCH.md without human approval.")
+	prompt := reviewPromptBody("tp", 1, criteria, "")
+	for _, want := range []string{"Repository review criteria", "MAQUINISTA.md", "BINDING", "Never approve a diff touching ARCH.md"} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing review criteria %q: %s", want, prompt)
+		}
+	}
+	// Empty criteria ship no section (most repos carry none).
+	if strings.Contains(reviewPromptBody("tp", 1, "", ""), "Repository review criteria") {
+		t.Errorf("empty criteria leaked the section header")
+	}
+	// Ordering: criteria precede the human comments.
+	both := reviewPromptBody("tp", 1, criteria, "Human comments on the PR")
+	if strings.Index(both, "Repository review criteria") > strings.Index(both, "Human comments") {
+		t.Errorf("criteria must precede the human comments: %s", both)
+	}
+}
+
+func TestLoadReviewCriteria(t *testing.T) {
+	dir := t.TempDir()
+	// No file — the common case: empty, never an error.
+	if got := loadReviewCriteria(dir); got != "" {
+		t.Errorf("no file = %q, want empty", got)
+	}
+	// Missing worktree (cleaned-up task dir): empty, not an error.
+	if got := loadReviewCriteria(filepath.Join(dir, "vanished")); got != "" {
+		t.Errorf("missing worktree = %q, want empty", got)
+	}
+	// Present: trimmed.
+	if err := os.WriteFile(filepath.Join(dir, reviewCriteriaFile), []byte("\nProtect ARCH.md.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadReviewCriteria(dir); got != "Protect ARCH.md." {
+		t.Errorf("got %q, want trimmed content", got)
+	}
+	// Blank file: no section.
+	if err := os.WriteFile(filepath.Join(dir, reviewCriteriaFile), []byte("   \n\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadReviewCriteria(dir); got != "" {
+		t.Errorf("blank file = %q, want empty", got)
+	}
+}
+
+func TestLoadReviewCriteria_TruncatesOversized(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, reviewCriteriaFile), []byte(strings.Repeat("x", maxReviewCriteriaChars+100)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := loadReviewCriteria(dir)
+	if !strings.HasPrefix(got, strings.Repeat("x", maxReviewCriteriaChars)) || !strings.Contains(got, "truncated") {
+		t.Errorf("oversized criteria not truncated to the cap with a marker: %d chars", len(got))
 	}
 }
 
@@ -434,6 +494,55 @@ func TestPromptBuild_GhOutage_ShipsPlainPrompt(t *testing.T) {
 	// The plain briefing still carries the verdict contract.
 	if !strings.Contains(prompts[0], "VERDICT: approve") {
 		t.Errorf("plain prompt lost the verdict contract: %q", prompts[0])
+	}
+}
+
+// TestDispatch_PromptCarriesReviewCriteria is MAQ-35 end to end: a
+// MAQUINISTA.md at the task worktree root is injected into the spawned
+// round prompt as binding criteria; a worktree without the file ships the
+// plain prompt. The heal path shares buildReviewPrompt, so it inherits the
+// section by construction (same seam as the human comments).
+func TestDispatch_PromptCarriesReviewCriteria(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	wt := t.TempDir()
+	criteria := "Any change touching DOMAIN.md requires human approval — never approve it alone."
+	if err := os.WriteFile(filepath.Join(wt, reviewCriteriaFile), []byte(criteria), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	seedReviewTask(t, pool, "tqc", "uuid-qc", wt)
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('tqc', 'impl-tqc', 'result', 'done')
+	`)
+
+	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
+	if err := dispatchPass(ctx, pool, &fakeGh{}, sp, DefaultImplementorIdleAfter); err != nil {
+		t.Fatalf("dispatchPass: %v", err)
+	}
+	prompts := inboxPrompts(t, pool, "reviewer-tqc")
+	if len(prompts) != 1 {
+		t.Fatalf("prompts = %d, want 1", len(prompts))
+	}
+	for _, want := range []string{"Repository review criteria", criteria} {
+		if !strings.Contains(prompts[0], want) {
+			t.Errorf("prompt missing review criteria %q: %s", want, prompts[0])
+		}
+	}
+
+	// No file in the worktree: plain prompt, no criteria section.
+	seedReviewTask(t, pool, "tqn", "uuid-qn", t.TempDir())
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('tqn', 'impl-tqn', 'result', 'done')
+	`)
+	if err := dispatchPass(ctx, pool, &fakeGh{}, sp, DefaultImplementorIdleAfter); err != nil {
+		t.Fatalf("dispatchPass 2: %v", err)
+	}
+	prompts = inboxPrompts(t, pool, "reviewer-tqn")
+	if len(prompts) != 1 || strings.Contains(prompts[0], "Repository review criteria") {
+		t.Fatalf("worktree without MAQUINISTA.md must ship the plain prompt: %q", prompts)
 	}
 }
 
