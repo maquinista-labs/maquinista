@@ -435,7 +435,11 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   guard for a break the fixer cannot fix. Both the Pipeline-topic
   question and a `merger` observation name the FAILING STEP
   (`go build ./...` or the exact `go test <pkgs>` command, paths capped
-  at 8 + count) and carry the first ~20 output lines. Gate subprocesses
+  at 8 + count) and carry ~20 output lines — the build leg's FIRST lines
+  (the compiler reports the first error first) or the test leg's LAST
+  lines (go test prints its `--- FAIL` blocks at the very end, after all
+  suites' log output; keeping the head buried failures under the
+  ellipsis — 2026-10-06 gates). Gate subprocesses
   run under a strict env allowlist (`gateEnv`): the orchestrator's
   runtime config (`DATABASE_URL`, bot tokens, `MAQUINISTA_*`/`PIPELINE_*`
   knobs) never leaks into a gate run — a gate that behaves differently

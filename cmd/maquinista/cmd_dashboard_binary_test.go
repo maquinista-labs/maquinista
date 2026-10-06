@@ -218,12 +218,29 @@ func TestDashboardBinary_RefusesDoubleStart(t *testing.T) {
 var (
 	binaryBuildOnce sync.Once
 	binaryPath      string
+	binaryDir       string
 	binaryBuildErr  error
 )
 
+// TestMain removes the once-built binary's temp dir after the whole run.
+// buildMaquinistaBinary uses sync.Once, so a per-test t.Cleanup cannot own
+// the dir (the first test to finish would delete it under the rest); the
+// process exit is the only point where no caller needs it anymore. Without
+// this, every `go test ./cmd/maquinista` leaked a ~70MB binary dir into
+// /tmp — two merge gates on 2026-10-06 went red with `no space left on
+// device` after the day's repeated suite runs filled the partition.
+func TestMain(m *testing.M) {
+	code := m.Run()
+	if binaryDir != "" {
+		_ = os.RemoveAll(binaryDir)
+	}
+	os.Exit(code)
+}
+
 // buildMaquinistaBinary builds `go build ./cmd/maquinista` into a
 // temp file once per test binary and returns its path. Subsequent
-// calls return the same path. Skips the test if the build fails
+// calls return the same path. The containing dir is removed by
+// TestMain after the run. Skips the test if the build fails
 // (e.g. offline module fetch).
 func buildMaquinistaBinary(t *testing.T) string {
 	t.Helper()
@@ -233,6 +250,7 @@ func buildMaquinistaBinary(t *testing.T) string {
 			binaryBuildErr = err
 			return
 		}
+		binaryDir = tmpDir
 		binaryPath = filepath.Join(tmpDir, "maquinista")
 		build := exec.Command("go", "build", "-o", binaryPath, "./cmd/maquinista")
 		build.Dir = repoRoot()
