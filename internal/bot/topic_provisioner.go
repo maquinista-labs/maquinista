@@ -167,6 +167,15 @@ func (b *Bot) provisionMissingTopics(ctx context.Context, pool *pgxpool.Pool) er
 // closeOrphanedTopics closes Telegram forum topics for agents that have been
 // archived (or whose row no longer exists) and removes the binding so the
 // relay stops delivering to them.
+//
+// Only user agents are orphanable. The synthetic 'pipeline' notifier also
+// holds an owner binding, but its row is seeded 'stopped' by migration 036
+// and no tmux pane ever refreshes its last_seen — so an ops pass keyed on
+// pane liveness can flip it 'dead', and if this loop treated that as
+// orphaned it would close the Pipeline topic and silently drop every
+// pipeline notification (2026-10-06 incident). Task panes
+// (implementor/reviewer/fixer) hold no owner bindings at all. role='user'
+// mirrors provisionMissingTopics.
 func (b *Bot) closeOrphanedTopics(ctx context.Context, pool *pgxpool.Pool) error {
 	// Bindings whose agent is archived, dead, or deleted (LEFT JOIN → NULL).
 	rows, err := pool.Query(ctx, `
@@ -176,7 +185,7 @@ func (b *Bot) closeOrphanedTopics(ctx context.Context, pool *pgxpool.Pool) error
 		WHERE b.binding_type = 'owner'
 		  AND b.chat_id IS NOT NULL
 		  AND b.thread_id IS NOT NULL
-		  AND (a.id IS NULL OR a.status IN ('archived', 'dead'))
+		  AND (a.id IS NULL OR (a.role = 'user' AND a.status IN ('archived', 'dead')))
 	`)
 	if err != nil {
 		return fmt.Errorf("query orphaned bindings: %w", err)
