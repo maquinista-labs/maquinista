@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -218,13 +219,64 @@ func TestDashboardBinary_RefusesDoubleStart(t *testing.T) {
 var (
 	binaryBuildOnce sync.Once
 	binaryPath      string
+	binaryDir       string // dir holding binaryPath; TestMain removes it
 	binaryBuildErr  error
 )
 
+// TestMain tears the shared binary build down at process exit.
+// The binary is built once per test-binary run and shared across
+// every binary-using test, so per-test t.Cleanup would delete it
+// under later tests' feet — only after m.Run() returns is removal
+// safe. Without this every `go test ./cmd/maquinista` leaked a
+// ~70MB /tmp/maquinista-bin-* dir; enough runs ENOSPC'd the /tmp
+// partition and mass-failed unrelated suites (infra red).
+func TestMain(m *testing.M) {
+	// Dirs orphaned by killed test runs (SIGKILL, crash) never see
+	// the teardown below; sweep them, age-gated so a live concurrent
+	// run's binary is not removed under it.
+	pruneStaleBinaryDirs(os.TempDir(), time.Hour)
+
+	code := m.Run()
+
+	if binaryDir != "" {
+		if err := os.RemoveAll(binaryDir); err != nil {
+			log.Printf("cmd/maquinista tests: removing %s: %v", binaryDir, err)
+		}
+	}
+	os.Exit(code)
+}
+
+// pruneStaleBinaryDirs removes maquinista-bin-* temp dirs under root
+// older than maxAge, warning for each. A dir younger than maxAge may
+// belong to a concurrently running test binary (two `go test` invocations
+// can race on this box — gate vs human); those are left alone.
+func pruneStaleBinaryDirs(root string, maxAge time.Duration) {
+	matches, err := filepath.Glob(filepath.Join(root, "maquinista-bin-*"))
+	if err != nil {
+		return
+	}
+	for _, dir := range matches {
+		info, err := os.Stat(dir)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		age := time.Since(info.ModTime())
+		if age < maxAge {
+			continue
+		}
+		log.Printf("cmd/maquinista tests: WARNING removing stale %s (age %s) — orphaned by a killed test run", dir, age.Round(time.Second))
+		if err := os.RemoveAll(dir); err != nil {
+			log.Printf("cmd/maquinista tests: removing %s: %v", dir, err)
+		}
+	}
+}
+
 // buildMaquinistaBinary builds `go build ./cmd/maquinista` into a
 // temp file once per test binary and returns its path. Subsequent
-// calls return the same path. Skips the test if the build fails
-// (e.g. offline module fetch).
+// calls return the same path. The temp dir is removed by TestMain
+// at process exit — never by a per-test cleanup, which would race
+// with later tests still exec'ing the binary. Skips the test if the
+// build fails (e.g. offline module fetch).
 func buildMaquinistaBinary(t *testing.T) string {
 	t.Helper()
 	binaryBuildOnce.Do(func() {
@@ -233,6 +285,7 @@ func buildMaquinistaBinary(t *testing.T) string {
 			binaryBuildErr = err
 			return
 		}
+		binaryDir = tmpDir
 		binaryPath = filepath.Join(tmpDir, "maquinista")
 		build := exec.Command("go", "build", "-o", binaryPath, "./cmd/maquinista")
 		build.Dir = repoRoot()
@@ -284,4 +337,3 @@ func containsSubstring(s, sub string) bool {
 	}
 	return false
 }
-
