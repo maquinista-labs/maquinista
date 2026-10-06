@@ -280,7 +280,7 @@ func TestReleaseStaleMergeEntries_ThresholdHonored(t *testing.T) {
 
 // ---- integration: the TEST gate leg blocks a red branch (AC 2 + AC 5) ----
 
-func TestRunMergeDrainPass_TestGateParksRedBranch(t *testing.T) {
+func TestRunMergeDrainPass_TestGateLoopsFixerThenParks(t *testing.T) {
 	pool := testPool(t)
 	_, worktree := initRemoteTrio(t, "testgate")
 	entry := seedReadyTaskPending(t, pool, worktree, 0)
@@ -296,28 +296,26 @@ func TestRunMergeDrainPass_TestGateParksRedBranch(t *testing.T) {
 	gh := &fakeGh{checks: ChecksGreen}
 	cfg := MergeConfig{Mode: MergeModeGH, AutoMerge: true, Gh: gh}
 
+	// Round 1: red branch → entry failed, task routed BACK to the fixer
+	// (changes_requested) — the builder → review → merger loop, no human.
 	processed, err := RunMergeDrainPass(context.Background(), pool, cfg, &fakeProvider{}, "team-1")
 	if err != nil || !processed {
 		t.Fatalf("processed=%v err=%v", processed, err)
 	}
-
-	// No merge — the branch is red (AC 5).
 	if gh.mergeCalls != 0 {
 		t.Errorf("squash-merge fired %d times on a branch with a failing test", gh.mergeCalls)
 	}
 	if got := entryStatus(t, pool, entry.ID); got != "failed" {
 		t.Errorf("entry = %q, want failed", got)
 	}
-	// The task parks needs-human (AC 2)…
-	if status, _ := taskRow(t, pool, taskID); status != "pending_approval" {
-		t.Errorf("task = %s, want parked pending_approval", status)
+	if status, _ := taskRow(t, pool, taskID); status != "changes_requested" {
+		t.Errorf("task = %s, want changes_requested (fixer round 1)", status)
 	}
-	// …with the failing STEP named in question and observation.
 	texts := pipelineNotifyTextsPool(t, pool)
 	if len(texts) != 1 {
 		t.Fatalf("emitted %d notes, want 1: %q", len(texts), texts)
 	}
-	for _, want := range []string{"🆘", "test gate failed", "go test .", "parked needs-human"} {
+	for _, want := range []string{"🆘", "test gate failed", "go test .", "Back to the fixer", "round 1 of 3"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("note %q missing %q", texts[0], want)
 		}
@@ -338,9 +336,38 @@ func TestRunMergeDrainPass_TestGateParksRedBranch(t *testing.T) {
 		t.Error("branch vanished from the remote — the gate must not clean up work it rejected")
 	}
 	if _, err := os.Stat(worktree); err != nil {
-		t.Errorf("task worktree %s must survive a test-gate park: %v", worktree, err)
+		t.Errorf("task worktree %s must survive a test-gate rejection: %v", worktree, err)
 	}
 	assertNoGateLeak(t, gitRepoRoot(t, worktree))
+
+	// Rounds 2..maxGateFixRounds: the state machine keeps looping — each
+	// round simulates the fixer having pushed (task re-routed to
+	// ready_to_merge) and the queue re-enqueueing the branch — until the
+	// round cap burns, when the task finally parks needs-human instead of
+	// looping forever.
+	for round := 2; round <= maxGateFixRounds; round++ {
+		if _, err := pool.Exec(context.Background(),
+			`UPDATE tasks SET status = 'ready_to_merge' WHERE id = $1`, taskID); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.EnqueueMerge(pool, entry.TaskID, entry.AgentID, entry.Branch, worktree, "main", *entry.CommitSHA); err != nil {
+			t.Fatal(err)
+		}
+		if processed, err := RunMergeDrainPass(context.Background(), pool, cfg, &fakeProvider{}, "team-1"); err != nil || !processed {
+			t.Fatalf("round %d: processed=%v err=%v", round, processed, err)
+		}
+		wantStatus, wantText := "changes_requested", "Back to the fixer"
+		if round >= maxGateFixRounds {
+			wantStatus, wantText = "pending_approval", "parked needs-human"
+		}
+		if status, _ := taskRow(t, pool, taskID); status != wantStatus {
+			t.Errorf("round %d: task = %s, want %s", round, status, wantStatus)
+		}
+		texts = pipelineNotifyTextsPool(t, pool)
+		if !strings.Contains(texts[len(texts)-1], wantText) {
+			t.Errorf("round %d: note %q missing %q", round, texts[len(texts)-1], wantText)
+		}
+	}
 }
 
 // TestRunMergeDrainPass_TestGatePassesGreenBranch: a branch with passing

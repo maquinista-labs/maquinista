@@ -28,6 +28,14 @@ func PgContainer(t *testing.T) (*pgxpool.Pool, string) {
 	}
 
 	ctx := context.Background()
+	// Startup timeout 180s, not testcontainers' typical 60s: this box runs
+	// container-PER-TEST — when several suites churn containers at once
+	// (a merge gate + a fixer pane mid-verification), dockerd degrades
+	// measurably (port-bind retries, broken first execs — see dockerd logs
+	// 2026-10-06 07:15-07:17). A container declared ready into a congested
+	// daemon hands the test a sick Postgres and the suite goes red for
+	// infra reasons; the higher bound just refuses to do that. Worst case
+	// (daemon truly stuck) is the same skip as before, three minutes later.
 	container, err := tcpg.Run(ctx,
 		"postgres:16-alpine",
 		tcpg.WithDatabase("maquinista_test"),
@@ -36,7 +44,7 @@ func PgContainer(t *testing.T) (*pgxpool.Pool, string) {
 		testcontainers.WithWaitStrategy(
 			wait.ForLog("database system is ready to accept connections").
 				WithOccurrence(2).
-				WithStartupTimeout(60*time.Second),
+				WithStartupTimeout(180*time.Second),
 		),
 	)
 	if err != nil {

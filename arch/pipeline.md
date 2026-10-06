@@ -308,6 +308,22 @@ sight murders slow-booting spawns). The malformed-verdict case is
 deliberately left to the watchdog: the parser never guesses, the timeout is
 the backstop — and a stalled fixer is bounded the same way.
 
+## State machine first (recovery flows through transitions)
+
+The pipeline is a state machine: builder/fixer → independent review →
+rebaser/merger (merge queue + gates). Every automated rejection — review
+`request_changes`, a red gate leg, a rebase conflict — is handled by a
+STATE TRANSITION that hands the task to the next role (fixer, reviewer,
+merger), each with its own round cap and a final escape to
+`pending_approval` (needs human). Do NOT handle new failure modes by
+covering the instance manually: no shell SQL pokes, no hand-built queue
+rows, no hand-merges. If a case has no transition, ADD the transition
+(with its cap and escape) — exactly like `parkGateFailure` routes gate
+failures back to the fixer and parks only at `maxGateFixRounds`.
+Corollary: automated steps must not inherit ambient runtime config (see
+`gateEnv`) — a step that behaves differently from a developer shell or
+CI gates nothing.
+
 ## Env contract
 
 | Variable | Meaning | Default |
@@ -407,11 +423,19 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
      non-Go changes (docs, CI configs) select nothing.
 
   Deterministic failure of either leg: entry `failed` (terminal — the
-  branch must change; re-approval after a fix enqueues a fresh one), task
-  parks `pending_approval`, and both the Pipeline-topic question and a
-  `merger` observation name the FAILING STEP (`go build ./...` or the
-  exact `go test <pkgs>` command, paths capped at 8 + count) and carry the
-  first ~20 output lines. Infra trouble (toolchain missing, worktree add
+  branch must change; re-approval after a fix enqueues a fresh one), and
+  the task flows back THROUGH THE STATE MACHINE: `changes_requested`
+  spawns a fresh fixer (builder → independent review → merger loop, no
+  human in the middle), parking `pending_approval` only on the
+  `maxGateFixRounds` (=3)-th failure for the same task — the runaway
+  guard for a break the fixer cannot fix. Both the Pipeline-topic
+  question and a `merger` observation name the FAILING STEP
+  (`go build ./...` or the exact `go test <pkgs>` command, paths capped
+  at 8 + count) and carry the first ~20 output lines. Gate subprocesses
+  run under a strict env allowlist (`gateEnv`): the orchestrator's
+  runtime config (`DATABASE_URL`, bot tokens, `MAQUINISTA_*`/`PIPELINE_*`
+  knobs) never leaks into a gate run — a gate that behaves differently
+  from a developer shell or CI gates nothing. Infra trouble (toolchain missing, worktree add
   failure, >10 min build or >10 min test run) fails the entry without
   blaming the branch — re-approve retries. A branch root without `go.mod`
   passes vacuously (non-Go repos unchanged). The worktree is removed on
