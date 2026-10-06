@@ -9,7 +9,9 @@ package pipeline
 // touches (`go build ./...` does not compile _test.go files, so a removed
 // test-only dependency or a red test slips past the build leg alone). Both
 // legs materialize the pushed branch (origin/<branch> — the exact tree a
-// squash-merge takes, rebase included) in a detached throwaway worktree.
+// squash-merge takes, rebase included) in a detached worktree of a
+// throwaway --shared clone (see gateTree — never a worktree of the task
+// repo: the suite's own leak checks run inside the gate).
 // Deterministic failure: no merge — the entry fails and the task flows back
 // through the state machine: changes_requested (fresh fixer → reviewer →
 // queue again), parking needs-human only after maxGateFixRounds failures.
@@ -41,9 +43,19 @@ import (
 )
 
 const (
-	// mergeGateDirPrefix names the throwaway worktrees the gate creates
-	// under os.TempDir() — also the leak-detection glob in tests.
+	// mergeGateDirPrefix is the leak-detection glob prefix (assertNoGateLeak
+	// in tests): any throwaway gate tree under this prefix in TempDir is a
+	// leak. The gate itself materializes under gateCloneDirPrefix now — a
+	// mergegate-prefixed path alive during a suite run IS a failure (see
+	// gateTree).
 	mergeGateDirPrefix = "maquinista-mergegate-"
+	// gateCloneDirPrefix names the throwaway SHARED CLONES the gate
+	// materializes from (gateTree) — deliberately a different prefix from
+	// mergeGateDirPrefix: the pipeline suite leak-checks TempDir for
+	// mergegate-* paths (assertNoGateLeak), and the gate's own tree used
+	// to trip that check while the suite ran inside it (MAQ-29/30: five
+	// consecutive reds, every manual run green).
+	gateCloneDirPrefix = "maquinista-gateclone-"
 	// buildGateTimeout caps a single gate build. The box compiles this repo
 	// in ~60-90s warm (the added-latency budget); 10m is runaway insurance,
 	// not a latency target. A timed-out build is infrastructure trouble
@@ -102,27 +114,39 @@ func gateTree(worktreeDir, ref string) (dir string, cleanup func(), err error) {
 	if err != nil {
 		return "", nil, fmt.Errorf("gate tree: repo root: %w", err)
 	}
-	dir, err = os.MkdirTemp("", mergeGateDirPrefix)
+	// Materialize from a throwaway --shared CLONE, never a worktree of the
+	// task repo: the pipeline suite leak-checks TempDir for mergegate-*
+	// trees (assertNoGateLeak) and greps the repo's worktree registry — a
+	// gate tree living in either trips those checks WHILE the suite runs
+	// inside it, red-ing every gate on a pipeline-touching branch
+	// (MAQ-29/30: five consecutive reds, every manual run green). A clone
+	// has its own refs — fresher than the task worktree's, no staleness —
+	// and its own registry; the clone prefix (gateCloneDirPrefix) is
+	// distinct from mergeGateDirPrefix, so the checks stay meaningful: a
+	// clone the gate failed to clean up still trips them.
+	root, err := os.MkdirTemp("", gateCloneDirPrefix)
 	if err != nil {
 		return "", nil, fmt.Errorf("gate tree: temp dir: %w", err)
 	}
-	// git worktree add wants a non-existent path; MkdirTemp reserved the
-	// name, now yield it.
-	if err := os.Remove(dir); err != nil {
-		return "", nil, fmt.Errorf("gate tree: temp dir: %w", err)
-	}
+	repo := filepath.Join(root, "repo")
 	done := false
 	cleanup = func() {
 		if done {
 			return
 		}
 		done = true
-		if rmErr := git.WorktreeRemove(admin, dir); rmErr != nil {
+		if rmErr := git.WorktreeRemove(repo, dir); rmErr != nil {
 			os.RemoveAll(dir)
-			_ = git.WorktreePrune(admin)
+			_ = git.WorktreePrune(repo)
 		}
+		os.RemoveAll(root)
 	}
-	if err := git.WorktreeAddDetached(admin, dir, ref); err != nil {
+	if err := git.CloneShared(admin, repo); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("gate tree: clone %s: %w", admin, err)
+	}
+	dir = filepath.Join(root, "tree")
+	if err := git.WorktreeAddDetached(repo, dir, ref); err != nil {
 		cleanup()
 		return "", nil, fmt.Errorf("gate tree: materialize %s: %w", ref, err)
 	}

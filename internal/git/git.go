@@ -131,6 +131,21 @@ func WorktreeAddDetached(repoRoot, worktreeDir, ref string) error {
 	return nil
 }
 
+// CloneShared clones repo (a repo path — bare or a worktree's) into dest as
+// a throwaway repository: --shared hardlinks the source object store (no
+// copy), --no-checkout skips materializing HEAD. The clone carries fresh
+// remote-tracking refs at clone time and its OWN worktree registry — which
+// is why gateTree materializes from one: a gate tree registered in the task
+// repo (or living under a mergegate prefix in TempDir) trips the pipeline
+// suite's own leak checks while they run inside the gate.
+func CloneShared(repo, dest string) error {
+	cmd := exec.Command("git", "clone", "--shared", "--no-checkout", repo, dest)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git clone --shared --no-checkout %s %s: %s: %w", repo, dest, string(out), err)
+	}
+	return nil
+}
+
 // WorktreeAttach creates a worktree checking out an existing branch.
 func WorktreeAttach(repoRoot, worktreeDir, branch string) error {
 	cmd := exec.Command("git", "-C", repoRoot, "worktree", "add", worktreeDir, branch)
