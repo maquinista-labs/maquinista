@@ -15,8 +15,10 @@ package pipeline
 // Deterministic failure: no merge — the entry fails and the task flows back
 // through the state machine: changes_requested (fresh fixer → reviewer →
 // queue again), parking needs-human only after maxGateFixRounds failures.
-// The question names the failing step and carries the first ~20 lines of
-// output. The worktree is removed on every outcome. Gate subprocesses run
+// The question names the failing step and carries ~20 lines of output — the
+// build leg keeps the compiler's FIRST lines (errors lead), the test leg
+// `go test`'s LAST lines (--- FAIL blocks print at the end; the head is test
+// log noise). The worktree is removed on every outcome. Gate subprocesses run
 // under a strict env allowlist (gateEnv): the orchestrator's runtime config
 // (DATABASE_URL, bot tokens, pipeline knobs) must never leak into a test
 // run — a gate that behaves differently from a developer shell or CI gates
@@ -71,8 +73,12 @@ const (
 	// maxBuildErrLines bounds the compiler/test output carried by the
 	// needs-human notification and the task observation (MAQ-20: "first ~20
 	// lines" — duplicate consts across files are invisible in a diff read
-	// but loud in compiler output; a red test's first failure names itself
-	// within the same budget).
+	// but loud in compiler output). The build leg keeps the FIRST lines
+	// (the compiler reports the first error first); the test leg keeps the
+	// LAST lines — go test prints its --- FAIL summaries at the very end,
+	// and the head is thousands of bytes of test log noise (two merge
+	// gates on 2026-10-06 reported 20 lines of noise and buried the actual
+	// `--- FAIL` blocks under the ellipsis).
 	maxBuildErrLines = 20
 	// maxGateFixRounds bounds how many gate failures (build or test legs)
 	// a single task may burn before it stops looping through the fixer and
@@ -267,9 +273,11 @@ func runTestGate(ctx context.Context, worktreeDir, ref, baseRef string) (passed 
 	case testCtx.Err() != nil:
 		return false, gateCmd, "", fmt.Errorf("test gate: cancelled: %w", testCtx.Err())
 	case errors.As(err, &exitErr):
-		// Deterministic red — the branch's fault, not infra's. The first
-		// lines carry the failing test's name and assertion.
-		return false, gateCmd, trimLines(string(out), maxBuildErrLines), nil
+		// Deterministic red — the branch's fault, not infra's. The tail
+		// carries the --- FAIL blocks: go test prints them after all test
+		// log output, so keeping the head would bury the failure (and its
+		// test name) under the ellipsis.
+		return false, gateCmd, trimTailLines(string(out), maxBuildErrLines), nil
 	default:
 		return false, gateCmd, "", fmt.Errorf("test gate: run %v: %w: %s", cmd.Args, err, string(out))
 	}
@@ -361,6 +369,21 @@ func trimLines(s string, n int) string {
 	return fmt.Sprintf("%s\n… (+%d more lines)", strings.Join(lines[:n], "\n"), len(lines)-n)
 }
 
+// trimTailLines keeps the LAST n lines of s, prefixing an ellipsis count of
+// the dropped head. The test-gate leg uses it: go test runs the suites
+// first (log output streams to the head) and only then prints the `--- FAIL`
+// blocks and the FAIL summary at the tail — keeping the head, as the build
+// leg rightly does for compiler output, showed 20 lines of log noise while
+// the actual failure sat under the ellipsis (2026-10-06 merge gates).
+func trimTailLines(s string, n int) string {
+	s = strings.TrimRight(s, "\n")
+	lines := strings.Split(s, "\n")
+	if len(lines) <= n {
+		return s
+	}
+	return fmt.Sprintf("… (-%d earlier lines)\n%s", len(lines)-n, strings.Join(lines[len(lines)-n:], "\n"))
+}
+
 // gateEnv allowlists the environment handed to gate subprocesses (both
 // legs). The orchestrator process carries runtime config and secrets
 // (DATABASE_URL, TELEGRAM_BOT_TOKEN, MAQUINISTA_*/PIPELINE_* knobs, API
@@ -403,12 +426,16 @@ func gateEnv() []string {
 // middle. Only the maxGateFixRounds-th failure for the same task parks
 // pending_approval — the runaway guard for a break the fixer cannot fix.
 // Either way the payload names the failing step (AC 2: "the failing step
-// named in the observation") and carries the first output lines so the
-// fixer needs no worktree spelunking.
+// named in the observation") and carries its output lines so the
+// fixer needs no worktree spelunking — the build leg's first lines (the
+// compiler reports the first error first) or the test leg's last lines
+// (--- FAIL blocks print at the end).
 func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, entry *db.MergeQueueEntry, step, gateCmd, output string) error {
-	cause, outLabel, stepHead := "does not compile", "Compiler output", "Build"
+	cause, outLabel, stepHead := "does not compile",
+		fmt.Sprintf("Compiler output (first %d lines)", maxBuildErrLines), "Build"
 	if step == testGateStep {
-		cause, outLabel, stepHead = "fails", "Test output", "Test"
+		cause, outLabel, stepHead = "fails",
+			fmt.Sprintf("Test output (last %d lines)", maxBuildErrLines), "Test"
 	}
 	if err := db.FailMerge(pool, entry.ID, fmt.Sprintf("%s gate failed on branch %s: `%s` %s", step, entry.Branch, gateCmd, cause)); err != nil {
 		return fmt.Errorf("pipeline: failing %d: %w", entry.ID, err)
@@ -444,8 +471,8 @@ func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, ent
 	if landed == "pending_approval" {
 		next = fmt.Sprintf("Task parked needs-human after %d gate failures. Fix, re-push, then `maquinista approve %s` to retry the merge.", failed, taskID)
 	}
-	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s gate failed on branch %s — `%s` %s. %s (first %d lines):\n%s\n%s%s",
-		taskTitle(ctx, pool, taskID), step, entry.Branch, gateCmd, cause, outLabel, maxBuildErrLines, output, next, prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s gate failed on branch %s — `%s` %s. %s:\n%s\n%s%s",
+		taskTitle(ctx, pool, taskID), step, entry.Branch, gateCmd, cause, outLabel, output, next, prLinkSuffix(ctx, pool, taskID))
 	log.Printf("pipeline: merge %s %s gate failed on branch %s → %s", taskID, step, entry.Branch, landed)
 	return nil
 }

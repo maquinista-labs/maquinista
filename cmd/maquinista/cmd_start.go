@@ -579,6 +579,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 			go pipeline.RunCommentCommands(ctx, pipeline.CommentDeps{
 				Pool:   pool,
 				Source: runner,
+				Gh:     runner, // MAQ-30: pickup marker on comment-triggered fixer rounds
 				Auth:   pipeline.GhCommandsConfigFromEnv(),
 				Merge:  mCfg,
 				Prov:   prov,

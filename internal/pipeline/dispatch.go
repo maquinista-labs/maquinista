@@ -563,7 +563,10 @@ func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agen
 }
 
 // reviewPromptBody is the per-round task briefing. The reviewer soul carries
-// the full method + verdict contract; this carries the round specifics.
+// the full method + verdict contract; this carries the round specifics plus
+// the PR hygiene rules (MAQ-29: title must not be all-lowercase, body must
+// start with `## What?` / `## Why?`) so a violation draws request_changes
+// even if the reviewer never re-reads AGENTS.md.
 // humanComments (rendered by renderHumanComments) is appended when non-empty:
 // the PR's human comments newer than the previous reviewer, framed as verdict
 // INPUT (MAQ-16 — they are never approve/request_changes verbs).
@@ -572,6 +575,8 @@ func reviewPromptBody(taskID string, round int, humanComments string) string {
 		"Review round %d for task %s. The implementation is committed in your cwd (the task worktree). "+
 			"Run `git fetch origin && git diff origin/main...HEAD` (plus `git log origin/main..HEAD`) to see the change, "+
 			"read the spec under .specs/ if present, run the validators the spec names, and judge the change on its merits. "+
+			"Enforce PR hygiene (AGENTS.md): the PR title must not be all-lowercase — sentence/title case, keeping its [MAQ-n] identifier — "+
+			"and the body must start with `## What?` and `## Why?` sections; request_changes when either rule is broken. "+
 			"End your reply with exactly one line: VERDICT: approve | VERDICT: request_changes | VERDICT: needs_human.",
 		round, taskID)
 	if humanComments != "" {

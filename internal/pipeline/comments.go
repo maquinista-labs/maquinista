@@ -17,10 +17,15 @@
 //     live-entry index is the second guard).
 //   - auth: PIPELINE_GH_ALLOWED_LOGINS, falling back to a repo-collaborator
 //     check via gh. Everyone else is ignored silently.
-//   - no-op discipline: not a command → ignored entirely; task not found or
-//     the verb not applicable to its state → one clean no-op, no state
-//     damage. Transient GitHub/DB errors are retried on the next pass
-//     (nothing is claimed until processing can proceed).
+//   - no-op discipline: task not found or the verb not applicable to its
+//     state → one clean no-op, no state damage. Transient GitHub/DB errors
+//     are retried on the next pass (nothing is claimed until processing can
+//     proceed).
+//   - non-command comments are not dead traffic either (MAQ-30): an allowed
+//     login's plain comment on a watched PR re-opens a round on the task
+//     behind it (dispatchCommentRound → triggerCommentRound — the state
+//     machine lives in reround.go). Bots and non-allowed logins never
+//     trigger; both are claimed, so the silence is remembered.
 package pipeline
 
 import (
@@ -408,9 +413,13 @@ type CommentDeps struct {
 	Merge  MergeConfig
 	Prov   TicketProvider
 	TeamID string
-	// Spawn materializes sessions for spawning verbs (resolve). The wiring
-	// passes the same spawner the dispatch loop uses.
+	// Spawn materializes sessions for spawning verbs (resolve) and for the
+	// MAQ-30 comment-triggered fixer rounds. The wiring passes the same
+	// spawner the dispatch loop uses.
 	Spawn ReviewSpawner
+	// Gh posts the MAQ-25 pickup marker for a comment-triggered fixer round.
+	// Nil skips the post (same optional-GitHub stance as dispatch).
+	Gh GhRunner
 }
 
 // errNoTaskForPR: no task row matches the PR (id-less resolution missed).
@@ -427,13 +436,16 @@ const (
 
 // DispatchCommentCommand handles one PR comment: parse → authorize →
 // resolve the target task (id-less) → claim exactly-once → route to the
-// verb handler. Returns the disposition recorded (or "" for non-command
-// comments, which are ignored entirely and never claimed). A transient
-// error ("", err) claims nothing so the next pass retries the comment.
+// verb handler. Non-command comments take the MAQ-30 trigger arm instead
+// (dispatchCommentRound — same auth/claim discipline, state machine instead
+// of a verb). Returns the disposition recorded. A transient error ("", err)
+// claims nothing so the next pass retries the comment.
 func DispatchCommentCommand(ctx context.Context, d CommentDeps, authz *commentAuthorizer, pr int, c PRComment) (string, error) {
 	verb, args, ok := ParseCommentCommand(c.Body)
 	if !ok {
-		return "", nil // non-command: ignored entirely
+		// Non-command: the MAQ-30 trigger candidate (a plain human comment
+		// re-opening a round). Still gated on auth + task resolution inside.
+		return dispatchCommentRound(ctx, d, authz, pr, c)
 	}
 
 	allowed, err := authorizeCommenter(ctx, d, authz, c.Author)
@@ -646,9 +658,8 @@ func setCommentDisposition(ctx context.Context, pool *pgxpool.Pool, commentID in
 // ---- poller ----
 
 // watchedPR is a PR whose conversation is polled: any open pipeline PR —
-// states approve applies to today, plus the neighbors a future verb
-// (park, rerun, ...) will care about. Comments on PRs outside the set are
-// never fetched — the cheapest possible no-op.
+// the states the verbs and the MAQ-30 comment trigger act on. Comments on
+// PRs outside the set are never fetched — the cheapest possible no-op.
 func watchedPRs(ctx context.Context, pool *pgxpool.Pool) ([]int, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT DISTINCT pr_url
@@ -722,7 +733,7 @@ func PollPRCommands(ctx context.Context, d CommentDeps, authz *commentAuthorizer
 				// swallowed. A claimed one re-reads as a harmless duplicate.
 				hold(fmt.Errorf("comment %d on PR #%d: %w", c.ID, pr, err))
 			case disp == "":
-				// non-command — ignored entirely
+				// defensive: the arms always record a disposition
 			default:
 				log.Printf("pipeline: comment %d on PR #%d by @%s → %s", c.ID, pr, c.Author, disp)
 			}

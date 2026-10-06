@@ -272,20 +272,43 @@ func TestDispatch_Auth(t *testing.T) {
 	})
 }
 
-func TestDispatch_NonCommandIgnored(t *testing.T) {
+func TestDispatch_NonCommandComment(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	d := commentDepsForTest(pool, &fakeComments{}, "alice")
+	sp := &fakeSpawner{t: t, pool: pool}
+	d.Spawn = sp
+
+	// PR #7 maps to a ready_to_merge task WITHOUT a worktree — the trigger
+	// evaluates but takes the worktree-guard no-op (never strands the task
+	// in review unwatched).
+	taskID := fmt.Sprintf("t-%d", nextTaskNum())
+	execOK(t, pool, `
+		INSERT INTO tasks (id, title, status, pr_url, metadata)
+		VALUES ($1, 'probe target', 'ready_to_merge', 'https://github.com/o/r/pull/7',
+		        '{"ticket_issue_id":"iss-1"}'::jsonb)
+	`, taskID)
 
 	disp, err := DispatchCommentCommand(ctx, d, nil, 7,
 		PRComment{ID: 201, Author: "alice", Body: "LGTM, shipping this 🚀"})
-	if err != nil || disp != "" {
-		t.Fatalf("disp=%q err=%v, want ignored entirely", disp, err)
+	if err != nil || disp != DispNoOp {
+		t.Fatalf("disp=%q err=%v, want evaluated no-op", disp, err)
 	}
 	var n int
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM gh_comment_commands WHERE comment_id = 201`).Scan(&n); err != nil || n != 0 {
-		t.Fatalf("non-command claimed: %d rows", n)
+		`SELECT count(*) FROM gh_comment_commands WHERE comment_id = 201`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("non-command claim rows = %d err=%v, want 1 (claimed, silence remembered)", n, err)
+	}
+	var detail string
+	if err := pool.QueryRow(ctx,
+		`SELECT detail FROM gh_comment_commands WHERE comment_id = 201`).Scan(&detail); err != nil || detail == "" {
+		t.Fatalf("detail=%q err=%v, want the no-op reason", detail, err)
+	}
+	if len(sp.spawns) != 0 {
+		t.Fatalf("spawns = %d, want 0 (no worktree guard)", len(sp.spawns))
+	}
+	if got := taskCol(t, pool, taskID, "status"); got != "ready_to_merge" {
+		t.Fatalf("status = %q, want untouched", got)
 	}
 }
 

@@ -311,6 +311,26 @@ func TestTrimLines(t *testing.T) {
 	}
 }
 
+// TestTrimTailLines: the test-gate payload carries the LAST ~20 lines —
+// go test prints its --- FAIL blocks at the very end, after all the suites'
+// log output, so keeping the head buries the failure under the ellipsis
+// (2026-10-06 merge gates: 20 lines of log noise, failure unseen).
+func TestTrimTailLines(t *testing.T) {
+	if got := trimTailLines("a\nb\n", 20); got != "a\nb" {
+		t.Errorf("short input: got %q", got)
+	}
+	long := strings.Repeat("noise\n", 30) + "--- FAIL: TestGateMustNotPass\nFAIL"
+	got := trimTailLines(long, 3)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 4 || !strings.HasPrefix(lines[0], "… (-29 earlier lines)") {
+		t.Errorf("truncated output = %d lines, head %q; want ellipsis + 3 lines", len(lines), lines[0])
+	}
+	wantTail := "--- FAIL: TestGateMustNotPass\nFAIL"
+	if !strings.HasSuffix(got, wantTail) {
+		t.Errorf("tail trim must keep the LAST lines; got tail %q", got[len(got)-60:])
+	}
+}
+
 // ---- test leg (MAQ-21) ----
 
 // gateRepoAtBase commits files, returns the base SHA, then commits more.

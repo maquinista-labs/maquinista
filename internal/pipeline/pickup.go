@@ -105,27 +105,48 @@ func isOwnPRComment(body string) bool {
 // maxPickupReasonChars caps the fixer pickup's one-line reason.
 const maxPickupReasonChars = 120
 
-// fixPickupReason distills the reviewer's findings into the fixer pickup's
-// one-line reason: the first line of the findings message that carries
-// substance (blank and VERDICT lines skipped), tail-capped. Any failure
-// yields "" and the body falls back to the generic reason.
-func fixPickupReason(ctx context.Context, pool *pgxpool.Pool, reviewerAgent string) string {
-	findings, err := latestFindings(ctx, pool, reviewerAgent)
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(findings, "\n") {
+// firstSubstantiveLine is fixPickupReason's core: the first line of text
+// that carries substance (blank and VERDICT lines skipped), tail-capped. ""
+// when every line is blank or a verdict.
+func firstSubstantiveLine(text string) string {
+	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "VERDICT:") {
 			continue
 		}
 		if runes := []rune(line); len(runes) > maxPickupReasonChars {
-			line = string(runes[:maxPickupReasonChars]) + " …"
+			return string(runes[:maxPickupReasonChars]) + " …"
 		}
 		return line
 	}
 	return ""
 }
+
+// fixPickupReason distills the reviewer's findings into the fixer pickup's
+// one-line reason. Any failure yields "" and the body falls back to the
+// generic reason.
+func fixPickupReason(ctx context.Context, pool *pgxpool.Pool, reviewerAgent string) string {
+	findings, err := latestFindings(ctx, pool, reviewerAgent)
+	if err != nil {
+		return ""
+	}
+	return firstSubstantiveLine(findings)
+}
+
+// commentPickupReason distills a triggering human comment into the fixer
+// pickup's one-line reason — fixPickupReason's shape applied to the comment
+// body instead of reviewer findings (MAQ-30: the comment is the work order,
+// so it is what the pickup names).
+func commentPickupReason(body string) string {
+	if line := firstSubstantiveLine(body); line != "" {
+		return line
+	}
+	return commentTriggerFallbackReason
+}
+
+// commentTriggerFallbackReason is the comment-triggered pickup's fallback
+// reason (blank or quote-only comment).
+const commentTriggerFallbackReason = "addressing human PR feedback"
 
 // genericPickupReason is the fixer pickup's fallback reason.
 const genericPickupReason = "addressing review findings"
