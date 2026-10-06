@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Run tests. On pass: mark done. On fail: write failure to context, reset to ready.
+# Run tests. On pass: mark done — ticket tasks re-enter 'review' so the
+# pipeline's dispatch loop mints a fresh reviewer (the done-path branch of
+# db.MarkDone, which nothing calls; this script is the completion route).
+# On fail: write failure to context, reset to ready.
+# Both guarded UPDATEs match claimed_by with or without the '@' prefix:
+# the task scheduler writes claimed_by='@'+agentID while AGENT_ID is bare.
 set -euo pipefail
 
 TASK_ID="${1:?Usage: maquinista-done <id> <summary>}"
@@ -24,8 +29,10 @@ if [ "$EXIT_CODE" -eq 0 ]; then
       INSERT INTO task_context (task_id, agent_id, kind, content)
       VALUES ('$TASK_ID', '$AGENT_ID', 'result', $QUOTED_SUMMARY)
     )
-    UPDATE tasks SET status='done', done_at=NOW(), claimed_by=NULL, claimed_at=NULL
-    WHERE id='$TASK_ID' AND claimed_by='$AGENT_ID';
+    UPDATE tasks SET
+      status = CASE WHEN metadata->>'ticket_issue_id' IS NOT NULL THEN 'review' ELSE 'done' END,
+      done_at=NOW(), claimed_by=NULL, claimed_at=NULL
+    WHERE id='$TASK_ID' AND claimed_by IN ('$AGENT_ID', '@$AGENT_ID');
 
     UPDATE agents SET task_id=NULL, status='idle', last_seen=NOW()
     WHERE id='$AGENT_ID';
@@ -68,7 +75,7 @@ $TRUNCATED" | sed "s/'/''/g")')")
   else
     psql "$DB" -c "
       UPDATE tasks SET status='ready', claimed_by=NULL, claimed_at=NULL
-      WHERE id='$TASK_ID' AND claimed_by='$AGENT_ID';
+      WHERE id='$TASK_ID' AND claimed_by IN ('$AGENT_ID', '@$AGENT_ID');
 
       UPDATE agents SET task_id=NULL, status='idle', last_seen=NOW()
       WHERE id='$AGENT_ID';
