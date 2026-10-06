@@ -40,6 +40,12 @@ type Config struct {
 	// (MAQ-13 backstop). <= 0 → default 10m, overridable via
 	// MAQUINISTA_WORKTREE_GRACE.
 	ParkGrace time.Duration
+	// SessionName is the tmux session frozen-agent panes are killed from
+	// (MAQ-31 freeze arms; used when the row's own tmux_session is empty).
+	SessionName string
+	// KillWindow is best-effort pane cleanup on freeze retires (MAQ-31;
+	// tmux.KillWindow-shaped). nil skips it — the row still retires.
+	KillWindow func(session, windowID string) error
 }
 
 // liveAgentStatusSQL is the set of agents.status values that mean "a pane
@@ -92,6 +98,18 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		return fmt.Errorf("LISTEN: %w", err)
 	}
 
+	// MAQ-31 AC 3: heal the crash-restart cohort on the first pass — live
+	// task rows that predate this boot and never streamed are frozen ghosts
+	// of the previous process (a graceful stop deletes task agents, so any
+	// survivor here is a crash/deploy leftover). Once, at start; everything
+	// that freezes later is the continuous arm's job.
+	idleAfter, spawnGrace := pipeline.FreezeBoundsFromEnv()
+	if healed, err := HealRestartCohort(ctx, pool, time.Now(), spawnGrace, cfg.SessionName, cfg.KillWindow); err != nil {
+		log.Printf("taskscheduler: restart cohort sweep: %v", err)
+	} else if healed > 0 {
+		log.Printf("taskscheduler: restart cohort sweep healed %d frozen agent(s)", healed)
+	}
+
 	for {
 		if err := drain(ctx, pool, cfg); err != nil {
 			log.Printf("taskscheduler: %v", err)
@@ -112,6 +130,15 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 			log.Printf("taskscheduler: heal missing inbox: %v", herr)
 		} else if healed > 0 {
 			log.Printf("taskscheduler: healed %d task(s) with missing inbox prompt", healed)
+		}
+		// MAQ-31: retire implementor-phase freezes (claimed tasks whose live
+		// agent row went silent past the freeze bounds) BEFORE the reaper —
+		// the retire is what lets the reaper's all-rows-non-live check pass
+		// on the next line, same wake.
+		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, cfg.SessionName, cfg.KillWindow); ferr != nil {
+			log.Printf("taskscheduler: retire frozen claims: %v", ferr)
+		} else if retired > 0 {
+			log.Printf("taskscheduler: retired %d frozen claim agent(s)", retired)
 		}
 		// Reaper: a claimed task whose agent row died mid-flight (pane
 		// vanished, daemon restart raced the spawn) is released back to
@@ -259,7 +286,7 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 		WHERE status = 'ready'
 		  AND NOT EXISTS (
 		        SELECT 1 FROM agents a
-		        WHERE a.task_id = t.id AND a.status IN (` + liveAgentStatusSQL + `)
+		        WHERE a.task_id = t.id AND a.status IN (`+liveAgentStatusSQL+`)
 		      )
 		ORDER BY priority DESC, created_at
 		FOR UPDATE SKIP LOCKED

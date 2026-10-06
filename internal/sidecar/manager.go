@@ -45,9 +45,9 @@ type managedSidecar struct {
 // fleet changes. Sync can be called periodically to pick up agents that
 // came online after Boot.
 type Manager struct {
-	pool     *pgxpool.Pool
-	session  string // tmux session name (e.g. "maquinista")
-	onClaim  func(agentID, inboxID string) // forwarded to each sidecar's Config.OnClaim
+	pool    *pgxpool.Pool
+	session string                        // tmux session name (e.g. "maquinista")
+	onClaim func(agentID, inboxID string) // forwarded to each sidecar's Config.OnClaim
 
 	mu        sync.Mutex
 	running   map[string]*managedSidecar
@@ -192,9 +192,13 @@ func (m *Manager) makeTmuxDriver(agentID string) PtyDriver {
 		}
 		driveErr := tmux.SendKeysWithDelay(session, tmuxWindow, text, 500)
 		if driveErr != nil && isTmuxWindowMissing(driveErr) {
+			// Guarded on status <> 'dead': a watchdog-retired row (MAQ-31
+			// freeze arms kill the pane while the sidecar may still be
+			// mid-drive) must never resurrect to 'stopped' — that would
+			// re-block the re-dispatch (candidate SQL excludes only 'dead').
 			if _, err := pool.Exec(ctx,
 				`UPDATE agents SET status='stopped', stop_requested=TRUE,
-				 last_seen=NOW() WHERE id=$1`, agentID); err != nil {
+				 last_seen=NOW() WHERE id=$1 AND status <> 'dead'`, agentID); err != nil {
 				log.Printf("sidecar %s: mark-stopped: %v", agentID, err)
 			} else {
 				log.Printf("sidecar %s: window %s vanished — marked stopped",

@@ -13,7 +13,9 @@
 //     done-path branch and closes the loop,
 //  5. caps the loop: a request_changes landing at/after the review-round cap
 //     parks the task in Needs Human instead of cycling forever,
-//  6. watchdogs stalled reviews AND stalled fixes into Needs Human.
+//  6. freeze-watchdogs silent agents via agent_outbox freshness (MAQ-31):
+//     a frozen reviewer/fixer is auto-retired and its work re-dispatches
+//     in place (see freeze.go).
 //
 // The board mirror is purely derived (sync.go DerivedState) — dispatch never
 // talks to the ticket system and holds no provider dependency.
@@ -103,10 +105,16 @@ func HasMalformedVerdictLine(text string) bool {
 type DispatchConfig struct {
 	// Interval between passes (default 10s, same cadence as sync).
 	Interval time.Duration
-	// ReviewTimeout is the stall watchdog bound: a live reviewer or fixer
-	// with no outbox activity and no transcript growth for this long parks
-	// the task in pending_approval (default 2h, MAQUINISTA_REVIEW_TIMEOUT).
-	ReviewTimeout time.Duration
+	// IdleAfter is the freeze silence bound (MAQ-31): a live pipeline agent
+	// with no agent_outbox row AND no transcript growth for this long —
+	// past SpawnGrace — is frozen and auto-retired, its work re-dispatched
+	// (default 30m, MAQUINISTA_WATCHDOG_IDLE).
+	IdleAfter time.Duration
+	// SpawnGrace is the newborn exemption (MAQ-31): agents younger than
+	// this are never frozen — a fresh spawn has no signal on either
+	// channel yet while pi cold-boots (default 10m,
+	// MAQUINISTA_WATCHDOG_SPAWN).
+	SpawnGrace time.Duration
 	// MaxReviewRounds is the fixer-loop cap (default 3,
 	// MAQUINISTA_REVIEW_ROUNDS_MAX).
 	MaxReviewRounds int
@@ -131,27 +139,23 @@ const DefaultImplementorIdleAfter = 10 * time.Minute
 
 // DefaultDispatchConfig returns the documented defaults.
 func DefaultDispatchConfig(sessionName string) DispatchConfig {
+	idle, spawn := DefaultFreezeIdle, DefaultFreezeSpawn
 	return DispatchConfig{
 		Interval:             10 * time.Second,
-		ReviewTimeout:        2 * time.Hour,
+		IdleAfter:            idle,
+		SpawnGrace:           spawn,
 		MaxReviewRounds:      DefaultMaxReviewRounds,
 		SessionName:          sessionName,
 		ImplementorIdleAfter: DefaultImplementorIdleAfter,
 	}
 }
 
-// DispatchConfigFromEnv applies MAQUINISTA_REVIEW_TIMEOUT,
-// MAQUINISTA_REVIEW_ROUNDS_MAX and MAQUINISTA_IMPLEMENTOR_IDLE_AFTER over
-// the defaults.
+// DispatchConfigFromEnv applies MAQUINISTA_WATCHDOG_IDLE,
+// MAQUINISTA_WATCHDOG_SPAWN, MAQUINISTA_REVIEW_ROUNDS_MAX and
+// MAQUINISTA_IMPLEMENTOR_IDLE_AFTER over the defaults.
 func DispatchConfigFromEnv(sessionName string) DispatchConfig {
 	cfg := DefaultDispatchConfig(sessionName)
-	if v := strings.TrimSpace(os.Getenv("MAQUINISTA_REVIEW_TIMEOUT")); v != "" {
-		if d, err := time.ParseDuration(v); err == nil && d > 0 {
-			cfg.ReviewTimeout = d
-		} else {
-			log.Printf("pipeline: dispatch: invalid MAQUINISTA_REVIEW_TIMEOUT %q, using %s", v, cfg.ReviewTimeout)
-		}
-	}
+	cfg.IdleAfter, cfg.SpawnGrace = FreezeBoundsFromEnv()
 	if v := strings.TrimSpace(os.Getenv("MAQUINISTA_IMPLEMENTOR_IDLE_AFTER")); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			cfg.ImplementorIdleAfter = d
@@ -204,8 +208,11 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 	if cfg.Interval <= 0 {
 		cfg.Interval = 10 * time.Second
 	}
-	if cfg.ReviewTimeout <= 0 {
-		cfg.ReviewTimeout = 2 * time.Hour
+	if cfg.IdleAfter <= 0 {
+		cfg.IdleAfter = DefaultFreezeIdle
+	}
+	if cfg.SpawnGrace <= 0 {
+		cfg.SpawnGrace = DefaultFreezeSpawn
 	}
 	if cfg.MaxReviewRounds <= 0 {
 		cfg.MaxReviewRounds = DefaultMaxReviewRounds
@@ -239,10 +246,10 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := mergerVerdictPass(ctx, pool, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: merger verdict pass: %v", err)
 		}
-		if err := mergerWatchdogPass(ctx, pool, cfg.ReviewTimeout, cfg.SessionName, killWindow); err != nil {
+		if err := mergerWatchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: merger watchdog pass: %v", err)
 		}
-		if err := watchdogPass(ctx, pool, cfg.ReviewTimeout, cfg.SessionName, killWindow); err != nil {
+		if err := watchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: watchdog pass: %v", err)
 		}
 		if err := mergeEnqueuePass(ctx, pool); err != nil {
@@ -599,7 +606,10 @@ func promptPass(ctx context.Context, pool *pgxpool.Pool, g GhRunner) error {
 	if err != nil {
 		return err
 	}
-	type gap struct{ agentID, taskID string; round int }
+	type gap struct {
+		agentID, taskID string
+		round           int
+	}
 	var gaps []gap
 	for rows.Next() {
 		var g gap
@@ -792,14 +802,6 @@ func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verd
 	return landed, true, tx.Commit(ctx)
 }
 
-// watchdogPass parks stalled pipeline agents: a live reviewer (in 'review')
-// or fixer (in 'changes_requested') with NO outbox activity (the monitor
-// writes rows as the agent streams) AND no transcript growth
-// (agents.last_transcript_at, MAQ-9) for longer than the timeout flips the
-// task to pending_approval and retires the pane. Agents younger than the
-// timeout are exempt: a freshly spawned reviewer has no outbox rows yet
-// (prompt delivery races pi's cold boot), and parking it on sight murders
-// every slow-booting spawn before its first streamed token.
 // liveReviewer is one live reviewer/fixer pane on a pipeline task. The
 // title/round columns feed the EX-06 Pipeline-topic summaries.
 type liveReviewer struct {
@@ -818,92 +820,6 @@ WHERE a.role = '` + fixerRole + `'
   AND a.status <> 'dead'
   AND t.status = 'changes_requested'
   AND t.metadata->>'ticket_issue_id' IS NOT NULL`
-
-func watchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
-	// Stall = silent on BOTH activity channels for the whole window:
-	//   - no agent_outbox rows (assistant text streamed by the monitor), AND
-	//   - no transcript growth (last_transcript_at — a healthy agent
-	//     mid-command streams tool events into the JSONL but writes no
-	//     outbox text; MAQ-9).
-	// NULL last_transcript_at = no growth ever observed. The started_at age
-	// guard keeps newborns (no signal on either channel yet) untouchable.
-	stallFilter := `
-  AND a.started_at < NOW() - make_interval(secs => $1)
-  AND NOT EXISTS (
-        SELECT 1 FROM agent_outbox o
-        WHERE o.agent_id = a.id AND o.created_at > NOW() - make_interval(secs => $1))
-  AND (a.last_transcript_at IS NULL
-       OR a.last_transcript_at < NOW() - make_interval(secs => $1))`
-	var reviewers []liveReviewer
-	if err := scanReviewers(ctx, pool, liveReviewersSQL+stallFilter,
-		[]any{timeout.Seconds()}, &reviewers); err != nil {
-		return err
-	}
-	for _, r := range reviewers {
-		applied, err := parkTask(ctx, pool, r.agentID, r.taskID, fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout), "review")
-		if err != nil {
-			return err
-		}
-		if applied {
-			log.Printf("pipeline: dispatch: watchdog retired stalled reviewer %s on %s → needs_human", r.agentID, r.taskID)
-			notifyTaskf(ctx, pool, r.taskID, "🆘 %s: %s%s", r.taskTitle,
-				fmt.Sprintf("watchdog: review stalled past %s — needs human", timeout),
-				prLinkSuffix(ctx, pool, r.taskID))
-			killReviewerPane(sessionName, r.session, r.window, killWindow)
-		}
-	}
-
-	var fixers []liveReviewer
-	if err := scanReviewers(ctx, pool, liveFixersSQL+stallFilter,
-		[]any{timeout.Seconds()}, &fixers); err != nil {
-		return err
-	}
-	for _, r := range fixers {
-		applied, err := parkTask(ctx, pool, r.agentID, r.taskID, fmt.Sprintf("watchdog: fix stalled past %s — needs human", timeout), "changes_requested")
-		if err != nil {
-			return err
-		}
-		if applied {
-			log.Printf("pipeline: dispatch: watchdog retired stalled fixer %s on %s → needs_human", r.agentID, r.taskID)
-			notifyTaskf(ctx, pool, r.taskID, "🆘 %s: %s%s", r.taskTitle,
-				fmt.Sprintf("watchdog: fix stalled past %s — needs human", timeout),
-				prLinkSuffix(ctx, pool, r.taskID))
-			killReviewerPane(sessionName, r.session, r.window, killWindow)
-		}
-	}
-	return nil
-}
-
-// parkTask flips the task to pending_approval (guarded on its current
-// status), records the watchdog note as a verdict row, and retires the
-// agent — one tx. applied=false when the row raced to another status.
-func parkTask(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note, expectStatus string) (bool, error) {
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		return false, err
-	}
-	tag, err := tx.Exec(ctx, `UPDATE tasks SET status='pending_approval' WHERE id=$1 AND status=$2`, taskID, expectStatus)
-	if err != nil {
-		tx.Rollback(ctx)
-		return false, err
-	}
-	if tag.RowsAffected() == 0 {
-		tx.Rollback(ctx)
-		return false, nil
-	}
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO task_context (task_id, agent_id, kind, content)
-		VALUES ($1, $2, 'verdict', $3)
-	`, taskID, agentID, note); err != nil {
-		tx.Rollback(ctx)
-		return false, err
-	}
-	if _, err := tx.Exec(ctx, `UPDATE agents SET status='dead', last_seen=NOW() WHERE id=$1`, agentID); err != nil {
-		tx.Rollback(ctx)
-		return false, err
-	}
-	return true, tx.Commit(ctx)
-}
 
 // ---- fixer loop (EX-04) -------------------------------------------------
 //
@@ -1044,7 +960,11 @@ func fixerPromptPass(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return err
 	}
-	type gap struct{ agentID, taskID string; round int; reviewerAgent string }
+	type gap struct {
+		agentID, taskID string
+		round           int
+		reviewerAgent   string
+	}
 	var gaps []gap
 	for rows.Next() {
 		var g gap

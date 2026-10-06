@@ -194,7 +194,7 @@ func liveMergerForTask(ctx context.Context, pool *pgxpool.Pool, taskID string) (
 	err := pool.QueryRow(ctx, `
 		SELECT EXISTS (
 			SELECT 1 FROM agents
-			WHERE task_id = $1 AND status <> 'dead' AND role = '` + mergerRole + `'
+			WHERE task_id = $1 AND status <> 'dead' AND role = '`+mergerRole+`'
 		)`, taskID).Scan(&live)
 	return live, err
 }
@@ -208,14 +208,14 @@ func hasUnconsumedMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID 
 		SELECT EXISTS (
 			SELECT 1 FROM task_context v
 			WHERE v.task_id = t.id
-			  AND v.kind = '` + mergeVerdictKind + `'
+			  AND v.kind = '`+mergeVerdictKind+`'
 			  AND v.content = 'entry ' || (m.content::jsonb->>'entry')
 			              || ' attempt ' || (m.content::jsonb->>'attempt')
 		)
 		FROM (SELECT id FROM tasks WHERE id = $1) t
 		JOIN LATERAL (
 			SELECT content FROM task_context
-			WHERE task_id = t.id AND kind = '` + mergeConflictKind + `'
+			WHERE task_id = t.id AND kind = '`+mergeConflictKind+`'
 			ORDER BY created_at DESC LIMIT 1
 		) m ON TRUE
 	`, taskID).Scan(&consumed)
@@ -234,7 +234,7 @@ func latestMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID string)
 	var raw string
 	err := pool.QueryRow(ctx, `
 		SELECT content FROM task_context
-		WHERE task_id = $1 AND kind = '` + mergeConflictKind + `'
+		WHERE task_id = $1 AND kind = '`+mergeConflictKind+`'
 		ORDER BY created_at DESC LIMIT 1
 	`, taskID).Scan(&raw)
 	if err == pgx.ErrNoRows {
@@ -394,7 +394,10 @@ func mergerPromptPass(ctx context.Context, pool *pgxpool.Pool) error {
 	if err != nil {
 		return err
 	}
-	type gap struct{ agentID, taskID string; marker mergeConflictMarker }
+	type gap struct {
+		agentID, taskID string
+		marker          mergeConflictMarker
+	}
 	var gaps []gap
 	for rows.Next() {
 		var g gap
@@ -687,23 +690,20 @@ func retireMerger(ctx context.Context, pool *pgxpool.Pool, agentID string) {
 
 // ---- watchdog arm ----------------------------------------------------------
 
-// mergerWatchdogPass parks a stalled merger episode: a live merger on a
+// mergerWatchdogPass parks a frozen merger episode: a live merger on a
 // ready_to_merge task with no outbox activity AND no transcript growth for
-// longer than the timeout (same stall definition as reviewers/fixers, MAQ-9).
-func mergerWatchdogPass(ctx context.Context, pool *pgxpool.Pool, timeout time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
-	stallFilter := `
-  AND a.started_at < NOW() - make_interval(secs => $1)
-  AND NOT EXISTS (
-        SELECT 1 FROM agent_outbox o
-        WHERE o.agent_id = a.id AND o.created_at > NOW() - make_interval(secs => $1))
-  AND (a.last_transcript_at IS NULL
-       OR a.last_transcript_at < NOW() - make_interval(secs => $1))`
-	mergers, err := scanLiveMergers(ctx, pool, liveMergersSQL+stallFilter, []any{timeout.Seconds()})
+// longer than the idle bound, past the spawn grace (same freeze definition
+// as reviewers/fixers, MAQ-31). Unlike reviewer/fixer freezes this still
+// lands needs-human (parkMergerConflict): the money path keeps its human
+// gate, and the conflicted queue entry + marker preserve the episode for a
+// hand-resolve or re-approve.
+func mergerWatchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
+	mergers, err := scanLiveMergers(ctx, pool, liveMergersSQL+FreezeFilterSQL, []any{idle.Seconds(), spawn.Seconds()})
 	if err != nil {
 		return err
 	}
 	for _, m := range mergers {
-		note := fmt.Sprintf("watchdog: merger stalled past %s — needs human", timeout)
+		note := fmt.Sprintf("watchdog: merger frozen — no outbox activity for %s past the %s spawn grace — needs human", idle, spawn)
 		applied, err := parkMergerConflict(ctx, pool, m.agentID, m.taskID, m.marker, note)
 		if err != nil {
 			return err

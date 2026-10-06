@@ -523,6 +523,9 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		go func() {
 			if err := taskscheduler.Run(ctx, pool, taskscheduler.Config{
 				EnsureAgent: ensureTaskWorker(pool, cfg, sidecarMgr),
+				// MAQ-31 freeze arms: pane cleanup on auto-retires.
+				SessionName: cfg.TmuxSessionName,
+				KillWindow:  tmux.KillWindow,
 			}); err != nil && ctx.Err() == nil {
 				log.Printf("task-scheduler: %v", err)
 			}

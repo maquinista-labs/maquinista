@@ -252,7 +252,7 @@ func cleanupDeadWindow(b *Bot, windowID string) {
 		defer cancel()
 		if _, uerr := pool.Exec(ctx, `
 			UPDATE agents SET status='stopped', last_seen=NOW()
-			WHERE tmux_session=$1 AND tmux_window=$2
+			WHERE tmux_session=$1 AND tmux_window=$2 AND status <> 'dead'
 		`, b.config.TmuxSessionName, windowID); uerr != nil {
 			log.Printf("cleanupThreadsForWindow: mark stopped: %v", uerr)
 		}
@@ -309,7 +309,7 @@ func (b *Bot) cleanStaleSessionMap(liveIDs map[string]bool) {
 		}
 		if _, err := pool.Exec(ctx, `
 			UPDATE agents SET status='stopped', last_seen=NOW()
-			WHERE tmux_session=$1 AND tmux_window=$2
+			WHERE tmux_session=$1 AND tmux_window=$2 AND status <> 'dead'
 		`, b.config.TmuxSessionName, wid); err != nil {
 			log.Printf("cleanStaleSessionMap: %s: %v", key, err)
 		}

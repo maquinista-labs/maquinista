@@ -103,6 +103,18 @@ implementor:
   pre-registration phase) — each release announces the requeue-after-heal
   on the Pipeline topic (MAQ-22; the guarded UPDATE's RETURNING is the
   exactly-once guard)
+- **freeze arm + restart sweep (MAQ-31):** `RetireFrozenClaims` runs each
+  wake BEFORE the reaper — a live row on a `claimed` task that meets the
+  shared freeze predicate (pipeline.FreezeFilterSQL: no outbox row AND no
+  transcript growth past `MAQUINISTA_WATCHDOG_IDLE`, older than
+  `MAQUINISTA_WATCHDOG_SPAWN`) is retired (🆘 exactly once via the guarded
+  retire) so the reaper's all-rows-non-live check passes on the same wake
+  and the claim requeues to `ready` for a fresh `-rN` implementor.
+  `HealRestartCohort` runs once at unit start: live task rows whose
+  `last_seen` predates the boot and that never streamed (the crash-
+  restart cohort) are healed on the first pass — implementor ghosts via
+  the reaper, reviewer ghosts via dispatchPass, fixer episodes re-armed
+  (fix row released atomically with the retire), newborns spared
 
 The standalone `maquinista task-scheduler` subcommand keeps the
 orchestrator.EnsureAgent stub (row-only, no pty) for debugging alongside a
@@ -294,19 +306,38 @@ session in the SAME worktree/PR:
   `maquinista-done` → `db.MarkDone` done-path branch → `review` → the
   reviewer spawn pass mints a fresh reviewer and bumps the round
 
-**Watchdog.** A live reviewer (in `review`) or fixer (in
-`changes_requested`) with NO activity signal for longer than
-`MAQUINISTA_REVIEW_TIMEOUT` (default 2h) parks the task in
-`pending_approval` with a watchdog verdict row and retires the pane.
-Activity is two-channel (MAQ-9): `agent_outbox` rows (assistant text the
-monitor streams) OR transcript growth (`agents.last_transcript_at`, written
-throttled by the monitor on JSONL offset advance — a healthy agent
-mid-command emits tool events but no outbox text). Parking requires BOTH
-channels silent for the whole window; agents younger than the timeout are
-exempt entirely (a newborn has no signal on either channel yet — parking on
-sight murders slow-booting spawns). The malformed-verdict case is
-deliberately left to the watchdog: the parser never guesses, the timeout is
-the backstop — and a stalled fixer is bounded the same way.
+**Watchdog (freeze detection, MAQ-31).** The liveness signal is
+`agent_outbox` freshness — the ground-truth activity stream (§3) — with a
+second veto channel: a live pipeline agent (reviewer in `review`, fixer in
+`changes_requested`, merger in `ready_to_merge`) is **frozen** when it has
+no outbox row AND no transcript growth (`agents.last_transcript_at`,
+MAQ-9 — a healthy agent mid-command streams tool events, not outbox text)
+for `MAQUINISTA_WATCHDOG_IDLE` (default 30m), past the newborn grace
+`MAQUINISTA_WATCHDOG_SPAWN` (default 10m — prompt delivery races pi cold
+boot, so younger agents are untouchable). Pane existence and
+`agents.last_seen` are explicitly NOT signals: on the 06/10 night two
+agents (an implementor pre-PR, a reviewer mid-review) sat `running` for
+60+ min with live panes and zero outbox rows while the old watchdog — whose
+newborn exemption was the full 2h stall bound, and which had no arm for
+implementors at all — never fired. On freeze the row is retired (the
+guarded UPDATE is the exactly-once 🆘 dedup; the retired agent's undriven
+task prompts are dropped so episode dedup keys free up), the pane is
+killed, and the work re-dispatches per role: reviewer → fresh `-rN`
+reviewer IN-ROUND (task stays `review`; the spawn pass mints), fixer →
+episode re-armed (the round's fix row is released; task stays
+`changes_requested`), implementor → claim requeued to `ready` by the
+stale-claim reaper (the task scheduler runs the same freeze predicate
+every wake — `taskscheduler.RetireFrozenClaims`). Every auto-retire
+notifies; silence is never a heal. The merger freeze still parks
+needs-human (the money path keeps a human gate). A **restart-cohort sweep**
+(`taskscheduler.HealRestartCohort`) runs once at unit start: live task rows
+whose `last_seen` predates the boot (crash restart — a graceful stop
+deletes task agents outright) and that never streamed a single outbox row
+are healed on the first pass instead of waiting for a human to notice a
+stalled board; rows younger than the spawn grace are left to the
+continuous arm (the 04/10 lesson: never murder a newborn on sight). The
+malformed-verdict case is still left to the watchdog: the parser never
+guesses, the freeze bound is the backstop.
 
 ## Env contract
 
@@ -320,7 +351,8 @@ the backstop — and a stalled fixer is bounded the same way.
 | `MAQUINISTA_WORKTREE_GRACE` | how long an unspawnable claimed task (no worktree, no live agent) sits before the scheduler parks it needs-human | `10m` |
 | `MAQUINISTA_TICKETS_APPROVERS` | ticket-system identities (email or display name, comma-separated) allowed to drive comment verbs; empty = fail-closed | (nobody) |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
-| `MAQUINISTA_REVIEW_TIMEOUT` | dispatch watchdog stall bound (reviewers + fixers) | `2h` |
+| `MAQUINISTA_WATCHDOG_IDLE` | freeze silence bound: a live pipeline agent with no outbox row AND no transcript growth this long (past the spawn grace) is auto-retired and its work re-dispatched (MAQ-31) | `30m` |
+| `MAQUINISTA_WATCHDOG_SPAWN` | freeze newborn grace: agents younger than this are never frozen (pi cold boot) | `10m` |
 | `MAQUINISTA_IMPLEMENTOR_IDLE_AFTER` | stuck-implementor self-heal bound: outbox idleness past this retires a `uq_agents_task_live`-blocking implementor row | `10m` |
 | `MAQUINISTA_REVIEW_ROUNDS_MAX` | fixer-loop cap: the request_changes landing at/after this review round parks the task | `3` |
 | `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |
@@ -458,8 +490,9 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   and ends with exactly `VERDICT: merged` or `VERDICT: needs_human`. On
   `merged` the verdict pass consumes the episode and the released entry
   re-runs the normal path unchanged (fetch → rebase → lease push → CI gate
-  → squash). On `needs_human` (or a stalled merger past
-  `MAQUINISTA_REVIEW_TIMEOUT`, or a marker left unconsumed for 2h) the task
+  → squash). On `needs_human` (or a frozen merger — outbox + transcript
+  silent past the freeze bounds, MAQ-31 — or a marker left unconsumed for
+  2h) the task
   parks `pending_approval` and the entry goes `conflict` with the marker's
   files — the pre-MAQ-15 landing, unchanged. Below the attempts cap the
   episode arms; at the cap the conflict parks directly. Episode identity is

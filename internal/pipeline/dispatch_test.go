@@ -423,32 +423,67 @@ func TestVerdict_MalformedWaits(t *testing.T) {
 	}
 }
 
-// TestWatchdog_StallTimeout parks a reviewer with no outbox activity past
-// the bound into needs-human; TestWatchdog_InsideTimeoutUntouched proves
-// an active reviewer is left alone.
-func TestWatchdog_StallTimeout(t *testing.T) {
+// TestWatchdog_FrozenReviewerRetired is the MAQ-31 core regression: a
+// reviewer past the spawn grace with zero outbox rows and no transcript
+// growth (the 06/10 victim shape: spawned, never wired, live pane) is
+// FROZEN — auto-retired within one pass while the task STAYS 'review' so
+// the next dispatch tick respawns a fresh reviewer in-round. The old
+// watchdog exempted every agent younger than the full stall timeout (2h)
+// and parked needs-human; both behaviors are gone.
+func TestWatchdog_FrozenReviewerRetired(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	seedReviewTask(t, pool, "tw", "uuid-w", "/tmp/wt")
 	seedReviewer(t, pool, "reviewer-tw", "tw")
-	// Backdate past the stall bound: the young-agent guard exempts agents
-	// younger than the timeout even with zero outbox activity.
+	// Past the 10m spawn grace, silent on both channels for 31m.
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-tw'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
-	if got := taskCol(t, pool, "tw", "status"); got != "pending_approval" {
-		t.Fatalf("stalled task status = %q, want pending_approval", got)
+	// Task stays review — the re-dispatch is a fresh reviewer, not a park.
+	if got := taskCol(t, pool, "tw", "status"); got != "review" {
+		t.Fatalf("frozen task status = %q, want review (respawns in-round)", got)
 	}
-	var content string
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='reviewer-tw'`).Scan(&status); err != nil {
+		t.Fatalf("reviewer row: %v", err)
+	}
+	if status != "dead" {
+		t.Fatalf("frozen reviewer status = %q, want dead", status)
+	}
+	// The freeze observation lands for downstream attempts.
+	var note string
 	if err := pool.QueryRow(ctx, `
-		SELECT content FROM task_context WHERE task_id='tw' AND kind='verdict'
-	`).Scan(&content); err != nil {
-		t.Fatalf("watchdog verdict row: %v", err)
+		SELECT content FROM task_context WHERE task_id='tw' AND kind='observation'
+	`).Scan(&note); err != nil {
+		t.Fatalf("freeze observation row: %v", err)
 	}
-	if !strings.Contains(content, "watchdog") {
-		t.Fatalf("verdict content = %q, want watchdog note", content)
+	if !strings.Contains(note, "watchdog") {
+		t.Fatalf("observation content = %q, want watchdog note", note)
+	}
+	// 🆘 exactly once: a second pass must be a no-op.
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+		t.Fatalf("second watchdogPass: %v", err)
+	}
+	var notifies int
+	if err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM agent_outbox
+		WHERE agent_id = 'pipeline' AND content->>'text' LIKE '%watchdog%'
+	`).Scan(&notifies); err != nil {
+		t.Fatalf("notify count: %v", err)
+	}
+	if notifies != 1 {
+		t.Fatalf("🆘 notifications = %d, want exactly 1 after two passes", notifies)
+	}
+
+	// And the re-dispatch: the next spawn pass mints a FRESH reviewer (-r2).
+	sp := &fakeSpawner{t: t, pool: pool, insertRow: false}
+	if err := dispatchPass(ctx, pool, nil, sp, 10*time.Minute); err != nil {
+		t.Fatalf("dispatchPass: %v", err)
+	}
+	if len(sp.spawns) != 1 || sp.spawns[0].AgentID != "reviewer-tw-r2" {
+		t.Fatalf("respawn = %+v, want exactly reviewer-tw-r2", sp.spawns)
 	}
 }
 
@@ -463,7 +498,7 @@ func TestWatchdog_InsideTimeoutUntouched(t *testing.T) {
 		VALUES ('reviewer-tx', '{"text":"still reviewing"}'::jsonb)
 	`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "tx", "status"); got != "review" {
@@ -479,24 +514,24 @@ func TestWatchdog_InsideTimeoutUntouched(t *testing.T) {
 }
 
 // TestWatchdog_TranscriptGrowthKeepsAlive pins the MAQ-9 liveness signal:
-// a reviewer past the age guard with ZERO outbox rows but recent transcript
-// growth (last_transcript_at inside the stall window — a long `go test`
+// a reviewer past the spawn grace with ZERO outbox rows but recent transcript
+// growth (last_transcript_at inside the idle window — a long `go test`
 // streams tool events, not assistant text) is HEALTHY and must not be
-// parked. Regression: 2026-10-02, the EX-07 round-3 reviewer spent minutes
-// running the suite with zero outbox rows; today's code parks it anyway.
+// retired. Regression: 2026-10-02, the EX-07 round-3 reviewer spent minutes
+// running the suite with zero outbox rows.
 func TestWatchdog_TranscriptGrowthKeepsAlive(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	seedReviewTask(t, pool, "tg", "uuid-g", "/tmp/wt")
 	seedReviewer(t, pool, "reviewer-tg", "tg")
-	// Past the age guard (PR #12), silent outbox, but the transcript grew
+	// Past the spawn grace (PR #12), silent outbox, but the transcript grew
 	// five minutes ago — mid-command liveness.
 	execOK(t, pool, `
 		UPDATE agents SET started_at = NOW() - interval '31 minutes',
 		                   last_transcript_at = NOW() - interval '5 minutes'
 		WHERE id='reviewer-tg'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "tg", "status"); got != "review" {
@@ -511,11 +546,11 @@ func TestWatchdog_TranscriptGrowthKeepsAlive(t *testing.T) {
 	}
 }
 
-// TestWatchdog_StaleTranscriptStillParks is the AC-2 regression: the
-// liveness signal must not become an amnesty. A reviewer past the age
-// guard whose transcript last grew BEFORE the stall window (grew once at
-// spawn, silent since) and with zero outbox rows is truly idle — parked.
-func TestWatchdog_StaleTranscriptStillParks(t *testing.T) {
+// TestWatchdog_StaleTranscriptStillRetired is the AC-2 regression: the
+// liveness signal must not become an amnesty. A reviewer past the spawn
+// grace whose transcript last grew BEFORE the idle window (grew once at
+// spawn, silent since) and with zero outbox rows is truly frozen — retired.
+func TestWatchdog_StaleTranscriptStillRetired(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 	seedReviewTask(t, pool, "ts", "uuid-s", "/tmp/wt")
@@ -525,11 +560,126 @@ func TestWatchdog_StaleTranscriptStillParks(t *testing.T) {
 		                   last_transcript_at = NOW() - interval '31 minutes'
 		WHERE id='reviewer-ts'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
-	if got := taskCol(t, pool, "ts", "status"); got != "pending_approval" {
-		t.Fatalf("stale-transcript task status = %q, want pending_approval", got)
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='reviewer-ts'`).Scan(&status); err != nil {
+		t.Fatalf("reviewer row: %v", err)
+	}
+	if status != "dead" {
+		t.Fatalf("stale-transcript reviewer status = %q, want dead", status)
+	}
+}
+
+// TestWatchdog_FrozenNewbornRetired is the exact MAQ-31 victim shape: an
+// agent spawned 11 minutes ago with NO signal on either channel (never
+// wired — prompt delivery lost, sidecar never attached) is frozen the
+// moment the spawn grace lapses, not at the old 2h timeout.
+func TestWatchdog_FrozenNewbornRetired(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tn", "uuid-n", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-tn", "tn")
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '11 minutes' WHERE id='reviewer-tn'`)
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='reviewer-tn'`).Scan(&status); err != nil {
+		t.Fatalf("reviewer row: %v", err)
+	}
+	if status != "dead" {
+		t.Fatalf("frozen newborn status = %q, want dead (spawn grace lapsed)", status)
+	}
+}
+
+// TestWatchdog_FrozenFixerReArms: a frozen fixer (task changes_requested)
+// is retired and its EPISODE re-armed — the round's fix row is released so
+// the next fixer pass mints a fresh fixer with a working prompt (the
+// frozen agent's shadowed inbox row is dropped).
+func TestWatchdog_FrozenFixerReArms(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	execOK(t, pool, `
+		INSERT INTO tasks (id, title, status, worktree_path, review_rounds, metadata)
+		VALUES ('tf', 'task tf', 'changes_requested', $1, 2, '{"ticket_issue_id":"uuid-f"}'::jsonb)
+	`, dir)
+	// A dead round-1 reviewer (the verdict author — the FK on agent_outbox
+	// requires the row) whose findings the fresh fix prompt embeds.
+	execOK(t, pool, `
+		INSERT INTO agents (id, tmux_session, tmux_window, role, task_id, status,
+		                    runner_type, cwd, window_name, started_at, last_seen, stop_requested)
+		VALUES ('reviewer-tf', 'sess', 'reviewer-tf', 'reviewer', 'tf', 'dead',
+		        'pi', $1, 'reviewer-tf', NOW(), NOW(), FALSE)
+	`, dir)
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('tf', 'reviewer-tf', 'verdict', 'VERDICT: request_changes')
+	`)
+	// The verdict's findings text — what enqueueFixPrompt embeds in the
+	// fresh fixer's prompt (latestFindings reads the verdict author's
+	// newest outbox row).
+	execOK(t, pool, `
+		INSERT INTO agent_outbox (agent_id, content)
+		VALUES ('reviewer-tf', '{"text":"1) tests missing\nVERDICT: request_changes\n"}'::jsonb)
+	`)
+	seedFixer(t, pool, "fixer-tf", "tf")
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '45 minutes' WHERE id='fixer-tf'`)
+	// The episode's fix row (blocks respawn) + the fixer's undriven prompt.
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('tf', 'fixer-tf', 'fix', 'round 2')
+	`)
+	execOK(t, pool, `
+		INSERT INTO agent_inbox (agent_id, from_kind, origin_channel, external_msg_id, content)
+		VALUES ('fixer-tf', 'system', 'task', 'fix:tf:2', '{"type":"fix"}'::jsonb)
+	`)
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	var status string
+	if err := pool.QueryRow(ctx, `SELECT status FROM agents WHERE id='fixer-tf'`).Scan(&status); err != nil {
+		t.Fatalf("fixer row: %v", err)
+	}
+	if status != "dead" {
+		t.Fatalf("frozen fixer status = %q, want dead", status)
+	}
+	if got := taskCol(t, pool, "tf", "status"); got != "changes_requested" {
+		t.Fatalf("task status = %q, want changes_requested (episode re-arms, no park)", got)
+	}
+	var fixRows int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM task_context WHERE task_id='tf' AND kind='fix'`).Scan(&fixRows); err != nil {
+		t.Fatal(err)
+	}
+	if fixRows != 0 {
+		t.Fatalf("fix rows = %d, want 0 (episode re-armed)", fixRows)
+	}
+	var inboxRows int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE agent_id='fixer-tf'`).Scan(&inboxRows); err != nil {
+		t.Fatal(err)
+	}
+	if inboxRows != 0 {
+		t.Fatalf("ghost prompt rows = %d, want 0 (undriven prompts dropped)", inboxRows)
+	}
+
+	// Re-dispatch: fixerPass mints a fresh fixer for the SAME round.
+	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
+	if err := fixerPass(ctx, pool, nil, sp, 10*time.Minute); err != nil {
+		t.Fatalf("fixerPass: %v", err)
+	}
+	if len(sp.spawns) != 1 || sp.spawns[0].AgentID != "fixer-tf-r2" {
+		t.Fatalf("fixer respawn = %+v, want exactly fixer-tf-r2", sp.spawns)
+	}
+	var prompts int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM agent_inbox WHERE agent_id='fixer-tf-r2'`).Scan(&prompts); err != nil {
+		t.Fatal(err)
+	}
+	if prompts != 1 {
+		t.Fatalf("fresh fixer prompt rows = %d, want 1", prompts)
 	}
 }
 
@@ -544,7 +694,7 @@ func TestWatchdog_YoungAgentUntouched(t *testing.T) {
 	seedReviewTask(t, pool, "ty", "uuid-y", "/tmp/wt")
 	seedReviewer(t, pool, "reviewer-ty", "ty") // started_at = NOW()
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "ty", "status"); got != "review" {
