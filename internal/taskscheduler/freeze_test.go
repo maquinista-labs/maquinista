@@ -80,7 +80,7 @@ func TestRetireFrozenClaims(t *testing.T) {
 	ctx := context.Background()
 	seedClaim(t, pool, "FZ", "impl-fz")
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +122,7 @@ func TestRetireFrozenClaims_ActiveUntouched(t *testing.T) {
 		VALUES ('impl-fa', '{"text":"working the spec"}'::jsonb)
 	`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestRetireFrozenClaims_TranscriptGrowthUntouched(t *testing.T) {
 	seedClaim(t, pool, "FT", "impl-ft")
 	exec(t, pool, `UPDATE agents SET last_transcript_at = NOW() - INTERVAL '5 minutes' WHERE id='impl-ft'`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +164,7 @@ func TestRetireFrozenClaims_YoungUntouched(t *testing.T) {
 		WHERE id='impl-fy'
 	`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -314,6 +314,129 @@ func TestHealRestartCohort_PostBootTranscriptSpared(t *testing.T) {
 	}
 	if n := pipelineNotifyCount(t, pool, "restart cohort"); n != 0 {
 		t.Fatalf("🆘 notes = %d, want 0 (a spared agent is never notified)", n)
+	}
+}
+
+// TestRetireFrozenClaims_RespawnCapParks pins the implementor arm's
+// circuit breaker: a task whose respawn budget is spent parks needs-human
+// atomically with the retire instead of requeueing — and the reaper leaves
+// a parked task alone (the freeze→requeue→claim→freeze outage loop ends).
+func TestRetireFrozenClaims_RespawnCapParks(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+	seedClaim(t, pool, "FP", "impl-fp")
+	// Three freeze cycles already spent (the observation ledger the guarded
+	// retires wrote).
+	for i := 0; i < 3; i++ {
+		exec(t, pool, `
+			INSERT INTO task_context (task_id, agent_id, kind, content)
+			VALUES ('FP', 'impl-fp', 'observation',
+			        'watchdog: implementor impl-fp frozen — no outbox activity; auto-retired')
+		`)
+	}
+
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired != 1 {
+		t.Fatalf("retired = %d, want 1", retired)
+	}
+	if got := agentStatus(t, pool, "impl-fp"); got != "dead" {
+		t.Fatalf("frozen implementor status = %q, want dead", got)
+	}
+	if got := taskStatus(t, pool, "FP"); got != "pending_approval" {
+		t.Fatalf("task status = %q, want pending_approval (cap reached — no requeue)", got)
+	}
+	// The reaper must not touch the parked task.
+	reaped, err := ReapStaleClaims(ctx, pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reaped != 0 {
+		t.Fatalf("reaped = %d, want 0 (parked tasks are out of the reaper's scope)", reaped)
+	}
+	// The park verdict names the reason, exactly once.
+	var verdicts int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM task_context WHERE task_id='FP' AND kind='verdict'`).Scan(&verdicts); err != nil {
+		t.Fatal(err)
+	}
+	if verdicts != 1 {
+		t.Fatalf("verdict rows = %d, want 1", verdicts)
+	}
+}
+
+// TestRun_RestartSweepSparesStreamingPane is the round-2 review headline
+// fix, pinned end-to-end through Run: the sweep must NOT run at +0s — the
+// monitor's first poll lands ~one poll interval after `go mon.Run`, so a
+// boot-instant sweep sees only pre-boot transcripts, the boot-relative
+// veto is dead code, and a mid-turn crash survivor is murdered on sight.
+// Run defers the sweep a few monitor polls: a touch written during the
+// grace window (the streaming survivor below) vetoes the heal, while an
+// untouched ghost still sweeps on the same boot.
+func TestRun_RestartSweepSparesStreamingPane(t *testing.T) {
+	pool := setup(t)
+
+	// The survivor: pre-boot implementor on a claimed task, zero outbox
+	// rows. Its transcript was touched 5m before the boot (within the
+	// continuous arm's idle window — so RetireFrozenClaims spares it
+	// throughout), and the "monitor" touches it again 30ms after boot,
+	// inside the sweep grace (3 × 200ms) — post-boot growth, veto fires.
+	seedClaim(t, pool, "RS", "impl-rs")
+	exec(t, pool, `UPDATE agents SET last_seen = $1, last_transcript_at = NOW() - INTERVAL '5 minutes' WHERE id='impl-rs'`,
+		time.Now().Add(-time.Minute))
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		exec(t, pool, `UPDATE agents SET last_transcript_at = NOW() WHERE id='impl-rs'`)
+	}()
+
+	// The ghost: pre-boot reviewer on a review task, silent on both
+	// channels — reviewers are outside the scheduler's continuous arm, so
+	// only the restart sweep can heal it in this Run.
+	exec(t, pool, `
+		INSERT INTO tasks (id, title, status, worktree_path, metadata)
+		VALUES ('RG', 'task RG', 'review', '/tmp/wt-rg', '{"ticket_issue_id":"gh-rg"}'::jsonb)
+	`)
+	exec(t, pool, `
+		INSERT INTO agents (id, tmux_session, tmux_window, role, task_id, status,
+		                    runner_type, cwd, window_name, started_at, last_seen, stop_requested)
+		VALUES ('reviewer-rg', 'maquinista', 'reviewer-rg', 'reviewer', 'RG', 'running',
+		        'pi', '/tmp/wt-rg', 'reviewer-rg', NOW() - INTERVAL '30 minutes', $1, FALSE)
+	`, time.Now().Add(-time.Minute))
+
+	cfg := Config{
+		PollInterval:        20 * time.Millisecond,
+		MonitorPollInterval: 200 * time.Millisecond, // sweep grace = 600ms
+		EnsureAgent: func(context.Context, string, string) (string, error) {
+			return "", nil
+		},
+	}
+	runCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = Run(runCtx, pool, cfg) // ctx.Err on cancel is expected
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+		t.Fatal("Run did not return")
+	}
+
+	// The streaming survivor is alive, its claim intact.
+	if got := agentStatus(t, pool, "impl-rs"); got != "running" {
+		t.Fatalf("streaming survivor status = %q, want running (post-boot transcript veto)", got)
+	}
+	if got := taskStatus(t, pool, "RS"); got != "claimed" {
+		t.Fatalf("survivor task status = %q, want claimed", got)
+	}
+	// The true ghost swept exactly once — the deferral did not break AC 3.
+	if got := agentStatus(t, pool, "reviewer-rg"); got != "dead" {
+		t.Fatalf("ghost status = %q, want dead (sweep still heals)", got)
+	}
+	if n := pipelineNotifyCount(t, pool, "restart cohort"); n != 1 {
+		t.Fatalf("🆘 notes = %d, want exactly 1", n)
 	}
 }
 

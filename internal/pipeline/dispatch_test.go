@@ -438,7 +438,7 @@ func TestWatchdog_FrozenReviewerRetired(t *testing.T) {
 	// Past the 10m spawn grace, silent on both channels for 31m.
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-tw'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	// Task stays review — the re-dispatch is a fresh reviewer, not a park.
@@ -463,7 +463,7 @@ func TestWatchdog_FrozenReviewerRetired(t *testing.T) {
 		t.Fatalf("observation content = %q, want watchdog note", note)
 	}
 	// 🆘 exactly once: a second pass must be a no-op.
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("second watchdogPass: %v", err)
 	}
 	var notifies int
@@ -498,7 +498,7 @@ func TestWatchdog_InsideTimeoutUntouched(t *testing.T) {
 		VALUES ('reviewer-tx', '{"text":"still reviewing"}'::jsonb)
 	`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "tx", "status"); got != "review" {
@@ -531,7 +531,7 @@ func TestWatchdog_TranscriptGrowthKeepsAlive(t *testing.T) {
 		                   last_transcript_at = NOW() - interval '5 minutes'
 		WHERE id='reviewer-tg'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "tg", "status"); got != "review" {
@@ -560,7 +560,7 @@ func TestWatchdog_StaleTranscriptStillRetired(t *testing.T) {
 		                   last_transcript_at = NOW() - interval '31 minutes'
 		WHERE id='reviewer-ts'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	var status string
@@ -583,7 +583,7 @@ func TestWatchdog_FrozenNewbornRetired(t *testing.T) {
 	seedReviewer(t, pool, "reviewer-tn", "tn")
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '11 minutes' WHERE id='reviewer-tn'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	var status string
@@ -592,6 +592,84 @@ func TestWatchdog_FrozenNewbornRetired(t *testing.T) {
 	}
 	if status != "dead" {
 		t.Fatalf("frozen newborn status = %q, want dead (spawn grace lapsed)", status)
+	}
+}
+
+// TestWatchdog_RespawnCapParks pins the freeze→respawn circuit breaker
+// (round-2 review): a reviewer round whose respawn budget is spent parks
+// the task needs-human on the next freeze — atomically with the retire
+// (exactly-once 🆘 + verdict row) — instead of respawning forever. The
+// budget is round-scoped: a fresh round starts clean even with the
+// previous round's ledger full.
+func TestWatchdog_RespawnCapParks(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tc", "uuid-c", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-tc", "tc")
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-tc'`)
+	execOK(t, pool, `UPDATE tasks SET review_rounds = 1 WHERE id = 'tc'`)
+	// Three freeze cycles already spent this round — the observation rows
+	// each guarded retire writes are the budget ledger.
+	for i := 0; i < 3; i++ {
+		execOK(t, pool, `
+			INSERT INTO task_context (task_id, agent_id, kind, content)
+			VALUES ('tc', 'reviewer-tc', 'observation',
+			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired')
+		`)
+	}
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	if got := taskCol(t, pool, "tc", "status"); got != "pending_approval" {
+		t.Fatalf("capped task status = %q, want pending_approval (circuit breaker)", got)
+	}
+	if got := agentStatus(t, pool, "reviewer-tc"); got != "dead" {
+		t.Fatalf("capped reviewer status = %q, want dead", got)
+	}
+	var verdict string
+	if err := pool.QueryRow(ctx, `
+		SELECT content FROM task_context WHERE task_id='tc' AND kind='verdict'
+	`).Scan(&verdict); err != nil {
+		t.Fatalf("park verdict row: %v", err)
+	}
+	if !strings.Contains(verdict, "parking needs-human") {
+		t.Fatalf("verdict = %q, want park reason", verdict)
+	}
+	// Exactly once: a second pass is a no-op (the retire guard), so the
+	// park verdict never duplicates.
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+		t.Fatalf("second watchdogPass: %v", err)
+	}
+	var verdicts int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM task_context WHERE task_id='tc' AND kind='verdict'`).Scan(&verdicts); err != nil {
+		t.Fatal(err)
+	}
+	if verdicts != 1 {
+		t.Fatalf("verdict rows = %d, want 1 after two passes", verdicts)
+	}
+
+	// A fresh round starts with a fresh budget: the same freeze with the
+	// task at round 2 respawns even though round 1's ledger is full.
+	seedReviewTask(t, pool, "td", "uuid-d", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-td", "td")
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-td'`)
+	execOK(t, pool, `UPDATE tasks SET review_rounds = 2 WHERE id = 'td'`)
+	for i := 0; i < 3; i++ {
+		execOK(t, pool, `
+			INSERT INTO task_context (task_id, agent_id, kind, content)
+			VALUES ('td', 'reviewer-td', 'observation',
+			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired')
+		`)
+	}
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass (td): %v", err)
+	}
+	if got := taskCol(t, pool, "td", "status"); got != "review" {
+		t.Fatalf("fresh-round task status = %q, want review (budget is round-scoped)", got)
+	}
+	if got := agentStatus(t, pool, "reviewer-td"); got != "dead" {
+		t.Fatalf("fresh-round reviewer status = %q, want dead (respawn path)", got)
 	}
 }
 
@@ -638,7 +716,7 @@ func TestWatchdog_FrozenFixerReArms(t *testing.T) {
 		VALUES ('fixer-tf', 'system', 'task', 'fix:tf:2', '{"type":"fix"}'::jsonb)
 	`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	var status string
@@ -694,7 +772,7 @@ func TestWatchdog_YoungAgentUntouched(t *testing.T) {
 	seedReviewTask(t, pool, "ty", "uuid-y", "/tmp/wt")
 	seedReviewer(t, pool, "reviewer-ty", "ty") // started_at = NOW()
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "ty", "status"); got != "review" {

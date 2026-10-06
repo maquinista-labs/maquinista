@@ -6,13 +6,21 @@
 //   - RetireFrozenClaims runs every wake: a live agent row on a 'claimed'
 //     task that is frozen (no outbox row AND no transcript growth past
 //     IdleAfter, older than SpawnGrace — the shared pipeline.FreezeFilterSQL
-//     predicate) is retired. The task row stays 'claimed'; the next wake's
-//     ReapStaleClaims sees only non-live rows and requeues it to 'ready',
-//     where DispatchOne mints a fresh -rN implementor. Retiring instead of
+//     predicate) is retired. The task row stays 'claimed'; the SAME wake's
+//     ReapStaleClaims (Run orders the retire BEFORE the reaper for exactly
+//     this) sees only non-live rows and requeues it to 'ready', where
+//     DispatchOne mints a fresh -rN implementor. Retiring instead of
 //     requeueing inline keeps one writer per transition (the reaper's
-//     guarded UPDATE + its 🔄 note).
+//     guarded UPDATE + its 🔄 note). The respawn budget is capped per task
+//     (no rounds in the implementor phase): past pipeline's
+//     FreezeRespawnCapFromEnv freeze retires, the next freeze parks the
+//     task needs-human in the same retire tx instead of requeueing — the
+//     circuit breaker against a systemic outage looping
+//     freeze→requeue→claim→freeze forever.
 //
-//   - HealRestartCohort runs once at unit start (MAQ-31 AC 3): live
+//   - HealRestartCohort runs once per unit boot (MAQ-31 AC 3) — deferred
+//     by Run until the monitor has had its first polls (the boot-relative
+//     transcript veto is meaningless before the monitor has spoken). Live
 //     task-scoped rows whose last_seen predates THIS process (crash
 //     restart — a graceful `maquinista stop` deletes task agents outright)
 //     and that never signaled post-boot — no outbox row ever AND no
@@ -53,8 +61,10 @@ WHERE t.status = 'claimed'
 
 // RetireFrozenClaims retires every frozen agent row on a claimed task.
 // Returns the number of rows THIS call retired (each one notified exactly
-// once, inside pipeline.RetireFrozenAgent's guarded transition).
-func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, sessionName string, killWindow func(session, windowID string) error) (int, error) {
+// once, inside pipeline.RetireFrozenAgent's guarded transition). Episodes
+// whose respawn budget (respawnCap) is spent park needs-human atomically
+// with the retire instead of requeueing.
+func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error) (int, error) {
 	rows, err := pool.Query(ctx, frozenClaimsSQL, idle.Seconds(), spawn.Seconds())
 	if err != nil {
 		return 0, err
@@ -75,14 +85,32 @@ func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 	}
 	retired := 0
 	for _, f := range victims {
-		note := fmt.Sprintf("watchdog: %s frozen — no outbox activity for %s past the %s spawn grace; auto-retired, claim requeues to ready for a fresh attempt", f.agentID, idle, spawn)
-		applied, err := pipeline.RetireFrozenAgent(ctx, pool, f.agentID, f.taskID, note)
+		spent, err := pipeline.CountFreezeRetires(ctx, pool, f.taskID, "watchdog: implementor")
+		if err != nil {
+			return retired, err
+		}
+		note := fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; auto-retired, claim requeues to ready for a fresh attempt", f.agentID, idle, spawn)
+		var cleanup func(pgx.Tx) error
+		if spent >= respawnCap {
+			// Respawn budget spent — a fresh implementor would freeze the
+			// same way. Park needs-human atomically with the retire (the
+			// guarded retire is still the exactly-once dedup).
+			note = fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; %d respawns already spent, parking needs-human", f.agentID, idle, spawn, spent)
+			cleanup = func(tx pgx.Tx) error {
+				return pipeline.ParkEpisodeTx(ctx, tx, f.taskID, "claimed", note)
+			}
+		}
+		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, f.agentID, f.taskID, note, cleanup)
 		if err != nil {
 			return retired, err
 		}
 		if applied {
 			retired++
-			log.Printf("taskscheduler: watchdog retired frozen %s on %s — reaper requeues next wake", f.agentID, f.taskID)
+			if cleanup != nil {
+				log.Printf("taskscheduler: watchdog retired frozen %s on %s — respawn cap (%d) reached, parked needs-human", f.agentID, f.taskID, respawnCap)
+			} else {
+				log.Printf("taskscheduler: watchdog retired frozen %s on %s — reaper requeues same wake", f.agentID, f.taskID)
+			}
 			killFrozenPane(sessionName, f.session, f.window, killWindow)
 		}
 	}
@@ -110,13 +138,18 @@ WHERE a.task_id IS NOT NULL
         SELECT 1 FROM agent_outbox o WHERE o.agent_id = a.id)
   AND (a.last_transcript_at IS NULL OR a.last_transcript_at < $1)`
 
-// HealRestartCohort sweeps the crash-restart cohort once, at unit start.
+// HealRestartCohort sweeps the crash-restart cohort once, per boot — Run
+// calls it after the monitor has had its first polls (see the sweep grace
+// in Run: before that the boot-relative transcript veto cannot observe any
+// post-boot growth, and the sweep would murder live panes on sight).
 // The per-role re-dispatch needs no special casing beyond the shared retire
 // (which drops the agent's undriven prompts): 'claimed' tasks are requeued
 // by ReapStaleClaims, 'review' tasks respawn via dispatchPass,
 // 'changes_requested' episodes re-arm via fixerPass (a fix row the ghost
 // held is released atomically with the retire), 'ready_to_merge' episodes
-// re-arm via mergerSpawnPass on its next tick.
+// re-arm via mergerSpawnPass on its next tick. Per-ghost failures do not
+// abort the sweep — the remaining ghosts are logged and left to the
+// continuous freeze arms.
 func HealRestartCohort(ctx context.Context, pool *pgxpool.Pool, boot time.Time, spawnGrace time.Duration, sessionName string, killWindow func(session, windowID string) error) (int, error) {
 	rows, err := pool.Query(ctx, restartCohortSQL, boot, spawnGrace.Seconds())
 	if err != nil {
@@ -137,6 +170,8 @@ func HealRestartCohort(ctx context.Context, pool *pgxpool.Pool, boot time.Time, 
 		return 0, err
 	}
 	healed := 0
+	var errs []error
+	var unswept []ghost
 	for _, g := range ghosts {
 		note := fmt.Sprintf("watchdog: restart cohort — %s predates this boot (last_seen before startup) and never streamed; auto-retired, task re-dispatches per its state", g.agentID)
 		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, g.agentID, g.taskID, note, func(tx pgx.Tx) error {
@@ -158,7 +193,13 @@ func HealRestartCohort(ctx context.Context, pool *pgxpool.Pool, boot time.Time, 
 			return err
 		})
 		if err != nil {
-			return healed, err
+			// One bad ghost must not abort the sweep (it runs once per
+			// boot) — log it, keep sweeping, and leave a survivor trail for
+			// operators; the continuous arms cover anything unswept.
+			log.Printf("taskscheduler: restart sweep: retire %s on %s failed: %v", g.agentID, g.taskID, err)
+			errs = append(errs, err)
+			unswept = append(unswept, g)
+			continue
 		}
 		if applied {
 			healed++
@@ -166,7 +207,10 @@ func HealRestartCohort(ctx context.Context, pool *pgxpool.Pool, boot time.Time, 
 			killFrozenPane(sessionName, g.session, g.window, killWindow)
 		}
 	}
-	return healed, nil
+	for _, g := range unswept {
+		log.Printf("taskscheduler: restart sweep: %s on %s NOT swept — the continuous freeze arms cover it on later passes", g.agentID, g.taskID)
+	}
+	return healed, errors.Join(errs...)
 }
 
 // killFrozenPane is the scheduler-side twin of pipeline's killReviewerPane:

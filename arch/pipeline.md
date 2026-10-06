@@ -109,15 +109,27 @@ implementor:
   transcript growth past `MAQUINISTA_WATCHDOG_IDLE`, older than
   `MAQUINISTA_WATCHDOG_SPAWN`) is retired (🆘 exactly once via the guarded
   retire) so the reaper's all-rows-non-live check passes on the same wake
-  and the claim requeues to `ready` for a fresh `-rN` implementor.
-  `HealRestartCohort` runs once at unit start: live task rows whose
-  `last_seen` predates the boot and that never signaled post-boot — no
-  outbox row ever AND no transcript growth since the boot (the crash-
-  restart cohort) — are healed on the first pass — implementor ghosts via
-  the reaper, reviewer ghosts via dispatchPass, fixer episodes re-armed
-  (fix row released atomically with the retire), newborns spared; a pane
-  that survived the crash and is mid-turn re-binds and streams, so its
-  post-boot transcript growth vetoes the heal (MAQ-9, boot-relative)
+  and the claim requeues to `ready` for a fresh `-rN` implementor. The
+  respawn budget is capped per task (`MAQUINISTA_WATCHDOG_RESPAWN_CAP`,
+  default 3 — the freeze observation rows are the ledger): once spent, the
+  next freeze parks needs-human in the same retire tx instead of
+  requeueing, so a systemic outage cannot loop
+  freeze→requeue→claim→freeze forever.
+  `HealRestartCohort` runs once per boot, on the first scheduler wake past
+  a small post-boot grace (3× the monitor poll interval): live task rows
+  whose `last_seen` predates the boot and that never signaled post-boot —
+  no outbox row ever AND no transcript growth since the boot (the crash-
+  restart cohort) — are healed — implementor ghosts via the reaper,
+  reviewer ghosts via dispatchPass, fixer episodes re-armed (fix row
+  released atomically with the retire), newborns spared; a pane that
+  survived the crash and is mid-turn re-binds and streams, so its
+  post-boot transcript growth vetoes the heal (MAQ-9, boot-relative). The
+  grace is load-bearing: the monitor's first poll (and thus the first
+  post-boot transcript touch) lands ~one poll interval after `go mon.Run`,
+  so a sweep at +0s would race it, find every pre-boot row silent, and
+  murder mid-turn survivors on sight — the veto would be dead code.
+  Per-ghost failures don't abort the sweep; unswept survivors are logged
+  and fall back to the continuous arms.
 
 The standalone `maquinista task-scheduler` subcommand keeps the
 orchestrator.EnsureAgent stub (row-only, no pty) for debugging alongside a
@@ -333,18 +345,35 @@ stale-claim reaper (the task scheduler runs the same freeze predicate
 every wake — `taskscheduler.RetireFrozenClaims`). Every auto-retire
 notifies; silence is never a heal. The merger freeze still parks
 needs-human (the money path keeps a human gate). A **restart-cohort sweep**
-(`taskscheduler.HealRestartCohort`) runs once at unit start: live task rows
-whose `last_seen` predates the boot (crash restart — a graceful stop
-deletes task agents outright) and that never signaled post-boot — no
-outbox row ever AND no transcript growth since the boot — are healed on
-the first pass instead of waiting for a human to notice a stalled board.
-The boot-relative transcript veto keeps the sweep honest about panes that
-SURVIVED the crash: one that is mid-turn re-binds and streams tool events
-(never outbox text) moments after start, and growth since the boot is
-liveness — not a ghost. Rows younger than the spawn grace are left to the
-continuous arm (the 04/10 lesson: never murder a newborn on sight). The
-malformed-verdict case is still left to the watchdog: the parser never
-guesses, the freeze bound is the backstop.
+(`taskscheduler.HealRestartCohort`) runs once per boot — deferred by the
+scheduler to its first wake past a small grace (3× the monitor poll
+interval), because the monitor's first poll only lands ~one interval after
+`go mon.Run` and the boot-relative veto is meaningless before it: a sweep
+at +0s would find every pre-boot row silent and kill live mid-turn panes
+on sight. Live task rows whose `last_seen` predates the boot (crash
+restart — a graceful stop deletes task agents outright) and that never
+signaled post-boot — no outbox row ever AND no transcript growth since
+the boot — are healed on that first sweep instead of waiting for a human
+to notice a stalled board. The boot-relative transcript veto keeps the
+sweep honest about panes that SURVIVED the crash: one that is mid-turn
+re-binds and streams tool events (never outbox text) moments after start,
+and growth since the boot is liveness — not a ghost. Rows younger than
+the spawn grace are left to the continuous arm (the 04/10 lesson: never
+murder a newborn on sight). The malformed-verdict case is still left to
+the watchdog: the parser never guesses, the freeze bound is the backstop.
+
+**Respawn cap (MAQ-31, round-2 review).** The in-round re-dispatch is a
+loop, and a systemic outage (model API down, undeliverable prompt) would
+spin it forever — freeze→respawn→freeze every ~31m, one 🆘 per cycle. So
+each episode has a respawn budget: `MAQUINISTA_WATCHDOG_RESPAWN_CAP`
+(default 3) freeze retires per task+round for the reviewer/fixer arms,
+per task for the implementor arm — the `watchdog:` observation rows each
+guarded retire writes are the ledger. Once spent, the next freeze parks
+the task needs-human in the same retire tx (guarded `pending_approval`
+transition + verdict row, exactly once with the 🆘; the fixer's episode is
+released too, so a human flip back re-arms clean). At the default bounds
+that spans ~2h — the old stall watchdog's accidental circuit-breaker
+window, now deliberate.
 
 ## Env contract
 
@@ -360,6 +389,7 @@ guesses, the freeze bound is the backstop.
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
 | `MAQUINISTA_WATCHDOG_IDLE` | freeze silence bound: a live pipeline agent with no outbox row AND no transcript growth this long (past the spawn grace) is auto-retired and its work re-dispatched (MAQ-31) | `30m` |
 | `MAQUINISTA_WATCHDOG_SPAWN` | freeze newborn grace: agents younger than this are never frozen (pi cold boot) | `10m` |
+| `MAQUINISTA_WATCHDOG_RESPAWN_CAP` | freeze→respawn circuit breaker: after this many watchdog retires of one episode (task+round for reviewer/fixer, task for implementor) the next freeze parks needs-human instead of re-dispatching | `3` |
 | `MAQUINISTA_IMPLEMENTOR_IDLE_AFTER` | stuck-implementor self-heal bound: outbox idleness past this retires a `uq_agents_task_live`-blocking implementor row | `10m` |
 | `MAQUINISTA_REVIEW_ROUNDS_MAX` | fixer-loop cap: the request_changes landing at/after this review round parks the task | `3` |
 | `MAQUINISTA_PI_MODEL_HIGH` | model for `reasoning_class: high` reviewers | falls back to `MAQUINISTA_PI_MODEL` |

@@ -46,6 +46,12 @@ type Config struct {
 	// KillWindow is best-effort pane cleanup on freeze retires (MAQ-31;
 	// tmux.KillWindow-shaped). nil skips it — the row still retires.
 	KillWindow func(session, windowID string) error
+	// MonitorPollInterval mirrors config.Config.MonitorPollInterval (the
+	// transcript monitor's poll cadence, MONITOR_POLL_INTERVAL). The
+	// restart-cohort sweep defers until a few intervals after boot so the
+	// monitor's first poll can touch post-boot transcripts before the
+	// sweep judges silence. <= 0 → default 2s (config's default).
+	MonitorPollInterval time.Duration
 }
 
 // liveAgentStatusSQL is the set of agents.status values that mean "a pane
@@ -88,6 +94,9 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 			}
 		}
 	}
+	if cfg.MonitorPollInterval <= 0 {
+		cfg.MonitorPollInterval = 2 * time.Second
+	}
 
 	listener, err := pool.Acquire(ctx)
 	if err != nil {
@@ -98,19 +107,36 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		return fmt.Errorf("LISTEN: %w", err)
 	}
 
-	// MAQ-31 AC 3: heal the crash-restart cohort on the first pass — live
-	// task rows that predate this boot and never streamed are frozen ghosts
-	// of the previous process (a graceful stop deletes task agents, so any
-	// survivor here is a crash/deploy leftover). Once, at start; everything
-	// that freezes later is the continuous arm's job.
+	// Freeze bounds + respawn cap (MAQ-31): shared with the pipeline's
+	// dispatch watchdog — one env trio tunes every freeze arm.
 	idleAfter, spawnGrace := pipeline.FreezeBoundsFromEnv()
-	if healed, err := HealRestartCohort(ctx, pool, time.Now(), spawnGrace, cfg.SessionName, cfg.KillWindow); err != nil {
-		log.Printf("taskscheduler: restart cohort sweep: %v", err)
-	} else if healed > 0 {
-		log.Printf("taskscheduler: restart cohort sweep healed %d frozen agent(s)", healed)
-	}
+	respawnCap := pipeline.FreezeRespawnCapFromEnv()
+
+	// MAQ-31 AC 3: heal the crash-restart cohort ONCE per boot — but not
+	// immediately. The sweep's transcript veto (spare a crash-surviving
+	// pane that is mid-turn) can only observe post-boot growth after the
+	// monitor's first poll, which lands ~one poll interval after `go
+	// mon.Run` and only fires on offset advance. A sweep at +0s races (and
+	// structurally always beats) the monitor: every pre-boot row still has
+	// a pre-boot/NULL last_transcript_at, the veto is dead code, and a live
+	// mid-turn pane is murdered on sight — the 04/10 newborn-kill class in
+	// a new disguise. So the sweep waits out a small grace of a few monitor
+	// polls and runs on the first wake past it: a true ghost heals at
+	// +~30s instead of +0s (no functional loss); a streaming survivor's
+	// post-boot touch lands inside the grace and vetoes the heal.
+	started := time.Now()
+	sweepGrace := 3 * cfg.MonitorPollInterval
+	swept := false
 
 	for {
+		if !swept && time.Since(started) >= sweepGrace {
+			swept = true
+			if healed, err := HealRestartCohort(ctx, pool, started, spawnGrace, cfg.SessionName, cfg.KillWindow); err != nil {
+				log.Printf("taskscheduler: restart cohort sweep: %v", err)
+			} else if healed > 0 {
+				log.Printf("taskscheduler: restart cohort sweep healed %d frozen agent(s)", healed)
+			}
+		}
 		if err := drain(ctx, pool, cfg); err != nil {
 			log.Printf("taskscheduler: %v", err)
 		}
@@ -135,7 +161,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		// agent row went silent past the freeze bounds) BEFORE the reaper —
 		// the retire is what lets the reaper's all-rows-non-live check pass
 		// on the next line, same wake.
-		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, cfg.SessionName, cfg.KillWindow); ferr != nil {
+		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, respawnCap, cfg.SessionName, cfg.KillWindow); ferr != nil {
 			log.Printf("taskscheduler: retire frozen claims: %v", ferr)
 		} else if retired > 0 {
 			log.Printf("taskscheduler: retired %d frozen claim agent(s)", retired)

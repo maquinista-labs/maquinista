@@ -118,6 +118,13 @@ type DispatchConfig struct {
 	// MaxReviewRounds is the fixer-loop cap (default 3,
 	// MAQUINISTA_REVIEW_ROUNDS_MAX).
 	MaxReviewRounds int
+	// RespawnCap bounds the freeze→respawn circuit (MAQ-31): after this
+	// many watchdog retires of the same episode — task+round for the
+	// reviewer/fixer arms, task for the implementor arm — the next freeze
+	// parks needs-human instead of re-dispatching (default 3,
+	// MAQUINISTA_WATCHDOG_RESPAWN_CAP). The deliberate successor of the old
+	// stall watchdog's accidental circuit breaker against systemic outages.
+	RespawnCap int
 	// SessionName is the tmux session reviewers run in (window cleanup).
 	SessionName string
 	// ImplementorIdleAfter is the stuck-implementor self-heal bound (MAQ-14):
@@ -145,14 +152,16 @@ func DefaultDispatchConfig(sessionName string) DispatchConfig {
 		IdleAfter:            idle,
 		SpawnGrace:           spawn,
 		MaxReviewRounds:      DefaultMaxReviewRounds,
+		RespawnCap:           DefaultFreezeRespawnCap,
 		SessionName:          sessionName,
 		ImplementorIdleAfter: DefaultImplementorIdleAfter,
 	}
 }
 
 // DispatchConfigFromEnv applies MAQUINISTA_WATCHDOG_IDLE,
-// MAQUINISTA_WATCHDOG_SPAWN, MAQUINISTA_REVIEW_ROUNDS_MAX and
-// MAQUINISTA_IMPLEMENTOR_IDLE_AFTER over the defaults.
+// MAQUINISTA_WATCHDOG_SPAWN, MAQUINISTA_WATCHDOG_RESPAWN_CAP,
+// MAQUINISTA_REVIEW_ROUNDS_MAX and MAQUINISTA_IMPLEMENTOR_IDLE_AFTER over
+// the defaults.
 func DispatchConfigFromEnv(sessionName string) DispatchConfig {
 	cfg := DefaultDispatchConfig(sessionName)
 	cfg.IdleAfter, cfg.SpawnGrace = FreezeBoundsFromEnv()
@@ -168,6 +177,13 @@ func DispatchConfigFromEnv(sessionName string) DispatchConfig {
 			cfg.MaxReviewRounds = n
 		} else {
 			log.Printf("pipeline: dispatch: invalid MAQUINISTA_REVIEW_ROUNDS_MAX %q, using %d", v, cfg.MaxReviewRounds)
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv(FreezeRespawnCapEnv)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cfg.RespawnCap = n
+		} else {
+			log.Printf("pipeline: dispatch: invalid %s %q, using %d", FreezeRespawnCapEnv, v, cfg.RespawnCap)
 		}
 	}
 	return cfg
@@ -249,7 +265,7 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := mergerWatchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: merger watchdog pass: %v", err)
 		}
-		if err := watchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.SessionName, killWindow); err != nil {
+		if err := watchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.RespawnCap, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: watchdog pass: %v", err)
 		}
 		if err := mergeEnqueuePass(ctx, pool); err != nil {

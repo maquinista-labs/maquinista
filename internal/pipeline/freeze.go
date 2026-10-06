@@ -33,6 +33,14 @@
 // claim requeued to 'ready' (taskscheduler.RetireFrozenClaims + the
 // stale-claim reaper). Mergers keep their needs-human park: the money path
 // keeps a human gate. Every auto-retire notifies; a heal is never silent.
+//
+// The in-round re-dispatch is bounded (FreezeRespawnCapFromEnv, default 3):
+// the freeze observation rows each guarded retire writes are the budget
+// ledger, and once an episode has spent it, the next freeze parks the task
+// needs-human instead of respawning — the old 2h stall watchdog was an
+// accidental circuit breaker against systemic outages (model API down →
+// freeze→respawn→freeze forever, one 🆘 every ~31m); this is the
+// deliberate one.
 package pipeline
 
 import (
@@ -40,6 +48,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -97,12 +106,74 @@ const FreezeFilterSQL = `
   AND (a.last_transcript_at IS NULL
        OR a.last_transcript_at < NOW() - make_interval(secs => $1))`
 
+// FreezeRespawnCapEnv tunes the freeze→respawn circuit breaker
+// (MAQUINISTA_WATCHDOG_RESPAWN_CAP).
+const FreezeRespawnCapEnv = "MAQUINISTA_WATCHDOG_RESPAWN_CAP"
+
+// DefaultFreezeRespawnCap bounds the in-round re-dispatch: after this many
+// watchdog retires of the same episode (task+round for reviewer/fixer,
+// task for the implementor arm) the NEXT freeze parks the task needs-human
+// instead of respawning. At the default bounds 3 respawns + the final park
+// spans ~2h — the old stall watchdog's accidental circuit-breaker window.
+const DefaultFreezeRespawnCap = 3
+
+// FreezeRespawnCapFromEnv resolves the respawn cap from
+// MAQUINISTA_WATCHDOG_RESPAWN_CAP, falling back to the documented default
+// on absent or malformed values. Every freeze arm reads the same cap, so
+// one var tunes the whole circuit breaker.
+func FreezeRespawnCapFromEnv() int {
+	respawnCap := DefaultFreezeRespawnCap
+	if v := strings.TrimSpace(os.Getenv(FreezeRespawnCapEnv)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			respawnCap = n
+		} else {
+			log.Printf("pipeline: freeze: invalid %s %q, using %d", FreezeRespawnCapEnv, v, respawnCap)
+		}
+	}
+	return respawnCap
+}
+
+// CountFreezeRetires counts one arm's prior freeze retirements for a task —
+// the observation rows each guarded retire writes are the respawn budget's
+// ledger. The prefix is arm- and round-scoped ('watchdog: reviewer frozen
+// (round 2)'), so each new round starts with a fresh budget.
+func CountFreezeRetires(ctx context.Context, pool *pgxpool.Pool, taskID, prefix string) (int, error) {
+	var n int
+	err := pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM task_context
+		WHERE task_id = $1 AND kind = 'observation' AND content LIKE $2 || '%'
+	`, taskID, prefix).Scan(&n)
+	return n, err
+}
+
+// ParkEpisodeTx parks a task needs-human inside a freeze retire's tx —
+// guarded on the episode status so a raced transition writes nothing — and
+// records the verdict row naming the park reason. The caller's guarded
+// retire is the exactly-once gate: only its single winner runs this hook,
+// so the park (like the retire's 🆘) fires exactly once.
+func ParkEpisodeTx(ctx context.Context, tx pgx.Tx, taskID, fromStatus, why string) error {
+	tag, err := tx.Exec(ctx,
+		`UPDATE tasks SET status = 'pending_approval' WHERE id = $1 AND status = $2`, taskID, fromStatus)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil // raced out of the episode status — nothing to park
+	}
+	_, err = tx.Exec(ctx,
+		`INSERT INTO task_context (task_id, kind, content) VALUES ($1, 'verdict', $2)`, taskID, why)
+	return err
+}
+
 // watchdogPass retires frozen reviewers and fixers. Unlike the pre-MAQ-31
 // stall watchdog it does NOT park the task: a frozen reviewer respawns
 // in-round (task stays 'review'), a frozen fixer's episode is re-armed
 // (task stays 'changes_requested'). The re-dispatch happens through the
-// existing passes on their next tick — no new spawn code.
-func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
+// existing passes on their next tick — no new spawn code. The respawn
+// budget is capped per task+round (respawnCap): once spent, the next
+// freeze parks needs-human instead — the circuit breaker against a
+// systemic outage looping freeze→respawn forever.
+func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error) error {
 	args := []any{idle.Seconds(), spawn.Seconds()}
 
 	var reviewers []liveReviewer
@@ -110,7 +181,29 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 		return err
 	}
 	for _, r := range reviewers {
-		note := fmt.Sprintf("watchdog: reviewer frozen — no outbox activity for %s past the %s spawn grace; auto-retired, fresh reviewer respawns in-round", idle, spawn)
+		spent, err := CountFreezeRetires(ctx, pool, r.taskID, fmt.Sprintf("watchdog: reviewer frozen (round %d)", r.round))
+		if err != nil {
+			return err
+		}
+		if spent >= respawnCap {
+			// Respawn budget spent: a fresh reviewer would freeze the same
+			// way (systemic outage, undeliverable prompt). Circuit-break to
+			// needs-human — retire + park in one tx, the guarded retire is
+			// still the exactly-once dedup.
+			note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — no outbox activity for %s past the %s spawn grace; %d in-round respawns already spent, parking needs-human", r.round, idle, spawn, spent)
+			applied, err := RetireFrozenAgentCleanup(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
+				return ParkEpisodeTx(ctx, tx, r.taskID, "review", note)
+			})
+			if err != nil {
+				return err
+			}
+			if applied {
+				log.Printf("pipeline: dispatch: watchdog retired frozen reviewer %s on %s — respawn cap (%d) reached, parked needs-human", r.agentID, r.taskID, respawnCap)
+				killReviewerPane(sessionName, r.session, r.window, killWindow)
+			}
+			continue
+		}
+		note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — no outbox activity for %s past the %s spawn grace; auto-retired, fresh reviewer respawns in-round", r.round, idle, spawn)
 		applied, err := RetireFrozenAgent(ctx, pool, r.agentID, r.taskID, note)
 		if err != nil {
 			return err
@@ -126,7 +219,39 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 		return err
 	}
 	for _, r := range fixers {
-		note := fmt.Sprintf("watchdog: fixer frozen — no outbox activity for %s past the %s spawn grace; auto-retired, fix episode re-armed", idle, spawn)
+		spent, err := CountFreezeRetires(ctx, pool, r.taskID, fmt.Sprintf("watchdog: fixer frozen (round %d)", r.round))
+		if err != nil {
+			return err
+		}
+		if spent >= respawnCap {
+			// Budget spent — park instead of re-arming. Same episode release
+			// as the respawn arm, so a human flipping the task back to
+			// changes_requested re-arms clean.
+			note := fmt.Sprintf("watchdog: fixer frozen (round %d) — no outbox activity for %s past the %s spawn grace; %d episode re-arms already spent, parking needs-human", r.round, idle, spawn, spent)
+			applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
+				var round int
+				if err := tx.QueryRow(ctx,
+					`SELECT review_rounds FROM tasks WHERE id = $1 FOR UPDATE`, r.taskID).Scan(&round); err != nil {
+					return err
+				}
+				if _, err := tx.Exec(ctx, `
+					DELETE FROM task_context
+					WHERE task_id = $1 AND kind = 'fix' AND content = $2
+				`, r.taskID, fmt.Sprintf("round %d", round)); err != nil {
+					return err
+				}
+				return ParkEpisodeTx(ctx, tx, r.taskID, "changes_requested", note)
+			})
+			if err != nil {
+				return err
+			}
+			if applied {
+				log.Printf("pipeline: dispatch: watchdog retired frozen fixer %s on %s — respawn cap (%d) reached, parked needs-human", r.agentID, r.taskID, respawnCap)
+				killReviewerPane(sessionName, r.session, r.window, killWindow)
+			}
+			continue
+		}
+		note := fmt.Sprintf("watchdog: fixer frozen (round %d) — no outbox activity for %s past the %s spawn grace; auto-retired, fix episode re-armed", r.round, idle, spawn)
 		applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
 			// Release the episode: fixerCandidatesSQL keys on the round's
 			// fix row, so deleting it lets the next fixerPass mint a fresh

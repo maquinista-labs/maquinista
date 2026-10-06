@@ -173,7 +173,7 @@ func TestWatchdog_NotifyOnStall(t *testing.T) {
 	// Backdate past the stall bound (young-agent guard exempts fresh agents).
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-tw'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	texts := pipelineNotifyTextsPool(t, pool)
@@ -198,7 +198,7 @@ func TestWatchdog_ActiveNoNotify(t *testing.T) {
 		VALUES ('reviewer-ta', '{"text":"thinking"}'::jsonb, NOW())
 	`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if texts := pipelineNotifyTextsPool(t, pool); len(texts) != 0 {
@@ -220,7 +220,7 @@ func TestWatchdog_PRLink(t *testing.T) {
 	// as TestWatchdog_StallTimeout).
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-twpr'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	texts := pipelineNotifyTextsPool(t, pool)
