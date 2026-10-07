@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
@@ -86,8 +88,23 @@ func AddSchedule(ctx context.Context, pool *pgxpool.Pool, s Schedule) (string, e
 		soulTemplateIDPtr = &s.SoulTemplateID
 	}
 
+	// The agent_id FK needs the row to exist; YAML references logical ids
+	// whose runtime row may have been swept. Self-heal + upsert in ONE tx
+	// so the registration either fully lands or fully rolls back (MAQ-39).
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if s.AgentID != "" {
+		if err := ensureAgentRow(ctx, tx, s.AgentID); err != nil {
+			return "", err
+		}
+	}
+
 	var id string
-	err = pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO scheduled_jobs
 			(name, cron_expr, timezone, agent_id, soul_template_id, context_markdown, agent_cwd,
 			 prompt, reply_channel, warm_spawn_before, enabled, next_run_at)
@@ -108,7 +125,10 @@ func AddSchedule(ctx context.Context, pool *pgxpool.Pool, s Schedule) (string, e
 	`, s.Name, s.Cron, tz, agentIDPtr, soulTemplateIDPtr, s.ContextMarkdown, s.AgentCWD,
 		promptJSON, replyJSON, warmPtr, enabled, next).Scan(&id)
 	if err != nil {
-		return "", fmt.Errorf("insert: %w", err)
+		return "", fmt.Errorf("insert %s (agent %q): %w", s.Name, s.AgentID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit: %w", err)
 	}
 	return id, nil
 }
@@ -204,8 +224,22 @@ func AddHook(ctx context.Context, pool *pgxpool.Pool, h Hook) (string, error) {
 		replyJSON, _ = json.Marshal(h.ReplyChannel)
 	}
 
+	// Same tx discipline as AddSchedule: self-heal the agent row, then
+	// upsert the hook — a swept agent row must never 23503 the boot
+	// reconcile again (MAQ-39). The error wrap names the agent so any
+	// residual FK failure is diagnosable without decoding SQLSTATEs.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return "", fmt.Errorf("begin: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := ensureAgentRow(ctx, tx, h.AgentID); err != nil {
+		return "", err
+	}
+
 	var id string
-	err := pool.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO webhook_handlers
 			(name, path, secret, signature_scheme, event_filter, agent_id,
 			 prompt_template, reply_channel, rate_limit_per_min, enabled)
@@ -223,9 +257,53 @@ func AddHook(ctx context.Context, pool *pgxpool.Pool, h Hook) (string, error) {
 		RETURNING id::text
 	`, h.Name, h.Path, h.Secret, scheme, filterJSON, h.AgentID, h.PromptTemplate, replyJSON, rate, enabled).Scan(&id)
 	if err != nil {
-		return "", fmt.Errorf("insert hook: %w", err)
+		return "", fmt.Errorf("insert hook %s (agent %q): %w", h.Name, h.AgentID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return "", fmt.Errorf("commit: %w", err)
 	}
 	return id, nil
+}
+
+// ensureAgentRow guarantees the FK target of a declarative registration
+// exists. YAML under config/{schedules,hooks} references agents by logical
+// id (pr-closer, reviewer, …) but agents rows are runtime state — retire
+// paths and stale-row sweeps DELETE them, and the ON DELETE CASCADE takes
+// the hook/schedule row down with them. On the next boot the upsert then
+// died with a bare 23503 and the hook never registered (MAQ-39). Self-heal:
+// recreate a placeholder row in the SAME transaction as the upsert so
+// reconcile converges on every boot.
+//
+// The placeholder is inert by construction — no runtime consumer may act
+// on it:
+//
+//	status='stopped'     → sidecar Sync + monitor session-map skip it
+//	role='hook'          → reconcileAgentPanes only provisions role='user'
+//	tmux_window=''       → nothing to tail, resolve, or kill
+//	stop_requested=TRUE  → second guard on the pane-reconcile predicates
+//
+// If a real agent with this id is spawned later it replaces the placeholder
+// via the normal spawn path (the placeholder carries no handle, session, or
+// workspace state worth preserving).
+func ensureAgentRow(ctx context.Context, tx pgx.Tx, agentID string) error {
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM agents WHERE id = $1)`, agentID).Scan(&exists); err != nil {
+		return fmt.Errorf("agent lookup %q: %w", agentID, err)
+	}
+	if exists {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO agents (id, tmux_session, tmux_window, status, role, stop_requested)
+		VALUES ($1, '', '', 'stopped', 'hook', TRUE)
+		ON CONFLICT (id) DO NOTHING
+	`, agentID); err != nil {
+		return fmt.Errorf("self-heal agent row %q: %w", agentID, err)
+	}
+	log.Printf("jobreg: self-heal: agent %q referenced by declarative registration was missing — "+
+		"recreated inert placeholder (status=stopped, role=hook, tmux_window='')", agentID)
+	return nil
 }
 
 // HookRow is the list-view projection.

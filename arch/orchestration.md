@@ -65,9 +65,23 @@ inbox/outbox + task infrastructure.
 `jobreg` (`internal/jobreg/`) is the declarative scheduled-job system.
 Operators write YAML files under `config/schedules/` and
 `config/hooks/`. On startup (and periodically), `jobreg.Reconcile`
-upserts these into the `job_registry` table. The scheduler daemon
-(`maquinista scheduler`) fires them on their cron expressions by
-injecting messages into agent inboxes.
+upserts these into the `scheduled_jobs` and `webhook_handlers` tables.
+The scheduler daemon (`maquinista scheduler`) fires scheduled jobs on
+their cron expressions by injecting messages into agent inboxes; the
+webhook HTTP server (`internal/webhooks`) routes POST /hooks/* deliveries
+through the matching `webhook_handlers` row into `agent_inbox`.
+
+Declarative registrations reference agents by logical id (`agent_id:` in
+YAML), but `agents` rows are runtime state — retire paths and stale-row
+sweeps delete them, and the `ON DELETE CASCADE` on
+`webhook_handlers.agent_id` / `scheduled_jobs.agent_id` takes the
+registration down with them. Both write paths therefore self-heal
+(MAQ-39): `ensureAgentRow` recreates the referenced agent row as an inert
+placeholder (`status='stopped'`, `role='hook'`, `tmux_window=''`,
+`stop_requested=TRUE` — skipped by pane reconcile, sidecar manager, and
+monitor) inside the same transaction as the upsert, so every boot
+converges instead of dying on the FK. Spawning a real agent with the same
+id later replaces the placeholder through the normal spawn path.
 
 ## TODO
 
