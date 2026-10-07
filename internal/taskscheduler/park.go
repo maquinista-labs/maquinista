@@ -10,6 +10,7 @@ package taskscheduler
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -28,8 +29,9 @@ const DefaultParkGrace = 10 * time.Minute
 // ParkUnspawnable parks every claimed task that has no worktree_path, no
 // live agent, and has been claimed longer than grace. Returns the number of
 // tasks parked. The guarded transition (status='claimed' → 'pending_approval'
-// in one tx with the note) makes each park exactly-once.
-func ParkUnspawnable(ctx context.Context, pool *pgxpool.Pool, grace time.Duration) (int, error) {
+// in one tx with the note) makes each park exactly-once. parkFanout (when
+// non-nil) fans each park out to the PR + ticket issue (MAQ-34).
+func ParkUnspawnable(ctx context.Context, pool *pgxpool.Pool, grace time.Duration, parkFanout func(ctx context.Context, taskID, summary string)) (int, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT t.id
 		FROM tasks t
@@ -71,6 +73,9 @@ func ParkUnspawnable(ctx context.Context, pool *pgxpool.Pool, grace time.Duratio
 		log.Printf("taskscheduler: task %s parked needs-human: claimed >%s with no worktree_path and no live agent", taskID, grace)
 		pipeline.NotifyTaskf(ctx, pool, taskID, "🆘 %s: claimed %s ago with no worktree_path and no live agent — unspawnable, parked needs-human. Provision the worktree, set tasks.worktree_path, flip the task back to 'ready'.",
 			pipeline.TaskTitle(ctx, pool, taskID), grace)
+		if parkFanout != nil {
+			parkFanout(ctx, taskID, fmt.Sprintf("Claimed %s ago with no worktree_path and no live agent — unspawnable, parked needs-human.", grace))
+		}
 		parked++
 	}
 	return parked, nil

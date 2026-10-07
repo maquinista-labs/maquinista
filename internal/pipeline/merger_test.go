@@ -240,7 +240,7 @@ func TestMergerVerdict_MergedContinuesToMerge(t *testing.T) {
 	agentID := "merger-" + taskID
 	seedMerger(t, pool, agentID, taskID, "kept both sides (prLinkSuffix + short-id verbs)\nVERDICT: merged\n")
 
-	if err := mergerVerdictPass(ctx, pool, "sess", nil); err != nil {
+	if err := mergerVerdictPass(ctx, pool, "sess", nil, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := mergerAgentStatus(t, pool, agentID); got != "dead" {
@@ -289,7 +289,7 @@ func TestMergerVerdict_NeedsHumanParksWithFiles(t *testing.T) {
 	agentID := "merger-" + taskID
 	seedMerger(t, pool, agentID, taskID, "both sides rewrote the same loop — cannot resolve mechanically\nVERDICT: needs_human\n")
 
-	if err := mergerVerdictPass(ctx, pool, "sess", nil); err != nil {
+	if err := mergerVerdictPass(ctx, pool, "sess", nil, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if status, _ := taskRow(t, pool, taskID); status != "pending_approval" {
@@ -448,7 +448,7 @@ func TestMergerPass_SpawnPromptHeal(t *testing.T) {
 	}, "0 seconds")
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := mergerPass(ctx, pool, sp); err != nil {
+	if err := mergerPass(ctx, pool, sp, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(sp.spawns) != 1 {
@@ -474,7 +474,7 @@ func TestMergerPass_SpawnPromptHeal(t *testing.T) {
 	}
 
 	// Second tick: the live merger blocks a duplicate spawn.
-	if err := mergerPass(ctx, pool, sp); err != nil {
+	if err := mergerPass(ctx, pool, sp, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(sp.spawns) != 1 {
@@ -484,7 +484,7 @@ func TestMergerPass_SpawnPromptHeal(t *testing.T) {
 	// Heal: a lost prompt (crash between spawn and enqueue) re-enqueues
 	// exactly once, dedup'd by external_msg_id — no second spawn.
 	execOK(t, pool, `DELETE FROM agent_inbox WHERE agent_id = $1`, p.AgentID)
-	if err := mergerPass(ctx, pool, sp); err != nil {
+	if err := mergerPass(ctx, pool, sp, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(sp.spawns) != 1 {
@@ -519,7 +519,7 @@ func TestMergerPass_StaleMarkerParks(t *testing.T) {
 	}, "3 hours")
 
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: false}
-	if err := mergerPass(ctx, pool, sp); err != nil {
+	if err := mergerPass(ctx, pool, sp, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(sp.spawns) != 0 {
@@ -545,7 +545,7 @@ func TestMergerPass_StaleMarkerParks(t *testing.T) {
 	seedMergeConflictMarker(t, pool, task2, mergeConflictMarker{
 		EntryID: 8, Attempt: 1, Base: "main", Branch: "t-y/feature", Files: []string{"y.go"},
 	}, "0 seconds")
-	if err := mergerPass(ctx, pool, sp); err != nil {
+	if err := mergerPass(ctx, pool, sp, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(sp.spawns) != 1 || sp.spawns[0].TaskID != task2 {
@@ -574,7 +574,7 @@ func TestMergerWatchdog_ParksFrozenMerger(t *testing.T) {
 	seedMerger(t, pool, "merger-"+taskID, taskID, "")
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - INTERVAL '3 hours' WHERE id = $1`, "merger-"+taskID)
 
-	if err := mergerWatchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil); err != nil {
+	if err := mergerWatchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, "sess", nil, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if status, _ := taskRow(t, pool, taskID); status != "pending_approval" {
@@ -625,7 +625,7 @@ func TestReapprove_FreshEntryRunsMergerExactlyOnce(t *testing.T) {
 	// Episode 1 lands needs-human (parked task, conflicted entry).
 	agentID := "merger-" + taskID
 	seedMerger(t, pool, agentID, taskID, "hopeless\nVERDICT: needs_human\n")
-	if err := mergerVerdictPass(ctx, pool, "sess", nil); err != nil {
+	if err := mergerVerdictPass(ctx, pool, "sess", nil, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if status, _ := taskRow(t, pool, taskID); status != "pending_approval" {
@@ -664,13 +664,13 @@ func TestReapprove_FreshEntryRunsMergerExactlyOnce(t *testing.T) {
 
 	// The dispatch loop spawns exactly ONE merger for episode 2.
 	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
-	if err := mergerPass(ctx, pool, sp); err != nil {
+	if err := mergerPass(ctx, pool, sp, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(sp.spawns) != 1 {
 		t.Fatalf("spawns = %d, want exactly 1 for the re-approved task", len(sp.spawns))
 	}
-	if err := mergerPass(ctx, pool, sp); err != nil {
+	if err := mergerPass(ctx, pool, sp, parkFanout{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(sp.spawns) != 1 {

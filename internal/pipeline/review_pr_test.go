@@ -252,7 +252,7 @@ func TestVerdictPass_PostsRoundCommentOnce(t *testing.T) {
 	seedPRReview(t, pool, "tpc", VerdictRequestChanges)
 	fg := &fakeGh{}
 
-	if err := verdictPass(ctx, pool, fg, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, fg, parkFanout{}, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if got := taskCol(t, pool, "tpc", "status"); got != "changes_requested" {
@@ -270,7 +270,7 @@ func TestVerdictPass_PostsRoundCommentOnce(t *testing.T) {
 
 	// A second pass is a strict no-op everywhere: the reviewer is retired,
 	// no repost (round-marker dedup keeps crash retries at exactly one).
-	if err := verdictPass(ctx, pool, fg, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, fg, parkFanout{}, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass 2: %v", err)
 	}
 	if len(fg.postedBodies) != 1 {
@@ -287,7 +287,7 @@ func TestVerdictPass_RoundNumberInComment(t *testing.T) {
 	execOK(t, pool, `UPDATE tasks SET review_rounds = 2 WHERE id = 'tpr2'`)
 	fg := &fakeGh{}
 
-	if err := verdictPass(ctx, pool, fg, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, fg, parkFanout{}, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if len(fg.postedBodies) != 1 || !strings.HasPrefix(fg.postedBodies[0], "[review round 2] VERDICT: approve") {
@@ -307,7 +307,7 @@ func TestVerdictPass_DedupsExistingRoundComment(t *testing.T) {
 		{Author: "acme-ci", IsBot: true, Body: "[review round 1] VERDICT: approve\n\n(pre-existing)"},
 	}}
 
-	if err := verdictPass(ctx, pool, fg, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, fg, parkFanout{}, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if len(fg.postedBodies) != 0 {
@@ -327,7 +327,7 @@ func TestVerdictPass_NoPR_SkipsComment(t *testing.T) {
 	execOK(t, pool, `UPDATE tasks SET pr_url = NULL WHERE id = 'tpn'`)
 	fg := &fakeGh{}
 
-	if err := verdictPass(ctx, pool, fg, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, fg, parkFanout{}, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if len(fg.postedBodies) != 0 {
@@ -355,7 +355,7 @@ func TestVerdictPass_GhOutage_StillTransitions(t *testing.T) {
 			ctx := context.Background()
 			seedPRReview(t, pool, "tpo-"+strings.ReplaceAll(c.name, " ", "-"), VerdictApprove)
 
-			if err := verdictPass(ctx, pool, c.fg, 3, "sess", nil); err != nil {
+			if err := verdictPass(ctx, pool, c.fg, parkFanout{}, 3, "sess", nil); err != nil {
 				t.Fatalf("verdictPass: %v", err)
 			}
 			if got := taskCol(t, pool, "tpo-"+strings.ReplaceAll(c.name, " ", "-"), "status"); got != "ready_to_merge" {
@@ -553,7 +553,7 @@ func TestNilGh_DisablesSurface(t *testing.T) {
 	ctx := context.Background()
 	seedPRReview(t, pool, "tpz", VerdictApprove)
 
-	if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, nil, parkFanout{}, 3, "sess", nil); err != nil {
 		t.Fatalf("verdictPass: %v", err)
 	}
 	if got := taskCol(t, pool, "tpz", "status"); got != "ready_to_merge" {
