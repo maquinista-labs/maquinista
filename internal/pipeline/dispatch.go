@@ -596,6 +596,14 @@ func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agen
 // humanComments (rendered by renderHumanComments) is appended when non-empty:
 // the PR's human comments newer than the previous reviewer, framed as verdict
 // INPUT (MAQ-16 — they are never approve/request_changes verbs).
+//
+// The closing paragraph is the terminal-action contract (MAQ-36): the round
+// ends ONLY on verdict delivery. The state machine parses nothing but the
+// final VERDICT: line of the reviewer's reply — findings prose in the
+// transcript/outbox is invisible to it — so a reviewer that writes complete
+// findings and stops has not finished the round; the watchdog retires it as
+// frozen and the round re-runs. Both the spawn and the prompt-heal paths
+// share this body, so the contract ships on every round.
 func reviewPromptBody(taskID string, round int, criteria, humanComments string) string {
 	body := fmt.Sprintf(
 		"Review round %d for task %s. The implementation is committed in your cwd (the task worktree). "+
@@ -603,7 +611,13 @@ func reviewPromptBody(taskID string, round int, criteria, humanComments string) 
 			"read the spec under .specs/ if present, run the validators the spec names, and judge the change on its merits. "+
 			"Enforce PR hygiene (AGENTS.md): the PR title must not be all-lowercase — sentence/title case, keeping its [MAQ-n] identifier — "+
 			"and the body must start with `## What?` and `## Why?` sections; request_changes when either rule is broken. "+
-			"End your reply with exactly one line: VERDICT: approve | VERDICT: request_changes | VERDICT: needs_human.",
+			"TERMINAL ACTION — the round ends ONLY on verdict delivery. The pipeline parses nothing but the final `VERDICT:` line of your reply "+
+			"(that line is what becomes the round's verdict comment on the PR); your findings prose is invisible to the state machine. "+
+			"A complete findings write-up whose reply never ends with the verdict line does NOT finish the round: "+
+			"the watchdog retires it as frozen and burns a fresh round re-reviewing from scratch. "+
+			"Your LAST action is therefore always the verdict delivery: end your reply with exactly one line — "+
+			"VERDICT: approve | VERDICT: request_changes | VERDICT: needs_human — and nothing after it. "+
+			"Writing findings is not finishing; delivering the verdict is.",
 		round, taskID)
 	if criteria != "" {
 		body += "\n\n" + criteria

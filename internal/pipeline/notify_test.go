@@ -180,7 +180,10 @@ func TestWatchdog_NotifyOnStall(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
 	}
-	for _, want := range []string{"🆘", "watchdog: reviewer frozen", "no outbox activity for 30m0s", "respawns in-round"} {
+	// MAQ-36: the note states what the freeze filter actually measured —
+	// parallel-bounds silence on BOTH channels — not the old sequential-
+	// sounding "no outbox activity for X past the Y spawn grace".
+	for _, want := range []string{"🆘", "watchdog: reviewer frozen", "silent for 30m0s (no outbox row and no transcript growth; spawn grace 10m0s elapsed)", "respawns in-round"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("summary %q missing %q", texts[0], want)
 		}
