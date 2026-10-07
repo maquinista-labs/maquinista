@@ -703,7 +703,7 @@ func mergerWatchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 		return err
 	}
 	for _, m := range mergers {
-		note := fmt.Sprintf("watchdog: merger frozen — no outbox activity for %s past the %s spawn grace — needs human", idle, spawn)
+		note := fmt.Sprintf("watchdog: merger frozen — %s — needs human", freezeCause(idle, spawn))
 		applied, err := parkMergerConflict(ctx, pool, m.agentID, m.taskID, m.marker, note)
 		if err != nil {
 			return err

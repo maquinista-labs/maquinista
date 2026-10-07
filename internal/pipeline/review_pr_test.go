@@ -136,6 +136,30 @@ func TestReviewPromptBody_IncludesHumanComments(t *testing.T) {
 	}
 }
 
+func TestReviewPromptBody_CarriesTerminalActionContract(t *testing.T) {
+	// MAQ-36: the prompt must make verdict DELIVERY the round's terminal
+	// action — the state machine sees nothing but the final VERDICT: line,
+	// so a complete findings write-up without it never ends the round (the
+	// MAQ-35 incident burned two full rounds on exactly that). Spawn and
+	// heal paths share this body, so one paragraph covers both.
+	prompt := reviewPromptBody("tp", 1, "", "")
+	for _, want := range []string{
+		"TERMINAL ACTION", // the contract is named as such
+		"round ends ONLY on verdict delivery",
+		"verdict comment on the PR",   // the PR-visible artifact it feeds
+		"findings prose is invisible", // why transcript prose is not finishing
+		"Writing findings is not finishing",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("prompt missing terminal-action contract %q:\n%s", want, prompt)
+		}
+	}
+	// The verdict vocabulary line survives the rewrite.
+	if !strings.Contains(prompt, "VERDICT: approve | VERDICT: request_changes | VERDICT: needs_human") {
+		t.Errorf("prompt lost the verdict vocabulary line:\n%s", prompt)
+	}
+}
+
 func TestReviewPromptBody_CarriesPRHygieneRules(t *testing.T) {
 	// MAQ-29: every round prompt restates the PR hygiene rules so an
 	// all-lowercase title or missing What?/Why? sections draws
