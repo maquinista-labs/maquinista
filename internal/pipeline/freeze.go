@@ -319,8 +319,13 @@ func retireFrozenAgentTx(ctx context.Context, pool *pgxpool.Pool, agentID, taskI
 		return false, err
 	}
 	defer tx.Rollback(ctx)
+	// MAQ-38: the retire also releases the tmux_window binding. A dead row
+	// holding @N is a collision timebomb — tmux window ids restart with the
+	// tmux server, and the next pane to draw that id would share it with a
+	// corpse (monitor attribution, transcript liveness and pane kills all
+	// resolve through this binding).
 	tag, err := tx.Exec(ctx, `
-		UPDATE agents SET status='dead', last_seen=NOW()
+		UPDATE agents SET status='dead', last_seen=NOW(), tmux_window=''
 		WHERE id=$1 AND status <> 'dead'
 	`, agentID)
 	if err != nil {

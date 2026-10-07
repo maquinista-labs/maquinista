@@ -12,6 +12,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/maquinista-labs/maquinista/hook"
+	"github.com/maquinista-labs/maquinista/internal/agent"
 	"github.com/maquinista-labs/maquinista/internal/agentspawn"
 	"github.com/maquinista-labs/maquinista/internal/bot"
 	"github.com/maquinista-labs/maquinista/internal/config"
@@ -203,6 +204,35 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		// up stragglers from pre-Phase-B installs so operators stop
 		// inspecting a stale file that no longer reflects reality.
 		_ = os.Remove(filepath.Join(cfg.MaquinistaDir, "state.json"))
+
+		// MAQ-38: sweep stale window bindings BEFORE any pane respawns.
+		// tmux window ids (@N) restart with the tmux server, so after a
+		// crash the pre-crash agents rows claim the same @N values fresh
+		// panes are about to draw — and every window-scoped consumer
+		// (monitor outbox attribution, transcript-liveness touches,
+		// freeze-arm pane kills) then hits a dead-row/live-row collision.
+		// Observed 2026-10-07: post-crash rounds streamed into panes whose
+		// outbox rows landed under stale pre-crash ids while the live rows
+		// starved on both freshness channels — the watchdog false-froze
+		// every round to the respawn cap. The sweep clears the stale
+		// bindings and reports live-row collisions ONCE, loud, instead of
+		// letting the churn repeat silently.
+		sweepCtx, sweepCancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if res, err := agent.SweepStaleWindowBindings(sweepCtx, pool, cfg.TmuxSessionName, tmux.ListWindows); err != nil {
+			log.Printf("reconcile: window-binding sweep failed: %v (continuing)", err)
+		} else {
+			if res.Cleared > 0 {
+				log.Printf("reconcile: window-binding sweep cleared %d stale binding(s)", res.Cleared)
+			}
+			if res.Mismatched > 0 {
+				log.Printf("reconcile: window-binding sweep: %d LIVE row(s) held collided window ids: %s",
+					res.Mismatched, strings.Join(res.MismatchRows, "; "))
+				pipeline.Notifyf(sweepCtx, pool,
+					"🧹 boot: tmux window-id collision after restart — %d live agent row(s) claimed window ids now owned by other panes; their outbox attribution and watchdog freshness were feeding the wrong rows. Bindings cleared, agents respawn clean:\n%s",
+					res.Mismatched, strings.Join(res.MismatchRows, "\n"))
+			}
+		}
+		sweepCancel()
 
 		// Respawn live agents that survived a previous `maquinista stop`.
 		// Uses --resume <session_id> when the hook has recorded one so
@@ -526,6 +556,10 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				// MAQ-31 freeze arms: pane cleanup on auto-retires.
 				SessionName: cfg.TmuxSessionName,
 				KillWindow:  tmux.KillWindow,
+				// MAQ-38 AC 2: freeze-retire notes state whether a pane
+				// existed for the retired id (name-based probe — panes are
+				// created -n <agentID>, and agent ids are never reused).
+				PaneExists: tmux.WindowNameExists,
 				// Restart-cohort sweep grace derives from the monitor's
 				// cadence: the sweep must not run before the monitor's first
 				// poll, or the boot-relative transcript veto is dead code.

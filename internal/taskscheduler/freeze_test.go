@@ -6,6 +6,7 @@ package taskscheduler
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -80,7 +81,7 @@ func TestRetireFrozenClaims(t *testing.T) {
 	ctx := context.Background()
 	seedClaim(t, pool, "FZ", "impl-fz")
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -122,7 +123,7 @@ func TestRetireFrozenClaims_ActiveUntouched(t *testing.T) {
 		VALUES ('impl-fa', '{"text":"working the spec"}'::jsonb)
 	`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +144,7 @@ func TestRetireFrozenClaims_TranscriptGrowthUntouched(t *testing.T) {
 	seedClaim(t, pool, "FT", "impl-ft")
 	exec(t, pool, `UPDATE agents SET last_transcript_at = NOW() - INTERVAL '5 minutes' WHERE id='impl-ft'`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -164,7 +165,7 @@ func TestRetireFrozenClaims_YoungUntouched(t *testing.T) {
 		WHERE id='impl-fy'
 	`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +336,7 @@ func TestRetireFrozenClaims_RespawnCapParks(t *testing.T) {
 		`)
 	}
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -452,5 +453,80 @@ func TestHealRestartCohort_EmptyWhenClean(t *testing.T) {
 	}
 	if healed != 0 {
 		t.Fatalf("healed = %d, want 0 on a clean board", healed)
+	}
+}
+
+// TestRetireFrozenClaims_NoteReportsPaneExistence is MAQ-38 AC 2: the
+// watchdog retire of an implementor round emits a notify that states
+// whether a tmux pane existed for the retired id — name-based probe, so
+// "no" (pane gone) and "yes" (pane present during an apparent freeze —
+// the stale-id starvation signature from the 07/10 incident) are both
+// diagnosable from the 🆘 alone.
+func TestRetireFrozenClaims_NoteReportsPaneExistence(t *testing.T) {
+	ctx := context.Background()
+
+	probe := func(probed *[]string) func(session, name string) bool {
+		return func(session, name string) bool {
+			*probed = append(*probed, session+":"+name)
+			return name == "impl-yes" // pane live for one victim, gone for the other
+		}
+	}
+
+	for _, tc := range []struct {
+		agentID, wantPane string
+	}{
+		{"impl-yes", "tmux pane for this id: yes"},
+		{"impl-no", "tmux pane for this id: no"},
+	} {
+		pool := setup(t)
+		seedClaim(t, pool, "PZ-"+tc.agentID, tc.agentID)
+		var probed []string
+
+		retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, probe(&probed))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if retired != 1 {
+			t.Fatalf("%s: retired = %d, want 1", tc.agentID, retired)
+		}
+		// The probe asked for the retired id by NAME, in the row's session
+		// (falls back to the session name when the row's own is empty).
+		if len(probed) != 1 || probed[0] != "maquinista:"+tc.agentID {
+			t.Fatalf("%s: probe = %v, want [maquinista:%s]", tc.agentID, probed, tc.agentID)
+		}
+		// The 🆘 (and its task_context observation twin) carries the fact.
+		var note string
+		if err := pool.QueryRow(ctx, `
+			SELECT content FROM task_context
+			WHERE task_id = $1 AND kind = 'observation'
+		`, "PZ-"+tc.agentID).Scan(&note); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(note, tc.wantPane) {
+			t.Fatalf("%s: observation = %q, want it to contain %q", tc.agentID, note, tc.wantPane)
+		}
+		if n := pipelineNotifyCount(t, pool, tc.wantPane); n != 1 {
+			t.Fatalf("%s: 🆘 notes carrying %q = %d, want exactly 1", tc.agentID, tc.wantPane, n)
+		}
+	}
+}
+
+// TestRetireFrozenClaims_NilPaneProbeShipsUnknown: a caller with no tmux
+// access still retires (and notifies) — the note just says "unknown"
+// instead of inventing a pane fact.
+func TestRetireFrozenClaims_NilPaneProbeShipsUnknown(t *testing.T) {
+	pool := setup(t)
+	ctx := context.Background()
+	seedClaim(t, pool, "PUNK", "impl-punk")
+
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retired != 1 {
+		t.Fatalf("retired = %d, want 1", retired)
+	}
+	if n := pipelineNotifyCount(t, pool, "tmux pane for this id: unknown"); n != 1 {
+		t.Fatalf("🆘 notes = %d, want exactly 1 carrying 'unknown'", n)
 	}
 }

@@ -71,6 +71,14 @@ whose `tmux_window` is absent or stale and calls `respawnAgent` for each.
 resolves runner command → `tmux.NewWindow` → waits for runner ready →
 updates `agents.tmux_window`.
 
+Before the first respawn of a boot, `agent.SweepStaleWindowBindings`
+(MAQ-38) clears every `tmux_window` binding that no longer resolves to a
+pane named for the row's own id — tmux window ids (@N) restart with the
+tmux server, so post-crash rows would otherwise claim the ids fresh
+panes draw and poison the monitor's window→agent attribution (outbox
+rows under stale ids, watchdog freshness feeding dead rows). Live-row
+collisions are notified once on the Pipeline topic at boot.
+
 Resume semantics: if `agents.session_id` is set (written by the
 SessionStart hook), the runner is launched with `--resume <session_id>`
 so Claude's conversation history survives restarts.

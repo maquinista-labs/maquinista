@@ -139,6 +139,26 @@ func WindowExists(session, window string) bool {
 	return exec.Command("tmux", "select-window", "-t", target).Run() == nil
 }
 
+// WindowNameExists reports whether a window whose NAME equals name exists
+// in the session (MAQ-38). Window ids (@N) are reused across tmux server
+// restarts, so id-based lookups cannot answer "does a pane for this agent
+// exist" — names can: every maquinista pane is created with -n <agentID>
+// and agent ids are never reused (the mint checks the agents table). The
+// freeze arms use this to tell a frozen worker from a spawn failure, and
+// to refuse killing a stale window binding that a younger pane now owns.
+func WindowNameExists(session, name string) bool {
+	windows, err := ListWindows(session)
+	if err != nil {
+		return false
+	}
+	for _, w := range windows {
+		if w.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // SendKeys sends literal text to a tmux window (no implicit Enter).
 func SendKeys(session, windowID, keys string) error {
 	target := session + ":" + windowID
