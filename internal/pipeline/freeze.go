@@ -173,6 +173,70 @@ func ParkEpisodeTx(ctx context.Context, tx pgx.Tx, taskID, fromStatus, why strin
 // budget is capped per task+round (respawnCap): once spent, the next
 // freeze parks needs-human instead — the circuit breaker against a
 // systemic outage looping freeze→respawn forever.
+//
+// The reviewer arm also salvages (MAQ-36): a frozen reviewer that already
+// wrote its findings but lost only the verdict delivery hands the writeup to
+// its respawn — the fresh round verifies + posts the verdict instead of
+// re-reviewing the diff from scratch.
+// freezeCause renders what the freeze filter (FreezeFilterSQL) actually
+// measured — the honest phrasing for every retire note (MAQ-36). The old
+// "no outbox activity for %s past the %s spawn grace" misrepresented the
+// predicate two ways: the bounds run in PARALLEL (the idle window does not
+// start after the spawn grace lapses), and outbox silence alone never
+// retires anyone — the MAQ-9 transcript veto must be silent too.
+func freezeCause(idle, spawn time.Duration) string {
+	return fmt.Sprintf("silent for %s (no outbox row and no transcript growth; spawn grace %s elapsed)", idle, spawn)
+}
+
+// minSalvageFindingsChars is the minimum length for an outbox text row to
+// count as a salvageable findings writeup (MAQ-36): a real review writeup is
+// a numbered findings list; shorter rows are progress notes and acks.
+const minSalvageFindingsChars = 200
+
+// salvageFindings captures a frozen reviewer's completed-but-undelivered
+// writeup (MAQ-36): the newest outbox text row long enough to be a findings
+// list, newest-first scan like latestVerdict. "" when nothing qualifies —
+// the best-effort fallback is today's full re-review.
+func salvageFindings(ctx context.Context, pool *pgxpool.Pool, agentID string) (string, error) {
+	rows, err := pool.Query(ctx, `
+		SELECT content->>'text' FROM agent_outbox
+		WHERE agent_id = $1 AND content ? 'text'
+		ORDER BY created_at DESC LIMIT 10
+	`, agentID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var text string
+		if err := rows.Scan(&text); err != nil {
+			return "", err
+		}
+		if t := strings.TrimSpace(text); len([]rune(t)) >= minSalvageFindingsChars {
+			if len(t) > maxFindingsChars {
+				t = t[len(t)-maxFindingsChars:]
+			}
+			return t, nil
+		}
+	}
+	return "", rows.Err()
+}
+
+// insertSalvagedFindingsTx records the captured writeup as a task_context
+// 'salvage' row inside the retire tx, so the respawned reviewer's prompt
+// build can carry it. Empty findings (the fallback) inserts nothing — and a
+// prompt build ignores salvage rows once any verdict has landed after them.
+func insertSalvagedFindingsTx(ctx context.Context, tx pgx.Tx, taskID, agentID, findings string) error {
+	if strings.TrimSpace(findings) == "" {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ($1, $2, 'salvage', $3)
+	`, taskID, agentID, findings)
+	return err
+}
+
 func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error) error {
 	args := []any{idle.Seconds(), spawn.Seconds()}
 
@@ -190,7 +254,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			// way (systemic outage, undeliverable prompt). Circuit-break to
 			// needs-human — retire + park in one tx, the guarded retire is
 			// still the exactly-once dedup.
-			note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — no outbox activity for %s past the %s spawn grace; %d in-round respawns already spent, parking needs-human", r.round, idle, spawn, spent)
+			note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — %s; %d in-round respawns already spent, parking needs-human", r.round, freezeCause(idle, spawn), spent)
 			human := fmt.Sprintf("the reviewer hung %d times (each ~%s with no activity) — the machine gave up and is waiting for you.", spent, DurHuman(idle))
 			applied, err := RetireFrozenAgentCleanup(ctx, pool, r.agentID, r.taskID, note, human, func(tx pgx.Tx) error {
 				return ParkEpisodeTx(ctx, tx, r.taskID, "review", note)
@@ -204,11 +268,22 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			}
 			continue
 		}
-		note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — no outbox activity for %s past the %s spawn grace; auto-retired, fresh reviewer respawns in-round", r.round, idle, spawn)
+		// MAQ-36 salvage: capture the frozen reviewer's writeup (best effort)
+		// BEFORE the retire — its fresh respawn then verifies + delivers
+		// instead of re-reviewing from scratch. No writeup → no salvage row,
+		// and the fallback is today's full re-review.
+		salvage, err := salvageFindings(ctx, pool, r.agentID)
+		if err != nil {
+			log.Printf("pipeline: dispatch: watchdog: salvage findings %s: %v — respawning without", r.agentID, err)
+			salvage = ""
+		}
+		note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — %s; auto-retired, fresh reviewer respawns in-round", r.round, freezeCause(idle, spawn))
 		// MAQ-37: the round number stays in the ledger note; prose says "the
 		// same round" — a raw 0/1 round digit reads like machine state.
 		human := fmt.Sprintf("the reviewer went silent (~%s with no activity) — retired it and started a fresh reviewer for the same round. No action needed.", DurHuman(idle))
-		applied, err := RetireFrozenAgent(ctx, pool, r.agentID, r.taskID, note, human)
+		applied, err := RetireFrozenAgentCleanup(ctx, pool, r.agentID, r.taskID, note, human, func(tx pgx.Tx) error {
+			return insertSalvagedFindingsTx(ctx, tx, r.taskID, r.agentID, salvage)
+		})
 		if err != nil {
 			return err
 		}
@@ -231,7 +306,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			// Budget spent — park instead of re-arming. Same episode release
 			// as the respawn arm, so a human flipping the task back to
 			// changes_requested re-arms clean.
-			note := fmt.Sprintf("watchdog: fixer frozen (round %d) — no outbox activity for %s past the %s spawn grace; %d episode re-arms already spent, parking needs-human", r.round, idle, spawn, spent)
+			note := fmt.Sprintf("watchdog: fixer frozen (round %d) — %s; %d episode re-arms already spent, parking needs-human", r.round, freezeCause(idle, spawn), spent)
 			human := fmt.Sprintf("the fixer hung %d times (each ~%s with no activity) — the machine gave up and is waiting for you.", spent, DurHuman(idle))
 			applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, human, func(tx pgx.Tx) error {
 				var round int
@@ -256,7 +331,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			}
 			continue
 		}
-		note := fmt.Sprintf("watchdog: fixer frozen (round %d) — no outbox activity for %s past the %s spawn grace; auto-retired, fix episode re-armed", r.round, idle, spawn)
+		note := fmt.Sprintf("watchdog: fixer frozen (round %d) — %s; auto-retired, fix episode re-armed", r.round, freezeCause(idle, spawn))
 		human := fmt.Sprintf("the fixer went silent (~%s with no activity) — retired it and re-armed the fix round with a fresh fixer. No action needed.", DurHuman(idle))
 		applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, human, func(tx pgx.Tx) error {
 			// Release the episode: fixerCandidatesSQL keys on the round's

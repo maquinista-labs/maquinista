@@ -181,6 +181,11 @@ func TestWatchdog_NotifyOnStall(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
 	}
+	// MAQ-37 split: the 🆘 carries only the human sentence; the machine
+	// note states what the freeze filter actually measured — parallel-bounds
+	// silence on BOTH channels, not the old sequential-sounding "no outbox
+	// activity for X past the Y spawn grace" (MAQ-36) — and lives in the
+	// task_context ledger, pinned by TestWatchdog_RetireNoteStatesRealTrigger.
 	for _, want := range []string{"🆘", "the reviewer went silent", "~30m with no activity", "fresh reviewer for the same round", "No action needed"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("summary %q missing %q", texts[0], want)

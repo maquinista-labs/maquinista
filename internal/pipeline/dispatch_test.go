@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -82,6 +83,20 @@ func seedOutboxRow(t *testing.T, pool *pgxpool.Pool, agentID, age string) {
 		INSERT INTO agent_outbox (agent_id, content, created_at)
 		VALUES ($1, '{"type":"text","text":"PR opened."}'::jsonb, NOW() - $2::interval)
 	`, agentID, age)
+}
+
+// seedOutboxText is seedOutboxRow with arbitrary assistant text — the
+// findings-writeup rows the MAQ-36 salvage scan reads.
+func seedOutboxText(t *testing.T, pool *pgxpool.Pool, agentID, text, age string) {
+	t.Helper()
+	raw, err := json.Marshal(map[string]string{"type": "text", "text": text})
+	if err != nil {
+		t.Fatalf("marshal outbox text: %v", err)
+	}
+	execOK(t, pool, `
+		INSERT INTO agent_outbox (agent_id, content, created_at)
+		VALUES ($1, $2::jsonb, NOW() - $3::interval)
+	`, agentID, string(raw), age)
 }
 
 func agentStatus(t *testing.T, pool *pgxpool.Pool, agentID string) string {
@@ -938,5 +953,177 @@ func TestDispatch_NonImplementorBlocker_NotRetired(t *testing.T) {
 	}
 	if n := pipelineNotifications(t, pool, "tr"); n != 0 {
 		t.Fatalf("notifications = %d, want 0", n)
+	}
+}
+
+// ---- MAQ-36: honest retire notes + findings salvage ---------------------
+
+// TestWatchdog_RetireNoteStatesRealTrigger pins the retire note against a
+// known activity timeline. The freeze predicate is parallel bounds — silence
+// on BOTH channels (outbox + transcript) for the full idle bound, agent
+// older than the spawn grace — so the note must state exactly that, not the
+// old "no outbox activity for X past the Y spawn grace" which read like a
+// sequential window and hid the transcript veto (MAQ-35's forensics hit).
+func TestWatchdog_RetireNoteStatesRealTrigger(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tn", "uuid-n", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-tn", "tn")
+	// A live reviewer round is never round 0 — dispatch increments
+	// review_rounds at spawn — so pin the note against a round-1 episode.
+	execOK(t, pool, `UPDATE tasks SET review_rounds = 1 WHERE id='tn'`)
+
+	// The MAQ-35 timeline shape: spawned ~10m ago, outbox activity 5m ago.
+	// At the documented bounds this is a LIVE agent — the watchdog must not
+	// fire, so no note can misdescribe it.
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '10 minutes' WHERE id='reviewer-tn'`)
+	seedOutboxRow(t, pool, "reviewer-tn", "5 minutes")
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass (recent activity): %v", err)
+	}
+	if got := agentStatus(t, pool, "reviewer-tn"); got != "running" {
+		t.Fatalf("active reviewer status = %q, want running", got)
+	}
+
+	// Now the truly frozen timeline: silent on both channels for 31m. When
+	// the watchdog fires, the observation note is pinned to the honest text.
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes', last_transcript_at = NOW() - interval '31 minutes' WHERE id='reviewer-tn'`)
+	execOK(t, pool, `UPDATE agent_outbox SET created_at = NOW() - interval '31 minutes' WHERE agent_id='reviewer-tn'`)
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass (frozen): %v", err)
+	}
+	var note string
+	if err := pool.QueryRow(ctx, `
+		SELECT content FROM task_context WHERE task_id='tn' AND kind='observation'
+	`).Scan(&note); err != nil {
+		t.Fatalf("freeze observation row: %v", err)
+	}
+	want := "watchdog: reviewer frozen (round 1) — silent for 30m0s (no outbox row and no transcript growth; spawn grace 10m0s elapsed); auto-retired, fresh reviewer respawns in-round"
+	if note != want {
+		t.Fatalf("retire note = %q, want %q", note, want)
+	}
+}
+
+// TestSalvageFindings_PrefersLongRows: the salvage scan skips short progress
+// notes/acks and returns the newest writeup-length row; no qualifying row →
+// "" with no error (the best-effort fallback).
+func TestSalvageFindings_PrefersLongRows(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tsf", "uuid-sf", "/tmp/wt")
+	seedReviewer(t, pool, "reviewer-tsf", "tsf")
+
+	// Nothing written: fallback.
+	got, err := salvageFindings(ctx, pool, "reviewer-tsf")
+	if err != nil || got != "" {
+		t.Fatalf("empty outbox salvage = %q, %v; want \"\", nil", got, err)
+	}
+
+	// Short note, then a writeup: the writeup wins even though it is older.
+	seedOutboxRow(t, pool, "reviewer-tsf", "2 minutes")
+	long := "1. internal/x/y.go:42 — nil deref when the queue empties. " + strings.Repeat("Detail. ", 40)
+	seedOutboxText(t, pool, "reviewer-tsf", long, "10 minutes")
+	got, err = salvageFindings(ctx, pool, "reviewer-tsf")
+	if err != nil {
+		t.Fatalf("salvageFindings: %v", err)
+	}
+	if !strings.Contains(got, "nil deref") {
+		t.Fatalf("salvage = %q, want the long findings row", got)
+	}
+}
+
+// TestWatchdog_SalvageCarriesFindingsToRespawn is the MAQ-36 acceptance
+// flow: a reviewer completes its findings writeup but never delivers the
+// verdict, the watchdog retires it, and the respawned round's prompt carries
+// the salvaged findings ("verify + post the verdict") — until a verdict
+// lands, which retires the salvage as stale.
+func TestWatchdog_SalvageCarriesFindingsToRespawn(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tsv", "uuid-sv", t.TempDir())
+	seedReviewer(t, pool, "reviewer-tsv", "tsv")
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-tsv'`)
+
+	// The delivery-failure shape (MAQ-35): a short progress note, then the
+	// complete findings — no VERDICT line anywhere in the outbox. Both rows
+	// sit OUTSIDE the 30m idle bound: after the writeup the reviewer stalled
+	// on delivery, and silence on both channels is what the watchdog sees.
+	seedOutboxRow(t, pool, "reviewer-tsv", "40 minutes")
+	findings := "1. internal/pipeline/freeze.go:206 — the retire note misstates the timer math. " + strings.Repeat("Evidence. ", 40)
+	seedOutboxText(t, pool, "reviewer-tsv", findings, "35 minutes")
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	if got := agentStatus(t, pool, "reviewer-tsv"); got != "dead" {
+		t.Fatalf("frozen reviewer status = %q, want dead", got)
+	}
+	var salvAgent, salvText string
+	if err := pool.QueryRow(ctx, `
+		SELECT COALESCE(agent_id, ''), content FROM task_context
+		WHERE task_id='tsv' AND kind='salvage'
+	`).Scan(&salvAgent, &salvText); err != nil {
+		t.Fatalf("salvage row after retire: %v", err)
+	}
+	if salvAgent != "reviewer-tsv" || !strings.Contains(salvText, "misstates the timer math") {
+		t.Fatalf("salvage row = (%q, %q), want the frozen reviewer's findings", salvAgent, salvText)
+	}
+
+	// The respawn: the next spawn pass mints -r2 and its round prompt ships
+	// the salvage section with the verify-and-deliver framing.
+	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
+	if err := dispatchPass(ctx, pool, nil, sp, 10*time.Minute); err != nil {
+		t.Fatalf("dispatchPass: %v", err)
+	}
+	if len(sp.spawns) != 1 || sp.spawns[0].AgentID != "reviewer-tsv-r2" {
+		t.Fatalf("respawn = %+v, want exactly reviewer-tsv-r2", sp.spawns)
+	}
+	prompt := inboxPrompts(t, pool, "reviewer-tsv-r2")[0]
+	for _, want := range []string{
+		"Salvaged review from reviewer-tsv",
+		"never delivered the VERDICT line",
+		"VERIFY those findings",
+		"misstates the timer math", // the findings body rides along
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Errorf("respawn prompt missing salvage framing %q:\n%s", want, prompt)
+		}
+	}
+
+	// Once a verdict lands, the salvage is stale: no later prompt carries it.
+	execOK(t, pool, `
+		INSERT INTO task_context (task_id, agent_id, kind, content)
+		VALUES ('tsv', 'reviewer-tsv-r2', 'verdict', 'VERDICT: approve')
+	`)
+	if _, s := fetchSalvagedFindings(ctx, pool, "tsv"); s != "" {
+		t.Fatalf("salvage still live after a verdict: %q", s)
+	}
+}
+
+// TestWatchdog_NoFindings_NoSalvage: the fallback — a frozen reviewer that
+// wrote nothing writeup-length leaves no salvage row, and the respawned
+// round re-reviews from scratch (today's behavior).
+func TestWatchdog_NoFindings_NoSalvage(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	seedReviewTask(t, pool, "tnf", "uuid-nf", t.TempDir())
+	seedReviewer(t, pool, "reviewer-tnf", "tnf")
+	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes' WHERE id='reviewer-tnf'`)
+	// Only short chatter, and outside the idle bound so the freeze predicate
+	// actually fires.
+	seedOutboxRow(t, pool, "reviewer-tnf", "40 minutes")
+
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+		t.Fatalf("watchdogPass: %v", err)
+	}
+	if n := count(t, pool, `SELECT count(*) FROM task_context WHERE task_id='tnf' AND kind='salvage'`); n != 0 {
+		t.Fatalf("salvage rows = %d, want 0", n)
+	}
+	sp := &fakeSpawner{t: t, pool: pool, insertRow: true}
+	if err := dispatchPass(ctx, pool, nil, sp, 10*time.Minute); err != nil {
+		t.Fatalf("dispatchPass: %v", err)
+	}
+	if prompt := inboxPrompts(t, pool, "reviewer-tnf-r2")[0]; strings.Contains(prompt, "Salvaged review") {
+		t.Fatalf("fallback prompt leaked a salvage section:\n%s", prompt)
 	}
 }

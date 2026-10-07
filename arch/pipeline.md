@@ -277,6 +277,33 @@ still apply. This repo's seeded `MAQUINISTA.md`: any change touching
 `DOMAIN.md` or `ARCH.md` requires human review/approval — the reviewer
 must not approve such a PR on its own.
 
+**Terminal-action contract (MAQ-36).** The round prompt's closing paragraph
+makes verdict DELIVERY the round's terminal action: the state machine parses
+nothing but the final `VERDICT:` line of the reviewer's reply (that line
+becomes the round's verdict comment on the PR), so a complete findings
+write-up that never ends with the verdict line does not finish the round —
+the watchdog retires it as frozen and a fresh round re-runs. The paragraph
+ends with the verdict vocabulary line (`VERDICT: approve |
+VERDICT: request_changes | VERDICT: needs_human`) and nothing after it.
+Both prompt paths share `reviewPromptBody`, so spawn and heal carry the
+contract on every round.
+
+**Salvaged findings on watchdog respawn (MAQ-36).** A reviewer freeze
+usually kills delivery, not review: the write-up is already in the outbox
+while the verdict never landed. So the watchdog's reviewer arm captures the
+frozen reviewer's write-up BEFORE the retire — the newest `agent_outbox`
+text row long enough to be a findings list (≥ 200 chars, tail-capped at
+6000) — and records it in the same retire tx as a `task_context` row of
+kind `salvage`. The respawned round's prompt (`buildReviewPrompt`) then
+renders that row as a verify-and-deliver section: the predecessor completed
+its review but failed to deliver, so this round verifies the findings
+against the diff and posts the verdict instead of re-reviewing from
+scratch. The salvage goes stale once any verdict row lands after it (its
+round ended) and stops rendering; a frozen reviewer with no writeup-length
+row inserts nothing and the respawn falls back to today's full re-review.
+All of it is best-effort: capture or lookup failures log and degrade to the
+plain round.
+
 **Spawn pickup markers (MAQ-25).** At spawn time — before the agent does
 any work — dispatch posts a one-line pickup comment on the task's open PR
 (`postPickupComment`, the MAQ-16 `PRComments`+`PRPostComment` transport),
@@ -416,6 +443,9 @@ and growth since the boot is liveness — not a ghost. Rows younger than
 the spawn grace are left to the continuous arm (the 04/10 lesson: never
 murder a newborn on sight). The malformed-verdict case is still left to
 the watchdog: the parser never guesses, the freeze bound is the backstop.
+The reviewer arm additionally salvages its victim's undelivered write-up
+(see **Salvaged findings on watchdog respawn**, above) so the respawned
+round verifies + delivers instead of re-reviewing from scratch.
 
 **Respawn cap (MAQ-31, round-2 review).** The in-round re-dispatch is a
 loop, and a systemic outage (model API down, undeliverable prompt) would

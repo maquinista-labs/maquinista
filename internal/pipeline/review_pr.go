@@ -218,10 +218,12 @@ func fetchHumanPRComments(ctx context.Context, pool *pgxpool.Pool, g GhRunner, t
 
 // buildReviewPrompt composes the round prompt: the standard per-round
 // briefing, the repo's binding review criteria (MAQUINISTA.md at the task
-// worktree root, MAQ-35), and the human PR comments newer than the previous
-// reviewer's start (MAQ-16). Best-effort on every auxiliary read: missing
-// criteria (the common case), a gh outage, or any lookup failure degrades
-// to today's plain prompt — never an error, never a blocked round.
+// worktree root, MAQ-35), the human PR comments newer than the previous
+// reviewer's start (MAQ-16), and — on a watchdog-respawned round — the
+// predecessor's salvaged findings (MAQ-36). Best-effort on every auxiliary
+// read: missing criteria (the common case), a gh outage, or any lookup
+// failure degrades to today's plain prompt — never an error, never a
+// blocked round.
 func buildReviewPrompt(ctx context.Context, pool *pgxpool.Pool, g GhRunner, taskID string, round int, currentAgentID string) string {
 	var criteria string
 	wt, err := taskWorktreePath(ctx, pool, taskID)
@@ -230,13 +232,64 @@ func buildReviewPrompt(ctx context.Context, pool *pgxpool.Pool, g GhRunner, task
 	} else {
 		criteria = renderReviewCriteria(loadReviewCriteria(wt))
 	}
+	// MAQ-36: a watchdog-respawned round inherits its predecessor's salvaged
+	// writeup — verify + deliver, not re-review. Read on both paths (spawn
+	// and heal share this builder); gh stays optional for it.
+	salvageAgent, salvage := fetchSalvagedFindings(ctx, pool, taskID)
+	body := ""
 	if g == nil {
-		return reviewPromptBody(taskID, round, criteria, "")
+		body = reviewPromptBody(taskID, round, criteria, "")
+	} else {
+		cutoff, err := previousReviewerCutoff(ctx, pool, taskID, currentAgentID)
+		if err != nil {
+			log.Printf("pipeline: dispatch: reviewer cutoff %s: %v — treating as round 1", taskID, err)
+			cutoff = nil
+		}
+		body = reviewPromptBody(taskID, round, criteria, fetchHumanPRComments(ctx, pool, g, taskID, cutoff))
 	}
-	cutoff, err := previousReviewerCutoff(ctx, pool, taskID, currentAgentID)
+	if salvage != "" {
+		body += "\n\n" + renderSalvagedFindings(salvageAgent, salvage)
+	}
+	return body
+}
+
+// fetchSalvagedFindings loads the task's freshest salvage row — a frozen
+// reviewer's captured writeup (MAQ-36) — while it is still LIVE: once any
+// verdict row has landed after it, the salvage is stale (its round ended)
+// and stops rendering. Best-effort: any lookup failure logs and returns
+// empty (the prompt ships without the section).
+func fetchSalvagedFindings(ctx context.Context, pool *pgxpool.Pool, taskID string) (agentID, findings string) {
+	err := pool.QueryRow(ctx, `
+		SELECT COALESCE(agent_id, ''), content FROM task_context s
+		WHERE s.task_id = $1 AND s.kind = 'salvage'
+		  AND NOT EXISTS (
+		        SELECT 1 FROM task_context v
+		        WHERE v.task_id = s.task_id AND v.kind = 'verdict'
+		          AND v.created_at > s.created_at)
+		ORDER BY s.created_at DESC LIMIT 1
+	`, taskID).Scan(&agentID, &findings)
 	if err != nil {
-		log.Printf("pipeline: dispatch: reviewer cutoff %s: %v — treating as round 1", taskID, err)
-		cutoff = nil
+		if !errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("pipeline: dispatch: salvage lookup %s: %v (prompt ships without it)", taskID, err)
+		}
+		return "", ""
 	}
-	return reviewPromptBody(taskID, round, criteria, fetchHumanPRComments(ctx, pool, g, taskID, cutoff))
+	return agentID, findings
+}
+
+// renderSalvagedFindings frames the predecessor's writeup for the
+// watchdog-respawned reviewer (MAQ-36): the predecessor completed its review
+// but failed to deliver its verdict, so this round VERIFIES the findings and
+// delivers the verdict instead of re-reviewing the diff from scratch.
+func renderSalvagedFindings(agentID, findings string) string {
+	who := agentID
+	if who == "" {
+		who = "the previous reviewer"
+	}
+	return fmt.Sprintf(
+		"Salvaged review from %s (this round was respawned by the watchdog): your predecessor completed its review and wrote the findings below, "+
+			"but its reply never delivered the VERDICT line — the round died on delivery, not on the review. "+
+			"Your round exists to VERIFY those findings against the diff and then deliver the verdict (the round's terminal action); "+
+			"do NOT re-review the diff from scratch unless the findings are wrong, stale, or incomplete.\n\n"+
+			"Predecessor findings:\n%s", who, findings)
 }
