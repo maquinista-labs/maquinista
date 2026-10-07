@@ -102,17 +102,26 @@ func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 		}
 		pane := paneStateFor(sessionName, f.session, f.agentID, paneExists)
 		note := fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; tmux pane for this id: %s; auto-retired, claim requeues to ready for a fresh attempt", f.agentID, idle, spawn, pane)
+		// MAQ-37: the 🆘 carries prose, not the ledger's machine block. The
+		// pane fact stays in the note above; the sentence only surfaces it
+		// when it contradicts the freeze (a live pane over a silent agent is
+		// the stale-id starvation signature an operator should know about).
+		human := fmt.Sprintf("the implementor went silent (~%s with no activity) — retired it; the task requeues for a fresh attempt. No action needed.", pipeline.DurHuman(idle))
+		if pane == "yes" {
+			human = fmt.Sprintf("the implementor went silent (~%s with no activity) even though its terminal pane was still open — retired it; the task requeues for a fresh attempt. No action needed.", pipeline.DurHuman(idle))
+		}
 		var cleanup func(pgx.Tx) error
 		if spent >= respawnCap {
 			// Respawn budget spent — a fresh implementor would freeze the
 			// same way. Park needs-human atomically with the retire (the
 			// guarded retire is still the exactly-once dedup).
 			note = fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; tmux pane for this id: %s; %d respawns already spent, parking needs-human", f.agentID, idle, spawn, pane, spent)
+			human = fmt.Sprintf("the implementor hung %d times (each ~%s with no activity) — the machine gave up and is waiting for you.", spent, pipeline.DurHuman(idle))
 			cleanup = func(tx pgx.Tx) error {
 				return pipeline.ParkEpisodeTx(ctx, tx, f.taskID, "claimed", note)
 			}
 		}
-		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, f.agentID, f.taskID, note, cleanup)
+		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, f.agentID, f.taskID, note, human, cleanup)
 		if err != nil {
 			return retired, err
 		}
@@ -186,7 +195,8 @@ func HealRestartCohort(ctx context.Context, pool *pgxpool.Pool, boot time.Time, 
 	var unswept []ghost
 	for _, g := range ghosts {
 		note := fmt.Sprintf("watchdog: restart cohort — %s predates this boot (last_seen before startup) and never streamed; auto-retired, task re-dispatches per its state", g.agentID)
-		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, g.agentID, g.taskID, note, func(tx pgx.Tx) error {
+		human := "a leftover agent from before the restart never produced output — retired it; the task re-dispatches automatically. No action needed."
+		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, g.agentID, g.taskID, note, human, func(tx pgx.Tx) error {
 			// Release a fix episode the ghost was working (same cleanup as
 			// the fixer freeze arm) so fixerPass can re-arm it. No-op for
 			// every other role/status.

@@ -290,7 +290,8 @@ func ReapStaleClaims(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 	for _, id := range reaped {
 		// MAQ-22: the guarded UPDATE above flips the row exactly once per
 		// release, so the requeue-after-heal one-liner is exactly-once too.
-		pipeline.Notifyf(ctx, pool, "🔄 %s: requeued to ready — stale claim healed (agent died mid-flight).",
+		// Task-stamped (MAQ-37): the issue/PR links ride with the note.
+		pipeline.NotifyTaskf(ctx, pool, id, "🔄 %s: requeued to ready — stale claim healed (the agent died mid-flight); a fresh implementor picks it up. No action needed.",
 			pipeline.TaskTitle(ctx, pool, id))
 	}
 	return len(reaped), nil
@@ -399,8 +400,11 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 	// are genuine claims and both announce; the empty check below is
 	// defensiveness against a future EnsureAgent change, not the guard.
 	if agentID != "" {
-		pipeline.Notifyf(ctx, pool, "📋 %s: claimed by @%s (%s) — /work-on-task dispatched.",
-			pipeline.TaskTitle(ctx, pool, taskID), agentID, role)
+		// MAQ-37: the claim names the role, never the minted worker id, and
+		// is task-stamped so the issue/PR links + reply-to-task key ride
+		// along.
+		pipeline.NotifyTaskf(ctx, pool, taskID, "📋 %s: claimed by %s — /work-on-task dispatched.",
+			pipeline.TaskTitle(ctx, pool, taskID), pipeline.RoleHuman(role, agentID))
 	}
 
 	// Enqueue the implementor's starting prompt + mark task.claimed_by.

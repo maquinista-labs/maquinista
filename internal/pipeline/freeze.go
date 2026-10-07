@@ -191,7 +191,8 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			// needs-human — retire + park in one tx, the guarded retire is
 			// still the exactly-once dedup.
 			note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — no outbox activity for %s past the %s spawn grace; %d in-round respawns already spent, parking needs-human", r.round, idle, spawn, spent)
-			applied, err := RetireFrozenAgentCleanup(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
+			human := fmt.Sprintf("the reviewer hung %d times (each ~%s with no activity) — the machine gave up and is waiting for you.", spent, DurHuman(idle))
+			applied, err := RetireFrozenAgentCleanup(ctx, pool, r.agentID, r.taskID, note, human, func(tx pgx.Tx) error {
 				return ParkEpisodeTx(ctx, tx, r.taskID, "review", note)
 			})
 			if err != nil {
@@ -204,7 +205,10 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			continue
 		}
 		note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — no outbox activity for %s past the %s spawn grace; auto-retired, fresh reviewer respawns in-round", r.round, idle, spawn)
-		applied, err := RetireFrozenAgent(ctx, pool, r.agentID, r.taskID, note)
+		// MAQ-37: the round number stays in the ledger note; prose says "the
+		// same round" — a raw 0/1 round digit reads like machine state.
+		human := fmt.Sprintf("the reviewer went silent (~%s with no activity) — retired it and started a fresh reviewer for the same round. No action needed.", DurHuman(idle))
+		applied, err := RetireFrozenAgent(ctx, pool, r.agentID, r.taskID, note, human)
 		if err != nil {
 			return err
 		}
@@ -228,7 +232,8 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			// as the respawn arm, so a human flipping the task back to
 			// changes_requested re-arms clean.
 			note := fmt.Sprintf("watchdog: fixer frozen (round %d) — no outbox activity for %s past the %s spawn grace; %d episode re-arms already spent, parking needs-human", r.round, idle, spawn, spent)
-			applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
+			human := fmt.Sprintf("the fixer hung %d times (each ~%s with no activity) — the machine gave up and is waiting for you.", spent, DurHuman(idle))
+			applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, human, func(tx pgx.Tx) error {
 				var round int
 				if err := tx.QueryRow(ctx,
 					`SELECT review_rounds FROM tasks WHERE id = $1 FOR UPDATE`, r.taskID).Scan(&round); err != nil {
@@ -252,7 +257,8 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			continue
 		}
 		note := fmt.Sprintf("watchdog: fixer frozen (round %d) — no outbox activity for %s past the %s spawn grace; auto-retired, fix episode re-armed", r.round, idle, spawn)
-		applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
+		human := fmt.Sprintf("the fixer went silent (~%s with no activity) — retired it and re-armed the fix round with a fresh fixer. No action needed.", DurHuman(idle))
+		applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, human, func(tx pgx.Tx) error {
 			// Release the episode: fixerCandidatesSQL keys on the round's
 			// fix row, so deleting it lets the next fixerPass mint a fresh
 			// fixer (-rN) for the SAME round. The frozen agent's own fix
@@ -285,17 +291,19 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 // task_context observation for downstream attempts, and deletion of the
 // agent's undriven task prompts (the rationale lives on
 // retireFrozenAgentTx). applied=false when the row raced to dead elsewhere
-// (no notification).
-func RetireFrozenAgent(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note string) (bool, error) {
-	return retireFrozenAgentTx(ctx, pool, agentID, taskID, note, nil)
+// (no notification). note is the machine-ledger observation; human is the
+// plain-language sentence the 🆘 carries (MAQ-37 — ids and timings live in
+// the ledger, prose in the notification).
+func RetireFrozenAgent(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note, human string) (bool, error) {
+	return retireFrozenAgentTx(ctx, pool, agentID, taskID, note, human, nil)
 }
 
 // RetireFrozenAgentCleanup is RetireFrozenAgent with a same-tx cleanup hook,
 // for retires whose re-dispatch needs an episode-row release (the fixer
 // arms delete the round's fix row with it) — atomic with the guarded
 // retire, so a raced no-op never releases an episode it didn't win.
-func RetireFrozenAgentCleanup(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note string, cleanup func(pgx.Tx) error) (bool, error) {
-	return retireFrozenAgentTx(ctx, pool, agentID, taskID, note, cleanup)
+func RetireFrozenAgentCleanup(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note, human string, cleanup func(pgx.Tx) error) (bool, error) {
+	return retireFrozenAgentTx(ctx, pool, agentID, taskID, note, human, cleanup)
 }
 
 // retireFrozenAgentTx is the shared retire: one tx — guarded status→dead,
@@ -313,7 +321,7 @@ func RetireFrozenAgentCleanup(ctx context.Context, pool *pgxpool.Pool, agentID, 
 // premise — so the rows are undriven and safe to drop. Implementors don't
 // need it (the scheduler's Upsert repoints) and reviewers grow a fresh
 // round key, but uniformity costs nothing and un-wedges every shape.
-func retireFrozenAgentTx(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note string, extra func(pgx.Tx) error) (bool, error) {
+func retireFrozenAgentTx(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note, human string, extra func(pgx.Tx) error) (bool, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -355,6 +363,9 @@ func retireFrozenAgentTx(ctx context.Context, pool *pgxpool.Pool, agentID, taskI
 	}
 	// MAQ-22/MAQ-31: the guarded retire above fired exactly once, so the
 	// 🆘 does too — inside the applied branch, never on a raced no-op.
-	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s%s", TaskTitle(ctx, pool, taskID), note, prLinkSuffix(ctx, pool, taskID))
+	// The note (ids, timings) went to the task_context ledger above; the
+	// notification carries only the human sentence (MAQ-37). Links ride
+	// via NotifyTask's decoration.
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s", TaskTitle(ctx, pool, taskID), human)
 	return true, nil
 }

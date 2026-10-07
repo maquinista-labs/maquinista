@@ -419,8 +419,10 @@ func retireStuckImplementor(ctx context.Context, pool *pgxpool.Pool, taskID stri
 	if tag.RowsAffected() == 0 {
 		return false, true, nil // raced to dead elsewhere — no notification
 	}
-	notifyTaskf(ctx, pool, taskID, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.%s",
-		taskTitle(ctx, pool, taskID), agentID, idleAfter, prLinkSuffix(ctx, pool, taskID))
+	// MAQ-37: prose, not the internal id — the retired row is identified as
+	// the implementor (role), never as `implementor-<uuid>[-rN]`.
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s ended its turn without announcing completion (silent for ~%s) — retired it; review proceeds. If the PR looks complete, no action needed.",
+		taskTitle(ctx, pool, taskID), roleHuman(agentID), DurHuman(idleAfter))
 	return true, true, nil
 }
 
@@ -553,8 +555,9 @@ func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agen
 	// MAQ-22: the round's claim announces itself exactly once — this bump
 	// runs once per spawned reviewer (the spawn pass's no-live-reviewer
 	// filter is the guard), so the journey stays visible in the topic
-	// without re-firing on later ticks.
-	notifyf(ctx, pool, "👀 %s: reviewer claimed — review round %d starting.",
+	// without re-firing on later ticks. Task-stamped (MAQ-37): the note is
+	// task-scoped, so it rides the issue/PR links + reply-to-task key.
+	notifyTaskf(ctx, pool, taskID, "👀 %s: code review round %d starting.",
 		TaskTitle(ctx, pool, taskID), round)
 
 	content, err := json.Marshal(map[string]any{
@@ -1064,8 +1067,9 @@ func recordFixEpisode(ctx context.Context, pool *pgxpool.Pool, agentID, taskID s
 	}
 	// MAQ-22: the episode marker above is the exactly-once guard — it is
 	// what fixerCandidatesSQL keys on — so the round-started one-liner
-	// fires exactly once per fixer episode.
-	notifyf(ctx, pool, "🔧 %s: fixer round %d started — resolving request_changes findings.",
+	// fires exactly once per fixer episode. Task-stamped (MAQ-37): links
+	// + reply-to-task key ride with the note.
+	notifyTaskf(ctx, pool, taskID, "🔧 %s: fixer round %d started — resolving the reviewer's findings.",
 		TaskTitle(ctx, pool, taskID), round)
 	tx, err := pool.Begin(ctx)
 	if err != nil {

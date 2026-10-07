@@ -122,7 +122,11 @@ func SetPRUrl(ctx context.Context, pool *pgxpool.Pool, taskID, url string) error
 	if err != nil {
 		return err
 	}
-	pipeline.Notifyf(ctx, pool, "📤 %s: PR opened → review.\n🔗 PR: %s", title, url)
+	// Task-stamped (MAQ-37): the canonical [MAQ-n] headline and the Linear
+	// issue link ride via the notify seam's decoration; the task_id key
+	// makes the note reply-commentable (MAQ-24).
+	pipeline.NotifyTaskf(ctx, pool, taskID, "📤 %s: PR opened → review.\n🔗 PR: %s",
+		pipeline.TaskTitle(ctx, pool, taskID), url)
 	return nil
 }
 

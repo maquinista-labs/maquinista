@@ -79,8 +79,8 @@ func mergeUpAfterConflict(ctx context.Context, pool *pgxpool.Pool, cfg MergeConf
 			db.AddObservation(pool, taskID, "merger",
 				fmt.Sprintf("Auto merge-up healed stale branch %s: origin/%s folded in via %s; re-checked mergeable — proceeding to gates.",
 					entry.Branch, base, method))
-			notifyTaskf(ctx, pool, taskID, "🔀 %s: branch %s was stale — auto merge-up (%s) folded origin/%s in; merge gates re-running.%s",
-				taskTitle(ctx, pool, taskID), entry.Branch, method, base, prLinkSuffix(ctx, pool, taskID))
+			notifyTaskf(ctx, pool, taskID, "🔀 %s: the branch was stale — an automatic merge-up (%s) folded origin/%s in; merge gates re-run. No action needed.",
+				taskTitle(ctx, pool, taskID), method, base)
 			log.Printf("pipeline: merge %s conflict healed by auto merge-up (%s) on branch %s", taskID, method, entry.Branch)
 			return finishMergeGH(ctx, pool, cfg, prov, teamID, entry, info, wt, base, pr)
 		}

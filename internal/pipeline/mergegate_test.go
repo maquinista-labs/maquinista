@@ -178,7 +178,7 @@ func TestProcessMergeGH_BuildGateBlocksBrokenBranch(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("emitted %d notes, want 1: %q", len(texts), texts)
 	}
-	for _, want := range []string{"🆘", "build gate failed", "go build ./...", "redeclared", "Back to the fixer", "round 1 of 3"} {
+	for _, want := range []string{"🆘", "build gate failed", "go build ./...", "redeclared", "Sending it back to the fixer", "attempt 1 of 3"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("note %q missing %q", texts[0], want)
 		}

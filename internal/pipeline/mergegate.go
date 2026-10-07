@@ -466,13 +466,13 @@ func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, ent
 	}
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("%s gate failed on branch %s — `%s` %s:\n%s", stepHead, entry.Branch, gateCmd, cause, output))
-	next := fmt.Sprintf("Back to the fixer: gate-failure round %d of %d — it pushes a fix, the reviewer re-checks it, and the queue re-runs the gate.",
+	next := fmt.Sprintf("Sending it back to the fixer (attempt %d of %d): a fix gets pushed, review re-runs, and the gate tries again. No action needed.",
 		failed, maxGateFixRounds)
 	if landed == "pending_approval" {
-		next = fmt.Sprintf("Task parked needs-human after %d gate failures. Fix, re-push, then `maquinista approve %s` to retry the merge.", failed, taskID)
+		next = fmt.Sprintf("Parked for you after %d gate failures. Fix and re-push, then approve to retry the merge (reply `approve` here, comment `approve` on the ticket issue, or run `maquinista approve %s`).", failed, shortTaskID(taskID))
 	}
-	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s gate failed on branch %s — `%s` %s. %s:\n%s\n%s%s",
-		taskTitle(ctx, pool, taskID), step, entry.Branch, gateCmd, cause, outLabel, output, next, prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: the %s gate failed on branch %s — `%s` %s. %s:\n%s\n%s",
+		taskTitle(ctx, pool, taskID), step, entry.Branch, gateCmd, cause, outLabel, output, next)
 	log.Printf("pipeline: merge %s %s gate failed on branch %s → %s", taskID, step, entry.Branch, landed)
 	return nil
 }

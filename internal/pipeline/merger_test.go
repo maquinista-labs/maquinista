@@ -219,7 +219,7 @@ func TestProcessMergeGH_ConflictArmsMergerEpisode(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("notes = %d, want 1 (the arming note)", len(texts))
 	}
-	for _, want := range []string{"🔀", "merger agent", "feature.txt", "attempt 1/5"} {
+	for _, want := range []string{"🔀", "merge agent is resolving", "feature.txt", "attempt 1/5"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("arming note %q missing %q", texts[0], want)
 		}
@@ -250,8 +250,8 @@ func TestMergerVerdict_MergedContinuesToMerge(t *testing.T) {
 		t.Error("episode must be consumed by the merged verdict")
 	}
 	texts := pipelineNotifyTextsPool(t, pool)
-	if len(texts) != 2 || !strings.Contains(texts[1], "re-entering the merge queue") {
-		t.Fatalf("notes = %q, want the re-entering note second", texts)
+	if len(texts) != 2 || !strings.Contains(texts[1], "back in the merge queue") {
+		t.Fatalf("notes = %q, want the merge-queue note second", texts)
 	}
 
 	// The released entry re-claims (FIFO) and the normal path completes.
@@ -532,8 +532,8 @@ func TestMergerPass_StaleMarkerParks(t *testing.T) {
 		t.Error("stale episode must be consumed by the park")
 	}
 	texts := pipelineNotifyTextsPool(t, pool)
-	if len(texts) != 1 || !strings.Contains(texts[0], "never dispatched") {
-		t.Fatalf("notes = %q, want one never-dispatched note", texts)
+	if len(texts) != 1 || !strings.Contains(texts[0], "armed but never started") || !strings.Contains(texts[0], "~2h") {
+		t.Fatalf("notes = %q, want one never-started note with a human duration", texts)
 	}
 
 	// Fresh markers are untouched by the stale bound.
