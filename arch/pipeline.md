@@ -130,6 +130,15 @@ implementor:
   murder mid-turn survivors on sight — the veto would be dead code.
   Per-ghost failures don't abort the sweep; unswept survivors are logged
   and fall back to the continuous arms.
+- **boot binding sweep (MAQ-38):** before any pane respawns,
+  `agent.SweepStaleWindowBindings` runs once per orchestrator boot: every
+  `agents.tmux_window` binding that does not resolve to a live pane named
+  for the row's own id is cleared (stale corpses, collided ids), and live
+  rows that held a collided id are reported ONCE, loud, on the Pipeline
+  topic (🧹 with the row-by-row mismatch) instead of silently starving
+  the watchdog round after round. Statuses are untouched — the state
+  machine owns them; the sweep only releases dead bindings so fresh
+  panes bind clean.
 
 The standalone `maquinista task-scheduler` subcommand keeps the
 orchestrator.EnsureAgent stub (row-only, no pty) for debugging alongside a
@@ -363,7 +372,29 @@ episode re-armed (the round's fix row is released; task stays
 `changes_requested`), implementor → claim requeued to `ready` by the
 stale-claim reaper (the task scheduler runs the same freeze predicate
 every wake — `taskscheduler.RetireFrozenClaims`). Every auto-retire
-notifies; silence is never a heal. The merger freeze still parks
+notifies; silence is never a heal.
+
+**Retire hygiene (MAQ-38).** Every guarded retire (all roles) also clears
+the row's `agents.tmux_window` binding: tmux window ids (@N) restart with
+the tmux server, so a corpse holding @N is a collision timebomb — the
+next pane to draw that id would share it with a dead row, and every
+window-scoped consumer (monitor outbox attribution, transcript-liveness
+touches, freeze-arm pane kills) resolves through that binding. The
+implementor arm's retire note additionally states whether a tmux pane
+existed for the retired id (name-based probe — panes are created
+`-n <agentID>` and agent ids are never reused, so id-based lookups cannot
+answer this across restarts): "no" means the round never had a pane (a
+spawn failure wearing a freeze costume — different remediation), "yes"
+during an apparent freeze is the stale-id starvation signature. That
+distinction is what turned the 07/10 false-freeze churn (post-crash
+window-id reuse routed whole rounds' outbox rows under stale pre-crash
+ids while the live rows starved both freshness channels) from an
+undiagnosable loop into a one-glance diagnosis in the 🆘. Window→agent
+resolution itself (`monitor.resolveAgentFromWindow`) is deterministic and
+live-preferring: exact id, then live status, then newest row — a collision
+never again feeds a corpse.
+
+The merger freeze still parks
 needs-human (the money path keeps a human gate). A **restart-cohort sweep**
 (`taskscheduler.HealRestartCohort`) runs once per boot — deferred by the
 scheduler to its first wake past a small grace (3× the monitor poll

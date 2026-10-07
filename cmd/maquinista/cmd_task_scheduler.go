@@ -9,6 +9,7 @@ import (
 
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
 	"github.com/maquinista-labs/maquinista/internal/taskscheduler"
+	"github.com/maquinista-labs/maquinista/internal/tmux"
 	"github.com/spf13/cobra"
 )
 
@@ -43,6 +44,9 @@ var taskSchedulerCmd = &cobra.Command{
 					Pool: pool, Spawner: spawner, Role: role, TaskID: taskID,
 				})
 			},
+			// MAQ-38 AC 2: freeze-retire notes state whether a pane existed
+			// for the retired id (name-based probe — panes are -n <agentID>).
+			PaneExists: tmux.WindowNameExists,
 		}
 		return taskscheduler.Run(ctx, pool, cfg)
 	},

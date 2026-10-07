@@ -18,6 +18,15 @@
 //     circuit breaker against a systemic outage looping
 //     freeze→requeue→claim→freeze forever.
 //
+//     Every retire note states whether a tmux pane existed for the retired
+//     id (MAQ-38 AC 2): the probe is name-based (panes are created
+//     -n <agentID> and ids are never reused), so "no" means the round
+//     never had a pane — a spawn failure wearing a freeze costume — while
+//     "yes" is a true silent worker. The distinction is what turned the
+//     07/10 false-freeze churn (stale-id attribution starved every round's
+//     freshness, pane present the whole time) from an undiagnosable loop
+//     into a one-glance diagnosis in the 🆘.
+//
 //   - HealRestartCohort runs once per unit boot (MAQ-31 AC 3) — deferred
 //     by Run until the monitor has had its first polls (the boot-relative
 //     transcript veto is meaningless before the monitor has spoken). Live
@@ -60,11 +69,13 @@ WHERE t.status = 'claimed'
   AND a.status IN (` + liveAgentStatusSQL + `)` + pipeline.FreezeFilterSQL
 
 // RetireFrozenClaims retires every frozen agent row on a claimed task.
+// paneExists probes "is there a pane for this agent id" (tmux.WindowNameExists
+// in production; tests inject) and rides the retire note — MAQ-38 AC 2.
 // Returns the number of rows THIS call retired (each one notified exactly
 // once, inside pipeline.RetireFrozenAgent's guarded transition). Episodes
 // whose respawn budget (respawnCap) is spent park needs-human atomically
 // with the retire instead of requeueing.
-func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error) (int, error) {
+func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error, paneExists func(session, name string) bool) (int, error) {
 	rows, err := pool.Query(ctx, frozenClaimsSQL, idle.Seconds(), spawn.Seconds())
 	if err != nil {
 		return 0, err
@@ -89,13 +100,14 @@ func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 		if err != nil {
 			return retired, err
 		}
-		note := fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; auto-retired, claim requeues to ready for a fresh attempt", f.agentID, idle, spawn)
+		pane := paneStateFor(sessionName, f.session, f.agentID, paneExists)
+		note := fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; tmux pane for this id: %s; auto-retired, claim requeues to ready for a fresh attempt", f.agentID, idle, spawn, pane)
 		var cleanup func(pgx.Tx) error
 		if spent >= respawnCap {
 			// Respawn budget spent — a fresh implementor would freeze the
 			// same way. Park needs-human atomically with the retire (the
 			// guarded retire is still the exactly-once dedup).
-			note = fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; %d respawns already spent, parking needs-human", f.agentID, idle, spawn, spent)
+			note = fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; tmux pane for this id: %s; %d respawns already spent, parking needs-human", f.agentID, idle, spawn, pane, spent)
 			cleanup = func(tx pgx.Tx) error {
 				return pipeline.ParkEpisodeTx(ctx, tx, f.taskID, "claimed", note)
 			}
@@ -211,6 +223,28 @@ func HealRestartCohort(ctx context.Context, pool *pgxpool.Pool, boot time.Time, 
 		log.Printf("taskscheduler: restart sweep: %s on %s NOT swept — the continuous freeze arms cover it on later passes", g.agentID, g.taskID)
 	}
 	return healed, errors.Join(errs...)
+}
+
+// paneStateFor answers "did a tmux pane exist for this agent id" for the
+// freeze note (MAQ-38 AC 2). The probe is name-based — every maquinista
+// pane is created with -n <agentID> and agent ids are never reused — so a
+// "no" means the retired id never had a pane at all (a spawn failure, not
+// a frozen worker), and a "yes" during an apparent freeze is the stale-id
+// signature: work was streaming into a pane whose outbox rows were being
+// attributed elsewhere. nil probe → "unknown" (tests, and any caller that
+// cannot look at tmux); the note still ships.
+func paneStateFor(sessionName, session, agentID string, paneExists func(session, name string) bool) string {
+	if paneExists == nil {
+		return "unknown"
+	}
+	s := session
+	if s == "" {
+		s = sessionName
+	}
+	if paneExists(s, agentID) {
+		return "yes"
+	}
+	return "no"
 }
 
 // killFrozenPane is the scheduler-side twin of pipeline's killReviewerPane:

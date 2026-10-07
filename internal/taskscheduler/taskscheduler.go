@@ -46,6 +46,12 @@ type Config struct {
 	// KillWindow is best-effort pane cleanup on freeze retires (MAQ-31;
 	// tmux.KillWindow-shaped). nil skips it — the row still retires.
 	KillWindow func(session, windowID string) error
+	// PaneExists probes whether a tmux pane exists for an agent id
+	// (tmux.WindowNameExists-shaped, name-based — MAQ-38 AC 2). The
+	// implementor freeze arm rides the answer on every retire note so a
+	// freeze with a live pane (the stale-id starvation signature) is
+	// diagnosable from the 🆘 alone. nil → notes say "unknown".
+	PaneExists func(session, name string) bool
 	// MonitorPollInterval mirrors config.Config.MonitorPollInterval (the
 	// transcript monitor's poll cadence, MONITOR_POLL_INTERVAL). The
 	// restart-cohort sweep defers until a few intervals after boot so the
@@ -161,7 +167,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		// agent row went silent past the freeze bounds) BEFORE the reaper —
 		// the retire is what lets the reaper's all-rows-non-live check pass
 		// on the next line, same wake.
-		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, respawnCap, cfg.SessionName, cfg.KillWindow); ferr != nil {
+		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, respawnCap, cfg.SessionName, cfg.KillWindow, cfg.PaneExists); ferr != nil {
 			log.Printf("taskscheduler: retire frozen claims: %v", ferr)
 		} else if retired > 0 {
 			log.Printf("taskscheduler: retired %d frozen claim agent(s)", retired)
