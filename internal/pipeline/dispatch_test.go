@@ -978,7 +978,7 @@ func TestWatchdog_RetireNoteStatesRealTrigger(t *testing.T) {
 	// fire, so no note can misdescribe it.
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '10 minutes' WHERE id='reviewer-tn'`)
 	seedOutboxRow(t, pool, "reviewer-tn", "5 minutes")
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {
 		t.Fatalf("watchdogPass (recent activity): %v", err)
 	}
 	if got := agentStatus(t, pool, "reviewer-tn"); got != "running" {
@@ -989,7 +989,7 @@ func TestWatchdog_RetireNoteStatesRealTrigger(t *testing.T) {
 	// the watchdog fires, the observation note is pinned to the honest text.
 	execOK(t, pool, `UPDATE agents SET started_at = NOW() - interval '31 minutes', last_transcript_at = NOW() - interval '31 minutes' WHERE id='reviewer-tn'`)
 	execOK(t, pool, `UPDATE agent_outbox SET created_at = NOW() - interval '31 minutes' WHERE agent_id='reviewer-tn'`)
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {
 		t.Fatalf("watchdogPass (frozen): %v", err)
 	}
 	var note string
@@ -1052,7 +1052,7 @@ func TestWatchdog_SalvageCarriesFindingsToRespawn(t *testing.T) {
 	findings := "1. internal/pipeline/freeze.go:206 — the retire note misstates the timer math. " + strings.Repeat("Evidence. ", 40)
 	seedOutboxText(t, pool, "reviewer-tsv", findings, "35 minutes")
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := agentStatus(t, pool, "reviewer-tsv"); got != "dead" {
@@ -1113,7 +1113,7 @@ func TestWatchdog_NoFindings_NoSalvage(t *testing.T) {
 	// actually fires.
 	seedOutboxRow(t, pool, "reviewer-tnf", "40 minutes")
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if n := count(t, pool, `SELECT count(*) FROM task_context WHERE task_id='tnf' AND kind='salvage'`); n != 0 {
