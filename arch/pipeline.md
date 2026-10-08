@@ -188,8 +188,11 @@ column ids via `TicketProvider.Columns` before pushing (`SetIssueColumn`).
 
 ## Review dispatch (EX-03)
 
-`pipeline.RunDispatch` (in `internal/pipeline/dispatch.go`) runs four passes
-per tick (default 10 s, same cadence as sync). It never talks to the ticket
+`pipeline.RunDispatch` (in `internal/pipeline/dispatch.go`) runs its passes
+per tick (default 10 s, same cadence as sync): reviewer spawn, prompt heal,
+verdict parse + transition, fixer, merger spawn/verdict/watchdog, freeze
+watchdog, merge enqueue, and the parked-branch merge-up (MAQ-42). It never
+ talks to the ticket
 system — everything below is `tasks`/`agents` bookkeeping, and the board
 sees the results only through the sync mirror.
 
@@ -639,6 +642,28 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   still spawns a merger session). Below the cap the entry is released for
   a later pass. The MAQ-15 merger-agent leg, when armed, takes precedence
   and is unchanged.
+- **Parked branches — merge-up pass (MAQ-42)** — the gate leg above only
+  sees `ready_to_merge` tasks, so a task parked `pending_approval` held a
+  branch that rotted while main moved (the MAQ-34 park sat CONFLICTING for
+  a day; no pass ever considered the branch). A dispatch-tick pass
+  (`parkedMergeUpPass`, next to the enqueue pass, gh mode regardless of
+  auto-merge — the approve verb benefits identically) scans parked tasks
+  holding a PR + worktree and no live queue entry, and runs the SAME
+  merge-up machinery on their branch: up-to-date branches cost one
+  ancestry read and nothing else; a stale branch that folds main in
+  cleanly is healed on the ref (🔀 note + observation, task stays parked,
+  no ledger, no comment) so the eventual approve takes the gate's
+  up-to-date fast path instead of re-conflicting; a deterministic
+  conflict consumes the same 2-attempt `mergeup_attempts` budget with a PR
+  comment per attempt. The budget lives on the task's newest merge_queue
+  entry — created as a terminal `conflict` ledger row
+  (`EnsureParkedMergeUpLedger`) when the park never reached the gate — so
+  a gate-parked conflict arrives at 2/2 and is never re-attempted, and a
+  fresh gate entry (requeue path) re-arms clean. After the second failure
+  exactly one 🆘 fires (the cap branch of the bump; the exhausted pre-
+  check keeps later ticks silent) and the task stays parked — the human
+  escapes are `resolve` / requeue, unchanged. A live merger episode
+  (`resolve` verb) blocks the pass, same as it blocks the gate.
 - **Conflicts — merger-agent leg (MAQ-15)** — under `PIPELINE_MERGE_AGENT=1`, a
   rebase conflict no longer parks immediately: the processor bumps the
   entry's `attempts` (the same budget as the CI cap), parks a
