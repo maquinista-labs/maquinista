@@ -256,6 +256,12 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := promptPass(ctx, pool, cfg.Gh); err != nil {
 			log.Printf("pipeline: dispatch: prompt pass: %v", err)
 		}
+		// ADR-0008 F3: one-shot completion nudges for review legs — runs
+		// before the verdict pass so a turn-ended reviewer is re-prompted
+		// within one tick of the signal landing.
+		if err := nudgePass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace); err != nil {
+			log.Printf("pipeline: dispatch: nudge pass: %v", err)
+		}
 		if err := verdictPass(ctx, pool, cfg.Gh, fan, cfg.MaxReviewRounds, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: verdict pass: %v", err)
 		}
@@ -711,9 +717,12 @@ func enqueueReviewPrompt(ctx context.Context, pool *pgxpool.Pool, g GhRunner, ag
 }
 
 // liveReviewersSQL drives both the verdict pass and the watchdog: live
-// reviewer agents on pipeline tasks still in 'review'.
+// reviewer agents on pipeline tasks still in 'review'. The trailing cause
+// expression is the ADR-0008 freeze classification — only the watchdog
+// reads it; verdictPass scans past it.
 const liveReviewersSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds,
+       ` + FreezeCauseSelectSQL + `
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE a.role = '` + reviewerRole + `'
@@ -853,17 +862,21 @@ func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verd
 }
 
 // liveReviewer is one live reviewer/fixer pane on a pipeline task. The
-// title/round columns feed the EX-06 Pipeline-topic summaries.
+// title/round columns feed the EX-06 Pipeline-topic summaries; cause is
+// the ADR-0008 freeze classification (empty outside the watchdog).
 type liveReviewer struct {
 	agentID, session, window, taskID string
-	taskTitle                        string
-	round                            int
+	taskTitle                       string
+	round                           int
+	cause                           string
 }
 
 // liveFixersSQL drives the fixer watchdog arm: live fixer agents on
-// pipeline tasks still in changes_requested.
+// pipeline tasks still in changes_requested. Same trailing cause
+// expression as liveReviewersSQL (ADR-0008 watchdog classification).
 const liveFixersSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds,
+       ` + FreezeCauseSelectSQL + `
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE a.role = '` + fixerRole + `'
@@ -1147,7 +1160,7 @@ func scanReviewers(ctx context.Context, pool *pgxpool.Pool, sql string, args []a
 	defer rows.Close()
 	for rows.Next() {
 		var r liveReviewer
-		if err := rows.Scan(&r.agentID, &r.session, &r.window, &r.taskID, &r.taskTitle, &r.round); err != nil {
+		if err := rows.Scan(&r.agentID, &r.session, &r.window, &r.taskID, &r.taskTitle, &r.round, &r.cause); err != nil {
 			return err
 		}
 		*out = append(*out, r)

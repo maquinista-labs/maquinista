@@ -627,9 +627,9 @@ func TestWatchdog_RespawnCapParks(t *testing.T) {
 	// each guarded retire writes are the budget ledger.
 	for i := 0; i < 3; i++ {
 		execOK(t, pool, `
-			INSERT INTO task_context (task_id, agent_id, kind, content)
+			INSERT INTO task_context (task_id, agent_id, kind, content, cause)
 			VALUES ('tc', 'reviewer-tc', 'observation',
-			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired')
+			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired', 'true_freeze')
 		`)
 	}
 
@@ -672,9 +672,9 @@ func TestWatchdog_RespawnCapParks(t *testing.T) {
 	execOK(t, pool, `UPDATE tasks SET review_rounds = 2 WHERE id = 'td'`)
 	for i := 0; i < 3; i++ {
 		execOK(t, pool, `
-			INSERT INTO task_context (task_id, agent_id, kind, content)
+			INSERT INTO task_context (task_id, agent_id, kind, content, cause)
 			VALUES ('td', 'reviewer-td', 'observation',
-			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired')
+			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired', 'true_freeze')
 		`)
 	}
 	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {

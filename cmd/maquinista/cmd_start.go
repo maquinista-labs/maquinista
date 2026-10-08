@@ -19,6 +19,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/dispatcher"
 	"github.com/maquinista-labs/maquinista/internal/gh"
+	"github.com/maquinista-labs/maquinista/internal/git"
 	"github.com/maquinista-labs/maquinista/internal/inboxecho"
 	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/listener"
@@ -571,6 +572,14 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				// existed for the retired id (name-based probe — panes are
 				// created -n <agentID>, and agent ids are never reused).
 				PaneExists: tmux.WindowNameExists,
+				// ADR-0008: silent-success freeze retires consult the
+				// artifacts question (open PR + branch current) before
+				// requeueing vs straight-to-review. Conservative probe:
+				// git errors read as "not up to date" and never misroute
+				// a half-done branch.
+				BranchUpToDate: func(worktree string) bool {
+					return git.BranchUpToDate(worktree, "main")
+				},
 				// MAQ-34: needs-human parks fan out to the PR + ticket issue
 				// (same gh + provider instances as the dispatch loop).
 				ParkFanout: func(ctx context.Context, taskID, summary string) {

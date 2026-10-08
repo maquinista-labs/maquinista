@@ -34,7 +34,7 @@ All consumers use `LISTEN` + a poll fallback (10 s) so a missed `NOTIFY`
 
 | Table | Purpose |
 |-------|---------|
-| `agents` | One row per agent; status, tmux_window, runner_type, workspace, last_transcript_at (liveness, MAQ-9) |
+| `agents` | One row per agent; status, tmux_window, runner_type, workspace, last_transcript_at (liveness, MAQ-9), last_turn_end_at + turn_end_nudged (ADR-0008 completion contract) |
 | `agent_souls` | Per-agent identity / system prompt fields |
 | `soul_templates` | Reusable soul blueprints |
 | `agent_memory` | Key/value memory blocks appended to soul render |
@@ -48,6 +48,7 @@ All consumers use `LISTEN` + a poll fallback (10 s) so a missed `NOTIFY`
 | `ticket_issue_map` | Ticket issue ↔ task mirror; the row is the bridge claim |
 | `ticket_comment_log` | Consumed ticket-comment ids (comment-verb exactly-once) |
 | `merge_queue` | One row per merge attempt (pending → merging → merged\|conflict\|failed); terminal `conflict` rows also ledger parked tasks' merge-up budgets (MAQ-42) |
+| `task_context` | Per-task journal (observations, verdicts, results, fix/salvage rows); freeze observations carry `cause` — `silent_success` (no respawn budget burned) vs `true_freeze` (counts against `MAQUINISTA_WATCHDOG_RESPAWN_CAP`), NULL = unclassified (ADR-0008) |
 | `job_registry` | Scheduled jobs (cron + hooks) |
 | `soul_templates` | Reusable soul templates |
 
