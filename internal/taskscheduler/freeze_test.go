@@ -94,7 +94,7 @@ func TestRetireFrozenClaims(t *testing.T) {
 	if got := taskStatus(t, pool, "FZ"); got != "claimed" {
 		t.Fatalf("task status = %q, want claimed (the reaper owns the requeue)", got)
 	}
-	if n := pipelineNotifyCount(t, pool, "frozen"); n != 1 {
+	if n := pipelineNotifyCount(t, pool, "went silent"); n != 1 {
 		t.Fatalf("🆘 notes = %d, want exactly 1", n)
 	}
 
@@ -262,7 +262,7 @@ func TestHealRestartCohort(t *testing.T) {
 		t.Fatalf("ghost prompt rows = %d, want 0", inboxRows)
 	}
 	// Every heal notified, exactly once each.
-	if n := pipelineNotifyCount(t, pool, "restart cohort"); n != 3 {
+	if n := pipelineNotifyCount(t, pool, "leftover agent"); n != 3 {
 		t.Fatalf("🆘 notes = %d, want 3", n)
 	}
 
@@ -313,7 +313,7 @@ func TestHealRestartCohort_PostBootTranscriptSpared(t *testing.T) {
 	if got := agentStatus(t, pool, "impl-gs"); got != "running" {
 		t.Fatalf("streaming survivor status = %q, want running", got)
 	}
-	if n := pipelineNotifyCount(t, pool, "restart cohort"); n != 0 {
+	if n := pipelineNotifyCount(t, pool, "leftover agent"); n != 0 {
 		t.Fatalf("🆘 notes = %d, want 0 (a spared agent is never notified)", n)
 	}
 }
@@ -436,7 +436,7 @@ func TestRun_RestartSweepSparesStreamingPane(t *testing.T) {
 	if got := agentStatus(t, pool, "reviewer-rg"); got != "dead" {
 		t.Fatalf("ghost status = %q, want dead (sweep still heals)", got)
 	}
-	if n := pipelineNotifyCount(t, pool, "restart cohort"); n != 1 {
+	if n := pipelineNotifyCount(t, pool, "leftover agent"); n != 1 {
 		t.Fatalf("🆘 notes = %d, want exactly 1", n)
 	}
 }
@@ -456,12 +456,13 @@ func TestHealRestartCohort_EmptyWhenClean(t *testing.T) {
 	}
 }
 
-// TestRetireFrozenClaims_NoteReportsPaneExistence is MAQ-38 AC 2: the
-// watchdog retire of an implementor round emits a notify that states
-// whether a tmux pane existed for the retired id — name-based probe, so
-// "no" (pane gone) and "yes" (pane present during an apparent freeze —
+// TestRetireFrozenClaims_NoteReportsPaneExistence: MAQ-38 AC 2 (the retire
+// states whether a tmux pane existed for the retired id — name-based probe,
+// so "no" (pane gone) and "yes" (pane present during an apparent freeze —
 // the stale-id starvation signature from the 07/10 incident) are both
-// diagnosable from the 🆘 alone.
+// diagnosable) restated under MAQ-37's split: the LEDGER note carries the
+// machine fact verbatim; the 🆘 carries prose, and only the live-pane case
+// (the operator-relevant one) surfaces in the sentence.
 func TestRetireFrozenClaims_NoteReportsPaneExistence(t *testing.T) {
 	ctx := context.Background()
 
@@ -473,10 +474,10 @@ func TestRetireFrozenClaims_NoteReportsPaneExistence(t *testing.T) {
 	}
 
 	for _, tc := range []struct {
-		agentID, wantPane string
+		agentID, wantPane, wantProse string
 	}{
-		{"impl-yes", "tmux pane for this id: yes"},
-		{"impl-no", "tmux pane for this id: no"},
+		{"impl-yes", "tmux pane for this id: yes", "even though its terminal pane was still open"},
+		{"impl-no", "tmux pane for this id: no", "went silent"},
 	} {
 		pool := setup(t)
 		seedClaim(t, pool, "PZ-"+tc.agentID, tc.agentID)
@@ -505,15 +506,21 @@ func TestRetireFrozenClaims_NoteReportsPaneExistence(t *testing.T) {
 		if !strings.Contains(note, tc.wantPane) {
 			t.Fatalf("%s: observation = %q, want it to contain %q", tc.agentID, note, tc.wantPane)
 		}
-		if n := pipelineNotifyCount(t, pool, tc.wantPane); n != 1 {
-			t.Fatalf("%s: 🆘 notes carrying %q = %d, want exactly 1", tc.agentID, tc.wantPane, n)
+		// The 🆘 never repeats the ledger's machine phrase (MAQ-37); the
+		// live-pane contradiction is the one fact worth prose.
+		if n := pipelineNotifyCount(t, pool, tc.wantPane); n != 0 {
+			t.Fatalf("%s: 🆘 notes carrying machine phrase %q = %d, want 0", tc.agentID, tc.wantPane, n)
+		}
+		if n := pipelineNotifyCount(t, pool, tc.wantProse); n != 1 {
+			t.Fatalf("%s: 🆘 notes carrying %q = %d, want exactly 1", tc.agentID, tc.wantProse, n)
 		}
 	}
 }
 
 // TestRetireFrozenClaims_NilPaneProbeShipsUnknown: a caller with no tmux
-// access still retires (and notifies) — the note just says "unknown"
-// instead of inventing a pane fact.
+// access still retires (and notifies) — the ledger note says "unknown"
+// instead of inventing a pane fact, and the 🆘 makes no pane claim at all
+// (MAQ-37: no machine vocabulary in prose).
 func TestRetireFrozenClaims_NilPaneProbeShipsUnknown(t *testing.T) {
 	pool := setup(t)
 	ctx := context.Background()
@@ -526,7 +533,17 @@ func TestRetireFrozenClaims_NilPaneProbeShipsUnknown(t *testing.T) {
 	if retired != 1 {
 		t.Fatalf("retired = %d, want 1", retired)
 	}
-	if n := pipelineNotifyCount(t, pool, "tmux pane for this id: unknown"); n != 1 {
-		t.Fatalf("🆘 notes = %d, want exactly 1 carrying 'unknown'", n)
+	var note string
+	if err := pool.QueryRow(ctx, `
+		SELECT content FROM task_context
+		WHERE task_id = 'PUNK' AND kind = 'observation'
+	`).Scan(&note); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(note, "tmux pane for this id: unknown") {
+		t.Fatalf("observation = %q, want the unknown pane fact in the ledger", note)
+	}
+	if n := pipelineNotifyCount(t, pool, "pane"); n != 0 {
+		t.Fatalf("🆘 notes mentioning a pane = %d, want 0 (unknown → no claim)", n)
 	}
 }

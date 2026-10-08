@@ -218,7 +218,7 @@ live reviewer agent:
   task-bound, soul clone, tmux pane, sidecar), then bumps
   `tasks.review_rounds` (autocommit — its presence makes the next tick a
   no-op for the spawn pass; the bump is also the exactly-once guard for
-  the MAQ-22 "reviewer claimed — review round N" one-liner), builds the
+  the MAQ-22 "code review round N starting" one-liner), builds the
   round prompt (see **Human PR comments**, below — deliberately with NO
   transaction open, so the gh comment fetch never holds a DB tx), and
   enqueues the prompt in its own tx (`external_msg_id =
@@ -369,7 +369,8 @@ session in the SAME worktree/PR:
   bumps at the next reviewer spawn); a `task_context` fix row
   (content `round <N>`) commits FIRST and stops re-spawning for the episode;
   that marker is also the exactly-once guard for the MAQ-22
-  "fixer round N started" one-liner
+  "fixer round N started" one-liner (rendered task-stamped, MAQ-37: links
+  + reply key ride along)
 - the fix prompt (`external_msg_id = fix:<task>:<round>` dedup) embeds the
   reviewer's newest message tail (≤6000 chars — the soul contract puts the
   numbered findings at the top of the final reply); a prompt miss heals on
@@ -458,12 +459,15 @@ the tmux server, so a corpse holding @N is a collision timebomb — the
 next pane to draw that id would share it with a dead row, and every
 window-scoped consumer (monitor outbox attribution, transcript-liveness
 touches, freeze-arm pane kills) resolves through that binding. The
-implementor arm's retire note additionally states whether a tmux pane
-existed for the retired id (name-based probe — panes are created
-`-n <agentID>` and agent ids are never reused, so id-based lookups cannot
-answer this across restarts): "no" means the round never had a pane (a
-spawn failure wearing a freeze costume — different remediation), "yes"
-during an apparent freeze is the stale-id starvation signature. That
+implementor arm's retire LEDGER note (task_context observation) states
+whether a tmux pane existed for the retired id (name-based probe — panes
+are created `-n <agentID>` and agent ids are never reused, so id-based
+lookups cannot answer this across restarts): "no" means the round never
+had a pane (a spawn failure wearing a freeze costume — different
+remediation), "yes" during an apparent freeze is the stale-id starvation
+signature. MAQ-37 keeps that machine block in the ledger; the 🆘 carries
+prose and only surfaces the pane when it contradicts the freeze ("went
+silent … even though its terminal pane was still open"). That
 distinction is what turned the 07/10 false-freeze churn (post-crash
 window-id reuse routed whole rounds' outbox rows under stale pre-crash
 ids while the live rows starved both freshness channels) from an
@@ -749,10 +753,17 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   one `agent_outbox` row for the agent, commits — the relay's binding leg
   fans it into `channel_deliveries` for the Pipeline topic provisioned by
   the bot (`ensurePipelineTopic`). Failures are logged, never escalated.
-  Every task mention that has a `pr_url` carries the link — verdict
-  summaries (`notifyVerdict`), watchdog parks, and all merge-flow notes —
-  via `prLinkSuffix`; tasks without a PR keep the old linkless text
-  (MAQ-10: no null/empty links). MAQ-22 extends the journey to EVERY
+  Every task-scoped note is rendered for the human reading the topic
+  (MAQ-37): the headline names the task as every human surface does —
+  `[MAQ-n] <title>` from `ticket_issue_map` (`TaskTitle`); raw task UUIDs
+  and internal agent ids never appear in prose (workers render as roles —
+  `RoleHuman`, "the implementor (round 4)"); durations read like prose
+  (`DurHuman`, "~30m" not "30m0s"); and `NotifyTask` decorates every
+  task-stamped note with the Linear issue URL plus the PR URL when the
+  task has one (tasks without a PR keep linkless text — MAQ-10: no
+  null/empty links). The machine block (uuid, rounds, timings) stays in
+  the `task_context` observation rows each guarded transition already
+  writes. MAQ-22 extends the journey to EVERY
   lifecycle transition, each emitted inside its guarded UPDATE branch so
   it fires exactly once per transition: task claimed (implementor, task
   scheduler; reviewer round N, review dispatch; fixer round N, fixer
@@ -877,7 +888,7 @@ human feedback and a human objection gates the merge.
   as today; each further cycle needs a fresh (claimable) comment.
 - **Notify** — the flip leg posts one 💬 one-liner ("back to review … the
   objection gates the merge"); the fixer leg posts the MAQ-22 🔧
-  "fixer round N started — re-round on @<author>'s PR comment" one-liner,
+  "fixer round N started — working @<author>'s PR comment" one-liner,
   deduped by the fix row exactly like the standard fixer's.
 
 ## Role souls
@@ -957,13 +968,16 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   reaches the merge; `merge_queue`'s partial live index is the second
   guard. A failing verb still consumes its comment — the operator
   re-approves with a new comment or the CLI.
-- **Notifier verbs** — the merge-proposal note teaches the comment forms
-  (short id, typeable from a phone): reply `approve <short-id>` in the
-  Pipeline topic or comment `approve` on the ticket issue. The CLI verb
-  (`maquinista approve`, now routed through `ApproveRef` too) keeps working.
-  Notes about `pending_approval` tasks (round cap, needs-human escalation,
-  CI-cap) keep the CLI-only form — the comment verb deliberately does not
-  act on `pending_approval`.
+- **Notifier verbs** — the merge-proposal note names each approve path
+  next to its clickable link (MAQ-37: the note is task-stamped, so a plain
+  reply `approve` resolves the task — no id to type): reply `approve` in
+  the Pipeline topic or comment `approve` on the ticket issue (link on the
+  note). The CLI verb (`maquinista approve`) keeps working; park notes
+  (round cap, needs-human escalation, CI-cap) quote all three forms with
+  the short id in the CLI path. No per-event note suggests env-var
+  toggles — that is config documentation, not an operator action. Notes
+  about `pending_approval` tasks keep the GitHub comment verb
+  deliberately inert on them.
 
 ## Park fan-out (MAQ-34)
 

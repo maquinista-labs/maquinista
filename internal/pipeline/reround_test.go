@@ -83,7 +83,7 @@ func TestCommentRound_FixerOnParkedTask(t *testing.T) {
 	}
 	// The one-liner fired exactly once (deduped by the fix row).
 	if n := count(t, pool, `SELECT count(*) FROM agent_outbox
-		WHERE agent_id = 'pipeline' AND content->>'text' LIKE '🔧%re-round on @alice%'`); n != 1 {
+		WHERE agent_id = 'pipeline' AND content->>'text' LIKE '🔧%working @alice%'`); n != 1 {
 		t.Errorf("re-round one-liners = %d, want 1", n)
 	}
 

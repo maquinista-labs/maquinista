@@ -528,8 +528,9 @@ func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, fan
 			// final cap question. Each failure bumps attempts (bounded by
 			// maxAttempts), so the one-liner fires once per distinct red
 			// and cannot spam the way an unbounded release loop would.
-			notifyf(ctx, pool, "🟥 %s: gate red (ci) — PR #%d checks failed (attempt %d/%d) — released, will re-check.%s",
-				TaskTitle(ctx, pool, taskID), pr, attempts, maxAttempts, prLinkSuffix(ctx, pool, taskID))
+			// MAQ-37: task-stamped so the link decoration applies here too.
+			notifyTaskf(ctx, pool, taskID, "🟥 %s: CI is red on PR #%d (attempt %d/%d) — released; the merge queue re-checks automatically. No action needed.",
+				TaskTitle(ctx, pool, taskID), pr, attempts, maxAttempts)
 			log.Printf("pipeline: merge %s CI failed on PR #%d (attempt %d/%d) — will re-check", taskID, pr, attempts, cfg.MaxAttempts)
 			return nil
 		}
@@ -545,9 +546,11 @@ func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, fan
 		}
 		db.AddObservation(pool, taskID, "merger",
 			fmt.Sprintf("CI failed %d times on PR #%d — parked needs-human.", attempts, pr))
-		notifyTaskf(ctx, pool, taskID, "🆘 %s: CI failed %d times on PR #%d — parked needs-human. Fix, re-push, then `maquinista approve %s` to retry the merge.%s",
-			taskTitle(ctx, pool, taskID), attempts, pr, taskID, prLinkSuffix(ctx, pool, taskID))
-		fan.notify(ctx, pool, taskID, fmt.Sprintf("CI failed %d times on PR #%d — parked needs-human.", attempts, pr))
+		notifyTaskf(ctx, pool, taskID, "🆘 %s: CI failed %d times on PR #%d — parked for you. Fix and re-push, then approve to retry the merge (reply `approve` here, comment `approve` on the ticket issue, or run `maquinista approve %s`).",
+			taskTitle(ctx, pool, taskID), attempts, pr, shortTaskID(taskID))
+		// MAQ-34: the park also comments the PR + ticket issue (exactly once
+		// per park episode).
+		fan.notify(ctx, pool, taskID, fmt.Sprintf("CI failed %d times on PR #%d — the merge is parked until it passes.", attempts, pr))
 		log.Printf("pipeline: merge %s CI failed %d times on PR #%d — parked needs-human", taskID, attempts, pr)
 		return nil
 	default:
@@ -596,8 +599,8 @@ func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, fan
 	}
 	db.AddObservation(pool, taskID, "merger",
 		fmt.Sprintf("PR #%d squash-merged into %s (%s).", pr, base, mergeSHA))
-	notifyTaskf(ctx, pool, taskID, "✅ %s merged: PR #%d squash-merged into %s (%s).%s",
-		taskTitle(ctx, pool, taskID), pr, base, mergeSHA, prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "✅ %s merged — PR #%d squash-merged into %s.%s",
+		taskTitle(ctx, pool, taskID), pr, base, commitLinkSuffix(prURLof(ctx, pool, taskID), mergeSHA))
 
 	// 6. Board sync (best-effort — the sync loop self-heals on next tick).
 	if prov != nil && info.IssueID != "" {
@@ -652,8 +655,8 @@ func parkMergeConflict(ctx context.Context, pool *pgxpool.Pool, fan parkFanout, 
 	// EX-06: the needs-human question carries the conflict files so the
 	// human can decide without opening the worktree. (Conflict →
 	// merger-agent resolution stays deferred; the plan records why.)
-	notifyTaskf(ctx, pool, taskID, "🆘 %s: rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.%s",
-		taskTitle(ctx, pool, taskID), entry.Branch, strings.Join(conflictErr.Files, "\n"), prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: the merge hit rebase conflicts on branch %s. Conflicting files:\n%s\nParked for you — resolve by hand, or re-approve to send a merge agent.",
+		taskTitle(ctx, pool, taskID), entry.Branch, strings.Join(conflictErr.Files, "\n"))
 	fan.notify(ctx, pool, taskID, fmt.Sprintf("Rebase conflict on branch %s. Conflicting files:\n%s", entry.Branch, strings.Join(conflictErr.Files, "\n")))
 	log.Printf("pipeline: merge %s conflict: %v", taskID, conflictErr)
 	return nil
@@ -673,8 +676,8 @@ func failMerge(ctx context.Context, pool *pgxpool.Pool, fan parkFanout, entryID 
 	// re-approve + fresh failure comments again (unlike the parks, the task
 	// never left ready_to_merge — nothing else moves the anchor here).
 	db.AddObservation(pool, taskID, "merger", fmt.Sprintf("Merge failed: %s (entry %d terminal — re-approve to re-enqueue).", msg, entryID))
-	notifyTaskf(ctx, pool, taskID, "⚠️ %s: merge failed — %s. The queue entry is failed; reply `approve %s` here (or comment `approve` on the ticket issue) to re-enqueue the merge.%s",
-		taskTitle(ctx, pool, taskID), msg, shortTaskID(taskID), prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "⚠️ %s: the merge machinery failed — %s. The work is safe. Approve again to retry the merge: reply `approve %s` here or comment `approve` on the ticket issue.",
+		taskTitle(ctx, pool, taskID), msg, shortTaskID(taskID))
 	fan.notify(ctx, pool, taskID, fmt.Sprintf("Merge failed — %s. The queue entry is failed; re-approve to re-enqueue the merge.", msg))
 	log.Printf("pipeline: merge %s failed: %s", taskID, msg)
 	return nil

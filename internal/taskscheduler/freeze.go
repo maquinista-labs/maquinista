@@ -129,17 +129,26 @@ func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 			return retired, err
 		}
 		note := fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; tmux pane for this id: %s; auto-retired, claim requeues to ready for a fresh attempt", f.agentID, idle, spawn, pane)
+		// MAQ-37: the 🆘 carries prose, not the ledger's machine block. The
+		// pane fact stays in the note above; the sentence only surfaces it
+		// when it contradicts the freeze (a live pane over a silent agent is
+		// the stale-id starvation signature an operator should know about).
+		human := fmt.Sprintf("the implementor went silent (~%s with no activity) — retired it; the task requeues for a fresh attempt. No action needed.", pipeline.DurHuman(idle))
+		if pane == "yes" {
+			human = fmt.Sprintf("the implementor went silent (~%s with no activity) even though its terminal pane was still open — retired it; the task requeues for a fresh attempt. No action needed.", pipeline.DurHuman(idle))
+		}
 		var cleanup func(pgx.Tx) error
 		if spent >= respawnCap {
 			// Respawn budget spent — a fresh implementor would freeze the
 			// same way. Park needs-human atomically with the retire (the
 			// guarded retire is still the exactly-once dedup).
 			note = fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; tmux pane for this id: %s; %d respawns already spent, parking needs-human", f.agentID, idle, spawn, pane, spent)
+			human = fmt.Sprintf("the implementor hung %d times (each ~%s with no activity) — the machine gave up and is waiting for you.", spent, pipeline.DurHuman(idle))
 			cleanup = func(tx pgx.Tx) error {
 				return pipeline.ParkEpisodeTx(ctx, tx, f.taskID, "claimed", note)
 			}
 		}
-		applied, err := pipeline.RetireFrozenAgentCause(ctx, pool, f.agentID, f.taskID, note, pipeline.CauseTrueFreeze, cleanup)
+		applied, err := pipeline.RetireFrozenAgentCause(ctx, pool, f.agentID, f.taskID, note, human, pipeline.CauseTrueFreeze, cleanup)
 		if err != nil {
 			return retired, err
 		}
@@ -162,6 +171,16 @@ type frozenVictim struct {
 	agentID, session, window, taskID, title string
 	worktree, prState, ticketIssue          string
 	cause                                   string
+}
+
+// silentSuccessHuman is the 🆘 sentence for a silent-success retire
+// (MAQ-37): what happened and that no action is needed, with the outcome
+// (straight to review vs requeue) in plain words.
+func silentSuccessHuman(artifacts bool) string {
+	if artifacts {
+		return "the implementor finished its work but never signalled completion — retired it and sent the finished work straight to review. No action needed."
+	}
+	return "the implementor finished its turn without signalling completion — retired it; the task requeues for a fresh attempt. No action needed."
 }
 
 // retireSilentSuccess retires a turn-ended implementor WITHOUT burning
@@ -204,7 +223,7 @@ func retireSilentSuccess(ctx context.Context, pool *pgxpool.Pool, f frozenVictim
 	} else {
 		note += "; claim requeues to ready (no respawn budget burned)"
 	}
-	applied, err := pipeline.RetireFrozenAgentCause(ctx, pool, f.agentID, f.taskID, note, pipeline.CauseSilentSuccess, cleanup)
+	applied, err := pipeline.RetireFrozenAgentCause(ctx, pool, f.agentID, f.taskID, note, silentSuccessHuman(artifacts), pipeline.CauseSilentSuccess, cleanup)
 	if err != nil {
 		return false, err
 	}
@@ -275,7 +294,8 @@ func HealRestartCohort(ctx context.Context, pool *pgxpool.Pool, boot time.Time, 
 	var unswept []ghost
 	for _, g := range ghosts {
 		note := fmt.Sprintf("watchdog: restart cohort — %s predates this boot (last_seen before startup) and never streamed; auto-retired, task re-dispatches per its state", g.agentID)
-		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, g.agentID, g.taskID, note, func(tx pgx.Tx) error {
+		human := "a leftover agent from before the restart never produced output — retired it; the task re-dispatches automatically. No action needed."
+		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, g.agentID, g.taskID, note, human, func(tx pgx.Tx) error {
 			// Release a fix episode the ghost was working (same cleanup as
 			// the fixer freeze arm) so fixerPass can re-arm it. No-op for
 			// every other role/status.

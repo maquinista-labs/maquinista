@@ -324,8 +324,8 @@ func resolveCommentHandler(ctx context.Context, hc CommentContext) error {
 		return fmt.Errorf("pipeline: resolve comment: record episode %s (merger %s spawned, prompt may be missing): %w",
 			hc.TaskID, agentID, err)
 	}
-	notifyTaskf(ctx, hc.Pool, hc.TaskID, "🔧 %s: resolve session %s spawned (PR #%d, branch %s) by @%s — rebase + pending comments; approve re-merges after.",
-		taskTitle(ctx, hc.Pool, hc.TaskID), agentID, hc.PR, branch, hc.Actor)
+	notifyTaskf(ctx, hc.Pool, hc.TaskID, "🔧 %s: resolve session started (PR #%d, branch %s) by @%s — it resolves the rebase and the pending comments; approve re-merges after.",
+		taskTitle(ctx, hc.Pool, hc.TaskID), hc.PR, branch, hc.Actor)
 	hc.ack(ctx)
 	return nil
 }

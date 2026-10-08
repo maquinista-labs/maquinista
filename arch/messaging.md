@@ -230,7 +230,11 @@ the outbox content — inert for rendering (the dispatcher reads `text`
 only), but it is what makes a notification **reply-commentable** (MAQ-24):
 replied-to Telegram message id → `channel_deliveries` → outbox → task_id,
 and the reply lands as a PR comment (see `arch/pipeline.md`, "Telegram
-reply → PR comment").
+reply → PR comment"). Task-scoping is also the rendering seam (MAQ-37):
+`NotifyTask` decorates every task-scoped note with the Linear issue URL
+and the PR URL when one exists, and notes are written for the human —
+`[MAQ-n] <title>` headlines, worker roles instead of internal agent ids,
+plain-language status sentences (`arch/pipeline.md`, "Telegram plumbing").
 
 ## in_reply_to is a routing hint, not required
 

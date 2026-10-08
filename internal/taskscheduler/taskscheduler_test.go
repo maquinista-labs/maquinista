@@ -92,10 +92,14 @@ func TestDispatchOne_NotifyClaimed(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("pipeline outbox = %d rows, want exactly 1", len(texts))
 	}
-	for _, want := range []string{"📋", "claimed by @impl-NT", "implementor", "notify claim"} {
+	for _, want := range []string{"📋", "claimed by the implementor", "notify claim"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("claim note %q missing %q", texts[0], want)
 		}
+	}
+	// MAQ-37 AC1: the minted worker id never appears in the note.
+	if strings.Contains(texts[0], "impl-NT") {
+		t.Errorf("claim note %q leaks the internal agent id", texts[0])
 	}
 }
 
@@ -124,11 +128,11 @@ func TestDispatchOne_NotifyClaimed_ExecutorRole(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("pipeline outbox = %d rows, want exactly 1", len(texts))
 	}
-	if !strings.Contains(texts[0], "(executor)") {
-		t.Errorf("claim note %q missing role \"(executor)\"", texts[0])
+	if !strings.Contains(texts[0], "the executor") {
+		t.Errorf("claim note %q missing role \"the executor\"", texts[0])
 	}
-	if strings.Contains(texts[0], "(implementor)") {
-		t.Errorf("claim note %q hard-codes \"(implementor)\"", texts[0])
+	if strings.Contains(texts[0], "the implementor") {
+		t.Errorf("claim note %q hard-codes \"the implementor\"", texts[0])
 	}
 }
 
@@ -434,7 +438,7 @@ func TestReapStaleClaims(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("pipeline outbox = %d rows, want exactly 1 requeue note", len(texts))
 	}
-	for _, want := range []string{"🔄", "requeued to ready", "STALE"} {
+	for _, want := range []string{"🔄", "requeued to ready", "stale claim healed", "No action needed"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("requeue note %q missing %q", texts[0], want)
 		}
@@ -591,9 +595,10 @@ func TestDispatchOne_ParksWithoutWorktree(t *testing.T) {
 	if agents != 0 || inbox != 0 {
 		t.Errorf("agents=%d inbox=%d, want 0/0 (no half-spawned pane)", agents, inbox)
 	}
-	// Pipeline topic ping: exactly one outbox row on the synthetic notifier.
+	// Pipeline topic ping: exactly one outbox row on the synthetic notifier
+	// (MAQ-37: the headline names the task by title, so match the prose).
 	var pings int
-	pool.QueryRow(ctx, `SELECT count(*) FROM agent_outbox WHERE agent_id='pipeline' AND content->>'text' LIKE '%T%'`).Scan(&pings)
+	pool.QueryRow(ctx, `SELECT count(*) FROM agent_outbox WHERE agent_id='pipeline' AND content->>'text' LIKE '%worktree_path%'`).Scan(&pings)
 	if pings != 1 {
 		t.Errorf("pipeline pings = %d, want 1", pings)
 	}

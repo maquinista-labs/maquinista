@@ -6,6 +6,7 @@ package pipeline
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -57,10 +58,10 @@ func TestVerdict_NotifyPerOutcome(t *testing.T) {
 		bumpRounds    bool
 		wantSubstr    []string
 	}{
-		{"approve", VerdictApprove, false, []string{"✅", "approved (review round 0)", "ready_to_merge", "reply `approve tv-appro`", "comment `approve` on the ticket issue"}},
-		{"request-changes", VerdictRequestChanges, false, []string{"🔁", "request_changes (review round 0)", "fixer spawning"}},
-		{"needs-human", VerdictNeedsHuman, false, []string{"🆘", "needs-human", "maquinista approve tv", "maquinista reject tv"}},
-		{"round-cap", VerdictRequestChanges, true, []string{"🆘", "review round cap 3 reached", "parked needs-human"}},
+		{"approve", VerdictApprove, false, []string{"✅", "review approved (round 0)", "queued for merge", "reply `approve` here", "comment `approve` on the ticket issue"}},
+		{"request-changes", VerdictRequestChanges, false, []string{"🔁", "the reviewer requested changes (round 0)", "fixer is picking it up", "No action needed"}},
+		{"needs-human", VerdictNeedsHuman, false, []string{"🆘", "parked for you", "reply `approve` or `reject`", "comment the same on the ticket issue"}},
+		{"round-cap", VerdictRequestChanges, true, []string{"🆘", "round cap (3 rounds without an approval)", "parked for you", "reply `approve` or `reject`"}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -180,12 +181,21 @@ func TestWatchdog_NotifyOnStall(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
 	}
-	// MAQ-36: the note states what the freeze filter actually measured —
-	// parallel-bounds silence on BOTH channels — not the old sequential-
-	// sounding "no outbox activity for X past the Y spawn grace".
-	for _, want := range []string{"🆘", "watchdog: reviewer frozen", "silent for 30m0s (no outbox row and no transcript growth; spawn grace 10m0s elapsed)", "respawns in-round"} {
+	// MAQ-37 split: the 🆘 carries only the human sentence; the machine
+	// note states what the freeze filter actually measured — parallel-bounds
+	// silence on BOTH channels, not the old sequential-sounding "no outbox
+	// activity for X past the Y spawn grace" (MAQ-36) — and lives in the
+	// task_context ledger, pinned by TestWatchdog_RetireNoteStatesRealTrigger.
+	for _, want := range []string{"🆘", "the reviewer went silent", "~30m with no activity", "fresh reviewer for the same round", "No action needed"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("summary %q missing %q", texts[0], want)
+		}
+	}
+	// MAQ-37 AC1: no machine vocabulary in the headline — the watchdog
+	// ledger note (ids, timings) went to task_context, not the topic.
+	for _, banned := range []string{"watchdog:", "frozen", "30m0s", "spawn grace", "respawns in-round"} {
+		if strings.Contains(texts[0], banned) {
+			t.Errorf("summary %q still carries machine vocabulary %q", texts[0], banned)
 		}
 	}
 }
@@ -253,10 +263,13 @@ func TestReviewRound_NotifyClaimed(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
 	}
-	for _, want := range []string{"👀", "reviewer claimed", "review round 1", "task tc"} {
+	for _, want := range []string{"👀", "code review round 1", "task tc"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("claim note %q missing %q", texts[0], want)
 		}
+	}
+	if strings.Contains(texts[0], "claimed") {
+		t.Errorf("claim note %q still carries the internal 'reviewer claimed' jargon", texts[0])
 	}
 
 	// A second bump (the next round's reviewer) announces the NEW round.
@@ -264,7 +277,7 @@ func TestReviewRound_NotifyClaimed(t *testing.T) {
 		t.Fatalf("recordReviewRound 2: %v", err)
 	}
 	texts = pipelineNotifyTextsPool(t, pool)
-	if len(texts) != 2 || !strings.Contains(texts[1], "review round 2") {
+	if len(texts) != 2 || !strings.Contains(texts[1], "code review round 2") {
 		t.Fatalf("second claim = %d texts %q, want round 2 note", len(texts), texts)
 	}
 }
@@ -299,6 +312,131 @@ func TestFixEpisode_NotifyRoundStarted(t *testing.T) {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("fix note %q missing %q", texts[0], want)
 		}
+	}
+}
+
+// ---- MAQ-37 pinned before/after examples ----
+
+// TestNotifyRendering_HumanReadablePins (MAQ-37 AC5): pinned before/after
+// examples. BEFORE is the retired Pipeline-topic shape — raw task UUID in
+// the headline, the internal agent id echoed twice, Go durations ("30m0s"),
+// watchdog jargon, no links:
+//
+//	🆘 [MAQ-34] Human-review parks must also comment... (caa43bb1-2bab-4ccf-baae-64b4c4daa55a):
+//	watchdog: implementor implementor-caa43bb1-...-r4 frozen — no outbox
+//	activity for 30m0s past the 10m0s spawn grace; 3 respawns already spent,
+//	parking needs-human
+//
+// AFTER is what every emission point must render now: "[MAQ-n] <title>"
+// headline, role prose, ~30m, plain sentence, issue + PR links.
+func TestNotifyRendering_HumanReadablePins(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	const (
+		taskID    = "caa43bb1-2bab-4ccf-baae-64b4c4daa55a"
+		issueID   = "d4c75be0-4029-4805-9937-c4a2b569e656"
+		issueURL  = "https://linear.app/brisaai/issue/MAQ-34/human-review-parks"
+		prURL     = "https://github.com/maquinista-labs/maquinista/pull/34"
+		agentID   = "implementor-" + taskID + "-r4"
+	)
+	execOK(t, pool, `
+		INSERT INTO tasks (id, title, status, pr_url, metadata)
+		VALUES ($1, $2, 'pending_approval', $3, $4::jsonb)
+	`, taskID, "[MAQ-34] Human-review parks must also comment on the ticket", prURL,
+		`{"ticket_issue_id":"`+issueID+`","ticket_url":"`+issueURL+`"}`)
+	execOK(t, pool, `
+		INSERT INTO ticket_issue_map (issue_id, issue_key, team_id, task_id)
+		VALUES ($1, 'MAQ-34', 'brisaai', $2)
+	`, issueID, taskID)
+
+	// The AFTER shape, composed exactly the way the freeze arms do:
+	// headline from TaskTitle, sentence from the human field, links ride
+	// with NotifyTask's decoration.
+	human := fmt.Sprintf("the implementor (round 4) hung 3 times (each ~%s with no activity) — the machine gave up and is waiting for you.", DurHuman(30*time.Minute))
+	NotifyTaskf(ctx, pool, taskID, "🆘 %s: %s", TaskTitle(ctx, pool, taskID), human)
+
+	texts := pipelineNotifyTextsPool(t, pool)
+	if len(texts) != 1 {
+		t.Fatalf("outbox texts = %d rows, want exactly 1", len(texts))
+	}
+	text := texts[0]
+
+	// AC1: the headline carries [MAQ-n] + title, never the raw uuid.
+	if !strings.HasPrefix(text, "🆘 [MAQ-34] Human-review parks must also comment on the ticket: ") {
+		t.Errorf("headline = %q, want a \"[MAQ-34] <title>\" prefix", text)
+	}
+	for _, want := range []string{"the implementor (round 4) hung 3 times", "~30m", "waiting for you"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("note %q missing %q", text, want)
+		}
+	}
+	// AC1/AC3: no full task uuid, no internal agent id, no machine timings
+	// or watchdog jargon anywhere in the prose.
+	for _, banned := range []string{taskID, agentID, "30m0s", "watchdog", "spawn grace", "parking needs-human", "frozen"} {
+		if strings.Contains(text, banned) {
+			t.Errorf("note %q carries machine vocabulary %q", text, banned)
+		}
+	}
+	// AC2: links always — Linear issue + PR, one line each.
+	for _, want := range []string{"🎫 Issue: " + issueURL, "🔗 PR: " + prURL} {
+		if !strings.Contains(text, want) {
+			t.Errorf("note %q missing link line %q", text, want)
+		}
+	}
+	// MAQ-24 invariant intact: the machine task_id still rides the outbox
+	// content so a Telegram reply lands as a PR comment.
+	var outTaskID string
+	if err := pool.QueryRow(ctx, `
+		SELECT content->>'task_id' FROM agent_outbox WHERE agent_id = $1
+	`, NotifyAgentID).Scan(&outTaskID); err != nil || outTaskID != taskID {
+		t.Fatalf("outbox task_id = %q (err %v), want %q", outTaskID, err, taskID)
+	}
+
+	// Pure-render pins: durations read like prose, ids render as roles.
+	for d, want := range map[time.Duration]string{
+		30 * time.Minute: "30m",
+		90 * time.Minute: "1h30m",
+		2 * time.Hour:    "2h",
+	} {
+		if got := DurHuman(d); got != want {
+			t.Errorf("DurHuman(%s) = %q, want %q", d, got, want)
+		}
+	}
+	if got := roleHuman(agentID); got != "the implementor (round 4)" {
+		t.Errorf("roleHuman = %q, want %q", got, "the implementor (round 4)")
+	}
+	if got := roleHuman("reviewer-tw"); got != "the reviewer" {
+		t.Errorf("roleHuman = %q, want %q", got, "the reviewer")
+	}
+	if got := shortTaskID(taskID); got != "caa43bb1" {
+		t.Errorf("shortTaskID = %q, want 8-char short form", got)
+	}
+	// Merged notes link the merge commit; no PR → bare sha; no sha → no line.
+	if got, want := commitLinkSuffix(prURL, "abc1234"), "\n🔨 Merged as https://github.com/maquinista-labs/maquinista/commit/abc1234"; got != want {
+		t.Errorf("commitLinkSuffix = %q, want %q", got, want)
+	}
+	if got, want := commitLinkSuffix("", "abc1234"), "\n🔨 Commit: abc1234"; got != want {
+		t.Errorf("commitLinkSuffix = %q, want %q", got, want)
+	}
+	if got := commitLinkSuffix(prURL, ""); got != "" {
+		t.Errorf("commitLinkSuffix = %q, want empty without a sha", got)
+	}
+
+	// Headline fallbacks: no issue mapping → the raw title (intake titles
+	// already carry the [MAQ-n] prefix); no title at all → the short id.
+	execOK(t, pool, `
+		INSERT INTO tasks (id, title, status) VALUES ('t-nomap', '[MAQ-99] No mapping', 'pending_approval')
+	`)
+	if got, want := TaskTitle(ctx, pool, "t-nomap"), "[MAQ-99] No mapping"; got != want {
+		t.Errorf("TaskTitle(no mapping) = %q, want %q", got, want)
+	}
+	if got, want := TaskTitle(ctx, pool, taskID), "[MAQ-34] Human-review parks must also comment on the ticket"; got != want {
+		t.Errorf("TaskTitle = %q, want the issue-key headline (no doubled brackets)", got)
+	}
+	execOK(t, pool, `INSERT INTO tasks (id, title, status) VALUES ('t-notitle', '', 'ready')`)
+	if got := TaskTitle(ctx, pool, "t-notitle"); got != "t-notitl" {
+		t.Errorf("TaskTitle(untitled) = %q, want the short-id fallback", got)
 	}
 }
 
