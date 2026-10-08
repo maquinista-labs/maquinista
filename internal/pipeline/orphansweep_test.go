@@ -144,7 +144,7 @@ func TestFixerCompletion_ReachesReadyToMergeInTwoTicks(t *testing.T) {
 		INSERT INTO agent_outbox (agent_id, content)
 		VALUES ('reviewer-f4-r2', '{"text":"all findings resolved\nVERDICT: approve\n"}'::jsonb)
 	`)
-	if err := verdictPass(ctx, pool, nil, 3, "sess", nil); err != nil {
+	if err := verdictPass(ctx, pool, nil, parkFanout{}, 3, "sess", nil); err != nil {
 		t.Fatalf("tick 2 verdictPass: %v", err)
 	}
 	if got := taskCol(t, pool, "f4", "status"); got != "ready_to_merge" {
