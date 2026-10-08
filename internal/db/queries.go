@@ -1097,6 +1097,37 @@ func RejectTask(pool *pgxpool.Pool, taskID, reason string) error {
 	return nil
 }
 
+// RequeueTask transitions a task from pending_approval back to ready — the
+// sanctioned manual re-entry after a needs-human park (MAQ-40), replacing
+// the one-off shell UPDATE the park used to require. Only pending_approval
+// requeues (any other status is an error): approve/reject stay the terminal
+// exits. Worktree, branch and metadata are left untouched so the next
+// implementor round updates the same PR, and stale claim fields are
+// released so the task re-enters at a clean ready node. requeuedBy is
+// stamped into the task journal (task_context observation) — the manual-ops
+// audit trail naming who requeued; created_at carries the when.
+func RequeueTask(pool *pgxpool.Pool, taskID, requeuedBy string) error {
+	tag, err := pool.Exec(context.Background(), `
+		UPDATE tasks
+		SET    status     = 'ready',
+		       claimed_by = NULL,
+		       claimed_at = NULL
+		WHERE  id     = $1
+		  AND  status = 'pending_approval'
+	`, taskID)
+	if err != nil {
+		return fmt.Errorf("requeueing task: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("task %q is not pending_approval — requeue only undoes the needs-human park", taskID)
+	}
+	if err := AddObservation(pool, taskID, requeuedBy,
+		"requeued to ready by "+requeuedBy+" — sanctioned pending_approval escape (manual-ops)"); err != nil {
+		return fmt.Errorf("journaling requeue: %w", err)
+	}
+	return nil
+}
+
 // UnclaimTask releases a claimed task back to ready.
 func UnclaimTask(pool *pgxpool.Pool, taskID string) error {
 	tag, err := pool.Exec(context.Background(), `
