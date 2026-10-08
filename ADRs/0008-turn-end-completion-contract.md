@@ -166,3 +166,6 @@ required. It is also the only option that separates "ended cleanly" from
   header; migration 035 worker soul; prompt.go BuildSinglePrompt.
 - Lineage: MAQ-31 (freeze arms), MAQ-14 (stuck implementor), MAQ-9
   (transcript liveness veto).
+- **Tracks:** [MAQ-43](https://linear.app/brisaai/issue/MAQ-43) (F1, shadow
+  turn-end signal) · [MAQ-44](https://linear.app/brisaai/issue/MAQ-44) (F2/F3,
+  nudge + cause-aware ledger), related to each other in Linear.
