@@ -291,6 +291,13 @@ func (p *linearProvider) AddIssueLink(ctx context.Context, issueID, url string) 
 	return p.client.CommentOnIssue(ctx, issueID, "🔗 PR: "+url)
 }
 
+// CommentOnIssue implements IssueCommenter (MAQ-34): the park fan-out posts
+// its needs-human note + approval paths onto the mapped issue. Delivery is
+// best-effort and deduped by the fan-out's episode marker, not here.
+func (p *linearProvider) CommentOnIssue(ctx context.Context, issueID, body string) error {
+	return p.client.CommentOnIssue(ctx, issueID, body)
+}
+
 // RecentComments implements CommentFetcher (MAQ-11). Author is the email
 // when the API exposes it, else the display name, else the account name.
 func (p *linearProvider) RecentComments(ctx context.Context, issueIDs []string, since time.Time) ([]IssueComment, error) {

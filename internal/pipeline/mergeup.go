@@ -61,6 +61,7 @@ const (
 // the machinery hiccupped, and a re-approve retries.
 func mergeUpAfterConflict(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, prov TicketProvider, teamID string, entry *db.MergeQueueEntry, info *taskMergeInfo, wt, base string, pr int, conflictErr *git.ConflictError) error {
 	taskID := entry.TaskID
+	fan := parkFanout{gh: ghPoster(cfg.Gh), prov: prov} // MAQ-34: park/failure arms below
 
 	method, upErr := runMergeUp(ctx, cfg, wt, entry, pr, base)
 	if upErr == nil {
@@ -69,11 +70,11 @@ func mergeUpAfterConflict(ctx context.Context, pool *pgxpool.Pool, cfg MergeConf
 		// a claimed-but-unsynced API success or a lost push — it counts as
 		// a failed attempt, never as a mergeable branch.
 		if err := git.Fetch(wt, "origin"); err != nil {
-			return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("merge-up verification fetch failed: %v", err))
+			return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("merge-up verification fetch failed: %v", err))
 		}
 		mergeable, err := git.IsAncestor(wt, "origin/"+base, "origin/"+entry.Branch)
 		if err != nil {
-			return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("merge-up verification failed: %v", err))
+			return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("merge-up verification failed: %v", err))
 		}
 		if mergeable {
 			db.AddObservation(pool, taskID, "merger",
@@ -82,7 +83,7 @@ func mergeUpAfterConflict(ctx context.Context, pool *pgxpool.Pool, cfg MergeConf
 			notifyTaskf(ctx, pool, taskID, "🔀 %s: branch %s was stale — auto merge-up (%s) folded origin/%s in; merge gates re-running.%s",
 				taskTitle(ctx, pool, taskID), entry.Branch, method, base, prLinkSuffix(ctx, pool, taskID))
 			log.Printf("pipeline: merge %s conflict healed by auto merge-up (%s) on branch %s", taskID, method, entry.Branch)
-			return finishMergeGH(ctx, pool, cfg, prov, teamID, entry, info, wt, base, pr)
+			return finishMergeGH(ctx, pool, cfg, fan, prov, teamID, entry, info, wt, base, pr)
 		}
 		if !mergeable {
 			// Claimed but unverifiable (stubbed API success, lost push): not
@@ -108,7 +109,7 @@ func mergeUpAfterConflict(ctx context.Context, pool *pgxpool.Pool, cfg MergeConf
 	// transport): terminal entry, task stays re-approvable, human informed.
 	var conflict *git.ConflictError
 	if !errors.As(upErr, &conflict) {
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("auto merge-up failed: %v", upErr))
+		return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("auto merge-up failed: %v", upErr))
 	}
 
 	// Deterministic conflict. Report the merge-up's own file list when the
@@ -127,7 +128,7 @@ func mergeUpAfterConflict(ctx context.Context, pool *pgxpool.Pool, cfg MergeConf
 		taskID, entry.Branch, attempts, maxMergeUps, conflict)
 
 	if attempts >= maxMergeUps {
-		return parkMergeConflict(ctx, pool, taskID, entry, &git.ConflictError{Files: files})
+		return parkMergeConflict(ctx, pool, fan, taskID, entry, &git.ConflictError{Files: files})
 	}
 	if err := db.ReleaseMergeEntry(pool, entry.ID); err != nil {
 		return fmt.Errorf("pipeline: releasing %d: %w", entry.ID, err)

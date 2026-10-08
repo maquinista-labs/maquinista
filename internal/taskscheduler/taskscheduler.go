@@ -46,6 +46,11 @@ type Config struct {
 	// KillWindow is best-effort pane cleanup on freeze retires (MAQ-31;
 	// tmux.KillWindow-shaped). nil skips it — the row still retires.
 	KillWindow func(session, windowID string) error
+	// ParkFanout fans a needs-human park out beyond the Pipeline topic
+	// (MAQ-34): the cmd layer wires it to pipeline.NotifyParkFanout with
+	// gh + provider, so the PR and the mapped ticket issue learn the task
+	// is parked and how to approve. nil skips the fan-out (tests).
+	ParkFanout func(ctx context.Context, taskID, summary string)
 	// PaneExists probes whether a tmux pane exists for an agent id
 	// (tmux.WindowNameExists-shaped, name-based — MAQ-38 AC 2). The
 	// implementor freeze arm rides the answer on every retire note so a
@@ -149,7 +154,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		// MAQ-13 backstop: claimed tasks with no worktree_path and no live
 		// agent are unspawnable forever (the scheduler only claims 'ready'
 		// rows, so nothing revisits them). Park past grace, exactly once.
-		if parked, perr := ParkUnspawnable(ctx, pool, cfg.ParkGrace); perr != nil {
+		if parked, perr := ParkUnspawnable(ctx, pool, cfg.ParkGrace, cfg.ParkFanout); perr != nil {
 			log.Printf("taskscheduler: park unspawnable: %v", perr)
 		} else if parked > 0 {
 			log.Printf("taskscheduler: parked %d unspawnable claimed task(s) needs-human", parked)
@@ -350,6 +355,9 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 		log.Printf("taskscheduler: task %s parked needs-human: no worktree_path (implementor can never spawn)", taskID)
 		pipeline.NotifyTaskf(ctx, pool, taskID, "🆘 %s: no worktree_path — cannot spawn an implementor. Parked needs-human. Provision the worktree, set tasks.worktree_path, flip the task back to 'ready'.",
 			pipeline.TaskTitle(ctx, pool, taskID))
+		if cfg.ParkFanout != nil {
+			cfg.ParkFanout(ctx, taskID, "No worktree_path — cannot spawn an implementor. Provision the worktree, set tasks.worktree_path, flip the task back to 'ready'.")
+		}
 		return true, nil
 	}
 

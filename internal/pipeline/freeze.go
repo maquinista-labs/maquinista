@@ -237,7 +237,7 @@ func insertSalvagedFindingsTx(ctx context.Context, tx pgx.Tx, taskID, agentID, f
 	return err
 }
 
-func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error) error {
+func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error, fan parkFanout) error {
 	args := []any{idle.Seconds(), spawn.Seconds()}
 
 	var reviewers []liveReviewer
@@ -264,6 +264,9 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			if applied {
 				log.Printf("pipeline: dispatch: watchdog retired frozen reviewer %s on %s — respawn cap (%d) reached, parked needs-human", r.agentID, r.taskID, respawnCap)
 				killReviewerPane(sessionName, r.session, r.window, killWindow)
+				// MAQ-34: the park fans out to the PR + ticket issue (deduped
+				// by the fan-out's episode marker).
+				fan.notify(ctx, pool, r.taskID, fmt.Sprintf("Reviewer froze repeatedly (round %d) — respawn cap (%d) reached, parked needs-human.", r.round, respawnCap))
 			}
 			continue
 		}
@@ -323,6 +326,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			if applied {
 				log.Printf("pipeline: dispatch: watchdog retired frozen fixer %s on %s — respawn cap (%d) reached, parked needs-human", r.agentID, r.taskID, respawnCap)
 				killReviewerPane(sessionName, r.session, r.window, killWindow)
+				fan.notify(ctx, pool, r.taskID, fmt.Sprintf("Fixer froze repeatedly (round %d) — respawn cap (%d) reached, parked needs-human.", r.round, respawnCap))
 			}
 			continue
 		}

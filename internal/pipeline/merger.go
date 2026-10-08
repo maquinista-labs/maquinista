@@ -115,7 +115,7 @@ func ParseMergeVerdict(text string) (string, bool) {
 // release the entry for the merger path; at the cap, fall back to today's
 // needs-human park. Everything the dispatch loop needs travels in the
 // marker; the queue entry stays the source of truth (no new states).
-func armMergeConflictAgent(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, entry *db.MergeQueueEntry, base string, conflictErr *git.ConflictError) error {
+func armMergeConflictAgent(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, fan parkFanout, entry *db.MergeQueueEntry, base string, conflictErr *git.ConflictError) error {
 	taskID := entry.TaskID
 	maxAttempts := cfg.MaxAttempts
 	if maxAttempts <= 0 {
@@ -127,7 +127,7 @@ func armMergeConflictAgent(ctx context.Context, pool *pgxpool.Pool, cfg MergeCon
 	}
 	if attempts >= maxAttempts {
 		log.Printf("pipeline: merge %s conflict: merger budget exhausted (%d/%d) — parking needs-human", taskID, attempts, maxAttempts)
-		return parkMergeConflict(ctx, pool, taskID, entry, conflictErr)
+		return parkMergeConflict(ctx, pool, fan, taskID, entry, conflictErr)
 	}
 
 	marker := mergeConflictMarker{
@@ -253,8 +253,8 @@ func latestMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID string)
 // ---- dispatch-loop passes -------------------------------------------------
 
 // mergerPass runs the merger spawn + prompt-heal arms (dispatch loop).
-func mergerPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) error {
-	if err := mergerSpawnPass(ctx, pool, spawn); err != nil {
+func mergerPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner, fan parkFanout) error {
+	if err := mergerSpawnPass(ctx, pool, spawn, fan); err != nil {
 		return err
 	}
 	return mergerPromptPass(ctx, pool)
@@ -284,7 +284,7 @@ WHERE t.status = 'ready_to_merge'
           AND v.content = 'entry ' || (m.content::jsonb->>'entry')
                       || ' attempt ' || (m.content::jsonb->>'attempt'))`
 
-func mergerSpawnPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner) error {
+func mergerSpawnPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawner, fan parkFanout) error {
 	rows, err := pool.Query(ctx, mergerCandidatesSQL)
 	if err != nil {
 		return err
@@ -328,6 +328,7 @@ func mergerSpawnPass(ctx context.Context, pool *pgxpool.Pool, spawn ReviewSpawne
 				log.Printf("pipeline: merger: stale episode on %s → needs_human", c.taskID)
 				notifyTaskf(ctx, pool, c.taskID, "🆘 %s: merger episode (attempt %d) never dispatched — parked needs-human. Resolve by hand or re-approve.%s",
 					taskTitle(ctx, pool, c.taskID), c.marker.Attempt, prLinkSuffix(ctx, pool, c.taskID))
+				fan.notify(ctx, pool, c.taskID, fmt.Sprintf("Merger episode (attempt %d) armed but never dispatched — parked needs-human.", c.marker.Attempt))
 			}
 			continue
 		}
@@ -493,7 +494,7 @@ type liveMerger struct {
 	marker                                  mergeConflictMarker
 }
 
-func mergerVerdictPass(ctx context.Context, pool *pgxpool.Pool, sessionName string, killWindow func(session, windowID string) error) error {
+func mergerVerdictPass(ctx context.Context, pool *pgxpool.Pool, sessionName string, killWindow func(session, windowID string) error, fan parkFanout) error {
 	mergers, err := scanLiveMergers(ctx, pool, liveMergersSQL, nil)
 	if err != nil {
 		return err
@@ -536,6 +537,7 @@ func mergerVerdictPass(ctx context.Context, pool *pgxpool.Pool, sessionName stri
 				}
 				notifyTaskf(ctx, pool, m.taskID, "🆘 %s: merger agent could not resolve the rebase conflict on branch %s. Conflicting files:\n%s\nTask parked needs-human.%s",
 					label, m.marker.Branch, strings.Join(m.marker.Files, "\n"), prLinkSuffix(ctx, pool, m.taskID))
+				fan.notify(ctx, pool, m.taskID, fmt.Sprintf("Merger agent could not resolve the rebase conflict on branch %s.", m.marker.Branch))
 				log.Printf("pipeline: merger: verdict needs_human on %s (%s) — parked", m.taskID, m.agentID)
 			}
 		}
@@ -697,7 +699,7 @@ func retireMerger(ctx context.Context, pool *pgxpool.Pool, agentID string) {
 // lands needs-human (parkMergerConflict): the money path keeps its human
 // gate, and the conflicted queue entry + marker preserve the episode for a
 // hand-resolve or re-approve.
-func mergerWatchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, sessionName string, killWindow func(session, windowID string) error) error {
+func mergerWatchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, sessionName string, killWindow func(session, windowID string) error, fan parkFanout) error {
 	mergers, err := scanLiveMergers(ctx, pool, liveMergersSQL+FreezeFilterSQL, []any{idle.Seconds(), spawn.Seconds()})
 	if err != nil {
 		return err
@@ -715,6 +717,7 @@ func mergerWatchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 			}
 			log.Printf("pipeline: merger: watchdog retired stalled merger %s on %s → needs_human", m.agentID, m.taskID)
 			notifyTaskf(ctx, pool, m.taskID, "🆘 %s: %s%s", label, note, prLinkSuffix(ctx, pool, m.taskID))
+			fan.notify(ctx, pool, m.taskID, "Merger agent froze mid-conflict-resolution — parked needs-human.")
 			killReviewerPane(sessionName, m.session, m.window, killWindow)
 		}
 	}
