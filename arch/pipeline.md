@@ -476,6 +476,18 @@ Corollary: automated steps must not inherit ambient runtime config (see
 `gateEnv`) — a step that behaves differently from a developer shell or
 CI gates nothing.
 
+The human side of the same rule: releasing a parked task is a VERB, not a
+shell UPDATE. `maquinista requeue <task-id>` (`db.RequeueTask`, MAQ-40) is
+the sanctioned `pending_approval → ready` transition — and only from there
+(`approve`/`reject` stay the terminal exits). It re-enters the machine at
+the normal `ready` node with worktree/branch/metadata untouched, so the
+next implementor round updates the same PR instead of spawning a
+duplicate; it releases stale claim fields (the reaper's requeue
+semantics) and stamps a task_context observation naming the `--by` actor
+(manual-ops traceability; `created_at` carries the when), plus a courtesy
+one-liner on the Pipeline topic. A non-`pending_approval` task is a hard
+error — the guarded UPDATE's rowcount is the exactly-once guard.
+
 ## Env contract
 
 | Variable | Meaning | Default |
