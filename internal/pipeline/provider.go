@@ -92,6 +92,16 @@ type TicketProvider interface {
 	AddIssueLink(ctx context.Context, issueID, url string) error
 }
 
+// IssueCommenter is the optional TicketProvider extension powering the park
+// fan-out (MAQ-34): posting a comment onto an issue. Providers that cannot
+// comment simply don't implement it; the fan-out probes for the capability
+// at runtime (same stance as CommentFetcher).
+type IssueCommenter interface {
+	// CommentOnIssue posts body as a comment on the issue. Exactly-once
+	// delivery is the CALLER's job (the fan-out's episode marker dedups).
+	CommentOnIssue(ctx context.Context, issueID, body string) error
+}
+
 // IssueComment is the slice of a ticket-system comment the comment verbs
 // need (MAQ-11). Author is the best identity the provider exposes — email
 // when public, else the display name.

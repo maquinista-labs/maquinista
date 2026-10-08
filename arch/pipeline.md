@@ -188,10 +188,13 @@ column ids via `TicketProvider.Columns` before pushing (`SetIssueColumn`).
 
 ## Review dispatch (EX-03)
 
-`pipeline.RunDispatch` (in `internal/pipeline/dispatch.go`) runs the passes
-below per tick (default 10 s, same cadence as sync). It never talks to the
-ticket system — everything below is `tasks`/`agents` bookkeeping, and the
-board sees the results only through the sync mirror.
+`pipeline.RunDispatch` (in `internal/pipeline/dispatch.go`) runs its passes
+per tick (default 10 s, same cadence as sync): orphan sweep (MAQ-41),
+reviewer spawn, prompt heal, verdict parse + transition, fixer, merger
+spawn/verdict/watchdog, freeze watchdog, merge enqueue, and the
+parked-branch merge-up (MAQ-42). It never talks to the ticket system —
+everything below is `tasks`/`agents` bookkeeping, and the board sees the
+results only through the sync mirror.
 
 **Entry.** `db.MarkDone` branches: a pipeline task (metadata
 `ticket_issue_id`) marked done by its worker goes to `review`, not `done` —
@@ -686,6 +689,28 @@ statuses (`pending → merging → merged|conflict|failed`) as the local flow:
   still spawns a merger session). Below the cap the entry is released for
   a later pass. The MAQ-15 merger-agent leg, when armed, takes precedence
   and is unchanged.
+- **Parked branches — merge-up pass (MAQ-42)** — the gate leg above only
+  sees `ready_to_merge` tasks, so a task parked `pending_approval` held a
+  branch that rotted while main moved (the MAQ-34 park sat CONFLICTING for
+  a day; no pass ever considered the branch). A dispatch-tick pass
+  (`parkedMergeUpPass`, next to the enqueue pass, gh mode regardless of
+  auto-merge — the approve verb benefits identically) scans parked tasks
+  holding a PR + worktree and no live queue entry, and runs the SAME
+  merge-up machinery on their branch: up-to-date branches cost one
+  ancestry read and nothing else; a stale branch that folds main in
+  cleanly is healed on the ref (🔀 note + observation, task stays parked,
+  no ledger, no comment) so the eventual approve takes the gate's
+  up-to-date fast path instead of re-conflicting; a deterministic
+  conflict consumes the same 2-attempt `mergeup_attempts` budget with a PR
+  comment per attempt. The budget lives on the task's newest merge_queue
+  entry — created as a terminal `conflict` ledger row
+  (`EnsureParkedMergeUpLedger`) when the park never reached the gate — so
+  a gate-parked conflict arrives at 2/2 and is never re-attempted, and a
+  fresh gate entry (requeue path) re-arms clean. After the second failure
+  exactly one 🆘 fires (the cap branch of the bump; the exhausted pre-
+  check keeps later ticks silent) and the task stays parked — the human
+  escapes are `resolve` / requeue, unchanged. A live merger episode
+  (`resolve` verb) blocks the pass, same as it blocks the gate.
 - **Conflicts — merger-agent leg (MAQ-15)** — under `PIPELINE_MERGE_AGENT=1`, a
   rebase conflict no longer parks immediately: the processor bumps the
   entry's `attempts` (the same budget as the CI cap), parks a
@@ -922,7 +947,9 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   every poll tick, and the poller logs the error without crashing (which
   is how it spams instead of failing). An empty approver list logs an
   explicit INERT warning once per start, so fail-closed never ships
-  silently.
+  silently. Writing to issues has its own optional extension too:
+  `IssueCommenter.CommentOnIssue` (Linear implements it) — the park
+  fan-out (MAQ-34, below) probes for it at runtime.
 - **Exactly-once** — the comment id is consumed into `ticket_comment_log`
   (INSERT ON CONFLICT DO NOTHING + RETURNING) BEFORE the verb runs, so a
   second identical comment or a pagination overlap loses the race and never
@@ -936,6 +963,45 @@ The verb arms a merge audit observation (`approved via … by <who>`).
   Notes about `pending_approval` tasks (round cap, needs-human escalation,
   CI-cap) keep the CLI-only form — the comment verb deliberately does not
   act on `pending_approval`.
+
+## Park fan-out (MAQ-34)
+
+A needs-human park no longer lives only in the Telegram group: every park
+site fans its 🆘 out to the two surfaces a reviewer actually reads — **one
+comment on the task's open PR** and **one comment on the mapped ticket
+issue** (`ticket_issue_map` row; providers without comment support and
+unmapped tasks degrade to the PR surface alone). Each comment states the
+park reason and quotes the exact approval paths: comment `approve` on the
+PR, `./maquinista approve <task-uuid> --by <approver>` (repo checkout,
+`.env` sourced; the approver handle resolves from
+`MAQUINISTA_TICKETS_APPROVERS`, preferring a non-email entry), or the
+Approve button on the Telegram card in the Approvals topic.
+
+`parkFanout.notify` (pipeline package, `parkfanout.go`) is the ONE code
+path — no per-site copies. Every park arm calls it from the applied branch
+of its guarded park transition (round-cap + needs-human verdicts, freeze
+respawn-cap parks, merger stale/frozen/needs-human parks, gate runaway,
+rebase-conflict parks, CI-attempt cap, merge-entry failure, both scheduler
+no-worktree parks via a cmd-wired hook); the zero value or an unwired hook
+degrades to the Telegram note alone.
+
+Exactly-once per park EPISODE rides two stacked guards:
+
+- **call placement** — the guarded park UPDATE's single winner is the only
+  caller, so a watchdog tick over an already-parked task never reaches the
+  fan-out; and
+- **the episode marker** — `claimParkFanout` anchors on the newest
+  non-marker `task_context` row (the park's own verdict/observation row,
+  written in the park tx) and claims via an INSERT of a `parkfanout` marker
+  carrying that anchor. A second call for the same parked task computes the
+  same anchor and posts nothing; a re-park writes a fresh verdict row, the
+  anchor moves, and the new episode fans out again.
+
+Posting is best-effort on both surfaces (the `notifyf` contract): a failed
+comment is logged, never fails the park; a spent claim never retries, so a
+transient gh outage costs that episode's PR comment but cannot double-post.
+No open PR (`ErrNoOpenPR` — no `pr_url`, or merged/closed) is the expected,
+silent degradation.
 
 ## Telegram reply → PR comment (MAQ-24)
 

@@ -122,8 +122,11 @@ func prLinkSuffix(ctx context.Context, pool *pgxpool.Pool, taskID string) string
 // summary: approve is the merge proposal, request_changes notes the fixer
 // round, needs_human / round-cap are the questions. A task with a PR gets
 // the link on every verdict (MAQ-10). Verdicts landed before EX-06 never
-// re-notify: the emission sits inside the guarded transition.
-func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdict, landed string, round, maxRounds int) {
+// re-notify: the emission sits inside the guarded transition. The two arms
+// that park pending_approval (round cap, needs_human) also fan out to the
+// PR + ticket issue (MAQ-34) — fan is the parkFanout built from the
+// dispatch config; its zero value degrades to the Telegram note alone.
+func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, fan parkFanout, taskID, title, verdict, landed string, round, maxRounds int) {
 	label := title
 	if label == "" {
 		label = TaskTitle(ctx, pool, taskID)
@@ -135,6 +138,7 @@ func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdi
 	case landed == "pending_approval":
 		notifyTaskf(ctx, pool, taskID, "🆘 %s: review round cap %d reached (%s) — parked needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
 			label, maxRounds, verdict, taskID, taskID, pr)
+		fan.notify(ctx, pool, taskID, fmt.Sprintf("Review round cap %d reached (%s) — parked needs-human.", maxRounds, verdict))
 	case verdict == VerdictApprove:
 		// MAQ-11: the proposal teaches the comment verbs (short id — typeable
 		// from a phone) instead of the CLI-only form. MAQ-10: the PR link
@@ -147,5 +151,6 @@ func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdi
 	default: // needs_human
 		notifyTaskf(ctx, pool, taskID, "🆘 %s: reviewer escalated needs-human. Decide with `maquinista approve %s` / `maquinista reject %s`.%s",
 			label, taskID, taskID, pr)
+		fan.notify(ctx, pool, taskID, "Reviewer escalated needs-human.")
 	}
 }
