@@ -83,6 +83,34 @@ Resume semantics: if `agents.session_id` is set (written by the
 SessionStart hook), the runner is launched with `--resume <session_id>`
 so Claude's conversation history survives restarts.
 
+## Completion contract (pipeline agents, ADR-0008)
+
+A pipeline agent (implementor / reviewer / fixer) ends its round through
+exactly one accepted completion verb — `maquinista-done <task-id>
+"<summary>"` for implementor and fixer rounds, the final `VERDICT:` line
+for reviewers. The contract lives in the souls (migration 035), the CLI
+prompt builder, and the review/fix prompt bodies.
+
+What happens when a turn ends without the verb (the monitor observes turn
+ends via `agents.last_turn_end_at`):
+
+1. **Nudge (recovery transition).** The owning leg sends exactly ONE
+   nudge per round — "your turn ended; finish" — via a guarded-UPDATE
+   consume (`agents.turn_end_nudged`) plus the inbox dedup key
+   `nudge:<task>:<agent>`. The nudge never completes on the agent's
+   behalf.
+2. **Silent-success retire.** If silence follows the turn end past the
+   freeze bounds, the watchdog retires the round as `silent_success`
+   (`task_context.cause`) — WITHOUT burning respawn budget; the
+   implementor phase goes straight to `review` when the artifacts allow
+   (open PR, branch current, ticket-mapped), else requeues to `ready`.
+3. **True-freeze backstop.** No turn end observed (crash, hang mid-turn)
+   keeps MAQ-31's semantics: budget burns, past the cap the task parks
+   needs-human.
+
+See pipeline.md §Watchdog (turn-end completion contract) for the full
+state machine.
+
 ## Workspace scopes
 
 See [workspaces.md](workspaces.md).

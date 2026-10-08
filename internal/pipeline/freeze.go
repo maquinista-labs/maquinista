@@ -106,6 +106,46 @@ const FreezeFilterSQL = `
   AND (a.last_transcript_at IS NULL
        OR a.last_transcript_at < NOW() - make_interval(secs => $1))`
 
+// Freeze causes (ADR-0008): why a frozen agent froze. The classifier is
+// FreezeCauseOf; the cause rides every freeze observation row
+// (task_context.cause) and gates the respawn budget — CountFreezeRetires
+// counts only true freezes, so silent successes retire for free.
+const (
+	// CauseSilentSuccess: a turn end was observed and nothing streamed
+	// after it — the agent finished speaking and never called
+	// `maquinista-done` (the 08/10 MAQ-37 r8 incident shape). Retires
+	// WITHOUT burning respawn budget; the implementor phase goes straight
+	// to review when the artifacts allow (open PR + branch up to date).
+	CauseSilentSuccess = "silent_success"
+	// CauseTrueFreeze: no turn end observed (crash, hang mid-turn — the
+	// transcript grew after the last turn end, or never showed one).
+	// Unchanged MAQ-31 behavior: counts against the respawn cap.
+	CauseTrueFreeze = "true_freeze"
+)
+
+// FreezeCauseOf classifies a frozen agent from its monitor-written
+// signals (ADR-0008): the last observable event being a clean turn end
+// (a turn end at/after the last transcript growth) is a silent success —
+// the agent ended its turn and sat silent; transcript growth after the
+// last turn end (a later turn started and died mid-way), or no turn end
+// at all, is a true freeze — the agent crashed or hung mid-turn. NULL
+// transcript timestamps mean "never observed", not "old".
+func FreezeCauseOf(turnEnd, transcriptAt *time.Time) string {
+	if turnEnd != nil && (transcriptAt == nil || !turnEnd.Before(*transcriptAt)) {
+		return CauseSilentSuccess
+	}
+	return CauseTrueFreeze
+}
+
+// FreezeCauseSelectSQL is FreezeCauseOf as a SELECT expression over an
+// `agents a` row, so freeze-arm queries can carry the classified cause
+// alongside the victim columns.
+const FreezeCauseSelectSQL = `CASE
+	WHEN a.last_turn_end_at IS NOT NULL
+	     AND (a.last_transcript_at IS NULL OR a.last_turn_end_at >= a.last_transcript_at)
+	THEN '` + CauseSilentSuccess + `'
+	ELSE '` + CauseTrueFreeze + `' END`
+
 // FreezeRespawnCapEnv tunes the freeze→respawn circuit breaker
 // (MAQUINISTA_WATCHDOG_RESPAWN_CAP).
 const FreezeRespawnCapEnv = "MAQUINISTA_WATCHDOG_RESPAWN_CAP"
@@ -133,16 +173,23 @@ func FreezeRespawnCapFromEnv() int {
 	return respawnCap
 }
 
-// CountFreezeRetires counts one arm's prior freeze retirements for a task —
-// the observation rows each guarded retire writes are the respawn budget's
-// ledger. The prefix is arm- and round-scoped ('watchdog: reviewer frozen
-// (round 2)'), so each new round starts with a fresh budget.
+// CountFreezeRetires counts one arm's prior TRUE-FREEZE retirements for a
+// task — the observation rows each guarded retire writes are the respawn
+// budget's ledger, and since ADR-0008 only 'true_freeze' rows burn budget:
+// a silent success (turn end observed, no done verb) retires for free
+// instead of punishing completed work as a freeze failure. The prefix is
+// arm- and round-scoped ('watchdog: reviewer frozen (round 2)'), so each
+// new round starts with a fresh budget. Rows from before the cause column
+// existed carry NULL and stop counting — a deploy-time budget reset per
+// task+round, bounded and harmless (the systemic-outage loop the cap
+// guards against re-parks within ~2h at the default bounds).
 func CountFreezeRetires(ctx context.Context, pool *pgxpool.Pool, taskID, prefix string) (int, error) {
 	var n int
 	err := pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM task_context
-		WHERE task_id = $1 AND kind = 'observation' AND content LIKE $2 || '%'
-	`, taskID, prefix).Scan(&n)
+		WHERE task_id = $1 AND kind = 'observation'
+		  AND content LIKE $2 || '%' AND cause = $3
+	`, taskID, prefix, CauseTrueFreeze).Scan(&n)
 	return n, err
 }
 
@@ -245,6 +292,33 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 		return err
 	}
 	for _, r := range reviewers {
+		// ADR-0008: the cause splits the arm. A silent success (turn end
+		// observed, no done verb — the r8 incident shape) never parks and
+		// never burns budget: the worst it earns is a fresh round, and the
+		// existing round cap is what bounds a genuinely confused agent. A
+		// true freeze keeps MAQ-31's circuit breaker exactly as it was.
+		if r.cause == CauseSilentSuccess {
+			// MAQ-36 salvage applies doubly here: a reviewer that ended its
+			// turn without the verdict very likely wrote its findings —
+			// hand them to the fresh round.
+			salvage, err := salvageFindings(ctx, pool, r.agentID)
+			if err != nil {
+				log.Printf("pipeline: dispatch: watchdog: salvage findings %s: %v — respawning without", r.agentID, err)
+				salvage = ""
+			}
+			note := fmt.Sprintf("watchdog: reviewer turn-ended without a verdict (round %d) — %s; auto-retired, fresh reviewer respawns in-round (no respawn budget burned)", r.round, freezeCause(idle, spawn))
+			applied, err := RetireFrozenAgentCause(ctx, pool, r.agentID, r.taskID, note, CauseSilentSuccess, func(tx pgx.Tx) error {
+				return insertSalvagedFindingsTx(ctx, tx, r.taskID, r.agentID, salvage)
+			})
+			if err != nil {
+				return err
+			}
+			if applied {
+				log.Printf("pipeline: dispatch: watchdog retired silent-success reviewer %s on %s — respawning (budget untouched)", r.agentID, r.taskID)
+				killReviewerPane(sessionName, r.session, r.window, killWindow)
+			}
+			continue
+		}
 		spent, err := CountFreezeRetires(ctx, pool, r.taskID, fmt.Sprintf("watchdog: reviewer frozen (round %d)", r.round))
 		if err != nil {
 			return err
@@ -255,7 +329,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			// needs-human — retire + park in one tx, the guarded retire is
 			// still the exactly-once dedup.
 			note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — %s; %d in-round respawns already spent, parking needs-human", r.round, freezeCause(idle, spawn), spent)
-			applied, err := RetireFrozenAgentCleanup(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
+			applied, err := RetireFrozenAgentCause(ctx, pool, r.agentID, r.taskID, note, CauseTrueFreeze, func(tx pgx.Tx) error {
 				return ParkEpisodeTx(ctx, tx, r.taskID, "review", note)
 			})
 			if err != nil {
@@ -280,7 +354,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			salvage = ""
 		}
 		note := fmt.Sprintf("watchdog: reviewer frozen (round %d) — %s; auto-retired, fresh reviewer respawns in-round", r.round, freezeCause(idle, spawn))
-		applied, err := RetireFrozenAgentCleanup(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
+		applied, err := RetireFrozenAgentCause(ctx, pool, r.agentID, r.taskID, note, CauseTrueFreeze, func(tx pgx.Tx) error {
 			return insertSalvagedFindingsTx(ctx, tx, r.taskID, r.agentID, salvage)
 		})
 		if err != nil {
@@ -297,6 +371,23 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 		return err
 	}
 	for _, r := range fixers {
+		// ADR-0008: a silent-success fixer (turn ended without done) re-arms
+		// its episode for free — no park, no budget burn. A true freeze
+		// keeps the circuit breaker.
+		if r.cause == CauseSilentSuccess {
+			note := fmt.Sprintf("watchdog: fixer turn-ended without done (round %d) — %s; auto-retired, fix episode re-armed (no respawn budget burned)", r.round, freezeCause(idle, spawn))
+			applied, err := RetireFrozenAgentCause(ctx, pool, r.agentID, r.taskID, note, CauseSilentSuccess, func(tx pgx.Tx) error {
+				return releaseFixEpisodeTx(ctx, tx, r.taskID)
+			})
+			if err != nil {
+				return err
+			}
+			if applied {
+				log.Printf("pipeline: dispatch: watchdog retired silent-success fixer %s on %s — episode re-armed (budget untouched)", r.agentID, r.taskID)
+				killReviewerPane(sessionName, r.session, r.window, killWindow)
+			}
+			continue
+		}
 		spent, err := CountFreezeRetires(ctx, pool, r.taskID, fmt.Sprintf("watchdog: fixer frozen (round %d)", r.round))
 		if err != nil {
 			return err
@@ -306,16 +397,8 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			// as the respawn arm, so a human flipping the task back to
 			// changes_requested re-arms clean.
 			note := fmt.Sprintf("watchdog: fixer frozen (round %d) — %s; %d episode re-arms already spent, parking needs-human", r.round, freezeCause(idle, spawn), spent)
-			applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
-				var round int
-				if err := tx.QueryRow(ctx,
-					`SELECT review_rounds FROM tasks WHERE id = $1 FOR UPDATE`, r.taskID).Scan(&round); err != nil {
-					return err
-				}
-				if _, err := tx.Exec(ctx, `
-					DELETE FROM task_context
-					WHERE task_id = $1 AND kind = 'fix' AND content = $2
-				`, r.taskID, fmt.Sprintf("round %d", round)); err != nil {
+			applied, err := RetireFrozenAgentCause(ctx, pool, r.agentID, r.taskID, note, CauseTrueFreeze, func(tx pgx.Tx) error {
+				if err := releaseFixEpisodeTx(ctx, tx, r.taskID); err != nil {
 					return err
 				}
 				return ParkEpisodeTx(ctx, tx, r.taskID, "changes_requested", note)
@@ -331,22 +414,13 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 			continue
 		}
 		note := fmt.Sprintf("watchdog: fixer frozen (round %d) — %s; auto-retired, fix episode re-armed", r.round, freezeCause(idle, spawn))
-		applied, err := retireFrozenAgentTx(ctx, pool, r.agentID, r.taskID, note, func(tx pgx.Tx) error {
+		applied, err := RetireFrozenAgentCause(ctx, pool, r.agentID, r.taskID, note, CauseTrueFreeze, func(tx pgx.Tx) error {
 			// Release the episode: fixerCandidatesSQL keys on the round's
 			// fix row, so deleting it lets the next fixerPass mint a fresh
 			// fixer (-rN) for the SAME round. The frozen agent's own fix
 			// prompt row is already gone (RetireFrozenAgent drops its
 			// undriven prompts), so the re-armed episode re-enqueues clean.
-			var round int
-			if err := tx.QueryRow(ctx,
-				`SELECT review_rounds FROM tasks WHERE id = $1 FOR UPDATE`, r.taskID).Scan(&round); err != nil {
-				return err
-			}
-			_, err := tx.Exec(ctx, `
-				DELETE FROM task_context
-				WHERE task_id = $1 AND kind = 'fix' AND content = $2
-			`, r.taskID, fmt.Sprintf("round %d", round))
-			return err
+			return releaseFixEpisodeTx(ctx, tx, r.taskID)
 		})
 		if err != nil {
 			return err
@@ -359,6 +433,25 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 	return nil
 }
 
+// releaseFixEpisodeTx deletes the CURRENT round's fix row inside a freeze
+// retire's tx — the episode release both fixer arms share.
+// fixerCandidatesSQL keys on this row, so deleting it lets fixerPass mint a
+// fresh fixer (-rN) for the SAME round; the frozen agent's own fix prompt
+// row is already gone (RetireFrozenAgent drops undriven prompts), so the
+// re-armed episode re-enqueues clean.
+func releaseFixEpisodeTx(ctx context.Context, tx pgx.Tx, taskID string) error {
+	var round int
+	if err := tx.QueryRow(ctx,
+		`SELECT review_rounds FROM tasks WHERE id = $1 FOR UPDATE`, taskID).Scan(&round); err != nil {
+		return err
+	}
+	_, err := tx.Exec(ctx, `
+		DELETE FROM task_context
+		WHERE task_id = $1 AND kind = 'fix' AND content = $2
+	`, taskID, fmt.Sprintf("round %d", round))
+	return err
+}
+
 // RetireFrozenAgent retires one frozen agent row: guarded status→dead (the
 // exactly-once 🆘 dedup — only the transition's winner notifies), a
 // task_context observation for downstream attempts, and deletion of the
@@ -366,7 +459,7 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 // retireFrozenAgentTx). applied=false when the row raced to dead elsewhere
 // (no notification).
 func RetireFrozenAgent(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note string) (bool, error) {
-	return retireFrozenAgentTx(ctx, pool, agentID, taskID, note, nil)
+	return retireFrozenAgentTxCause(ctx, pool, agentID, taskID, note, "", nil)
 }
 
 // RetireFrozenAgentCleanup is RetireFrozenAgent with a same-tx cleanup hook,
@@ -374,7 +467,15 @@ func RetireFrozenAgent(ctx context.Context, pool *pgxpool.Pool, agentID, taskID,
 // arms delete the round's fix row with it) — atomic with the guarded
 // retire, so a raced no-op never releases an episode it didn't win.
 func RetireFrozenAgentCleanup(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note string, cleanup func(pgx.Tx) error) (bool, error) {
-	return retireFrozenAgentTx(ctx, pool, agentID, taskID, note, cleanup)
+	return retireFrozenAgentTxCause(ctx, pool, agentID, taskID, note, "", cleanup)
+}
+
+// RetireFrozenAgentCause is RetireFrozenAgentCleanup with the ADR-0008
+// freeze cause riding the observation row (task_context.cause):
+// CauseSilentSuccess (no respawn budget burn) or CauseTrueFreeze (counts
+// against the cap). Empty cause = unclassified (pre-ADR callers).
+func RetireFrozenAgentCause(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note, cause string, cleanup func(pgx.Tx) error) (bool, error) {
+	return retireFrozenAgentTxCause(ctx, pool, agentID, taskID, note, cause, cleanup)
 }
 
 // retireFrozenAgentTx is the shared retire: one tx — guarded status→dead,
@@ -392,7 +493,7 @@ func RetireFrozenAgentCleanup(ctx context.Context, pool *pgxpool.Pool, agentID, 
 // premise — so the rows are undriven and safe to drop. Implementors don't
 // need it (the scheduler's Upsert repoints) and reviewers grow a fresh
 // round key, but uniformity costs nothing and un-wedges every shape.
-func retireFrozenAgentTx(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note string, extra func(pgx.Tx) error) (bool, error) {
+func retireFrozenAgentTxCause(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, note, cause string, extra func(pgx.Tx) error) (bool, error) {
 	tx, err := pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -414,9 +515,9 @@ func retireFrozenAgentTx(ctx context.Context, pool *pgxpool.Pool, agentID, taskI
 		return false, nil // raced to dead elsewhere — no notification
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO task_context (task_id, agent_id, kind, content)
-		VALUES ($1, $2, 'observation', $3)
-	`, taskID, agentID, note); err != nil {
+		INSERT INTO task_context (task_id, agent_id, kind, content, cause)
+		VALUES ($1, $2, 'observation', $3, NULLIF($4, ''))
+	`, taskID, agentID, note, cause); err != nil {
 		return false, err
 	}
 	if _, err := tx.Exec(ctx, `

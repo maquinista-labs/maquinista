@@ -81,7 +81,7 @@ func TestRetireFrozenClaims(t *testing.T) {
 	ctx := context.Background()
 	seedClaim(t, pool, "FZ", "impl-fz")
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,7 +123,7 @@ func TestRetireFrozenClaims_ActiveUntouched(t *testing.T) {
 		VALUES ('impl-fa', '{"text":"working the spec"}'::jsonb)
 	`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestRetireFrozenClaims_TranscriptGrowthUntouched(t *testing.T) {
 	seedClaim(t, pool, "FT", "impl-ft")
 	exec(t, pool, `UPDATE agents SET last_transcript_at = NOW() - INTERVAL '5 minutes' WHERE id='impl-ft'`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -165,7 +165,7 @@ func TestRetireFrozenClaims_YoungUntouched(t *testing.T) {
 		WHERE id='impl-fy'
 	`)
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -330,13 +330,13 @@ func TestRetireFrozenClaims_RespawnCapParks(t *testing.T) {
 	// retires wrote).
 	for i := 0; i < 3; i++ {
 		exec(t, pool, `
-			INSERT INTO task_context (task_id, agent_id, kind, content)
+			INSERT INTO task_context (task_id, agent_id, kind, content, cause)
 			VALUES ('FP', 'impl-fp', 'observation',
-			        'watchdog: implementor impl-fp frozen — no outbox activity; auto-retired')
+			        'watchdog: implementor impl-fp frozen — no outbox activity; auto-retired', 'true_freeze')
 		`)
 	}
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,7 +482,7 @@ func TestRetireFrozenClaims_NoteReportsPaneExistence(t *testing.T) {
 		seedClaim(t, pool, "PZ-"+tc.agentID, tc.agentID)
 		var probed []string
 
-		retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, probe(&probed))
+		retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, probe(&probed), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -519,7 +519,7 @@ func TestRetireFrozenClaims_NilPaneProbeShipsUnknown(t *testing.T) {
 	ctx := context.Background()
 	seedClaim(t, pool, "PUNK", "impl-punk")
 
-	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil)
+	retired, err := RetireFrozenClaims(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "maquinista", nil, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
