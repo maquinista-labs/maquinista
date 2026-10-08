@@ -67,3 +67,45 @@ func TestSlugifyJobName(t *testing.T) {
 		}
 	}
 }
+
+// MAQ-41: pipeline roles are task-scoped — SpawnFresh must refuse to mint a
+// row with an empty TaskID instead of silently inserting task_id=NULL (a
+// binding no completion leg can see). The check fires before any pool/tmux
+// work, so the rejection is exercisable as a plain unit test.
+func TestSpawnFresh_PipelineRoleRequiresTaskID(t *testing.T) {
+	cfg := baseConfig()
+	for _, role := range []string{"implementor", "reviewer", "fixer", "merger"} {
+		_, err := SpawnFresh(nil, nil, cfg, FreshParams{
+			AgentID: role + "-abc",
+			Role:    role,
+			// TaskID deliberately empty.
+		}, nil)
+		if err == nil {
+			t.Errorf("SpawnFresh(role=%q, TaskID=\"\") = nil error, want hard refusal", role)
+			continue
+		}
+		if !strings.Contains(err.Error(), "task-scoped") || !strings.Contains(err.Error(), "TaskID is required") {
+			t.Errorf("SpawnFresh(role=%q) error = %q, want the task-scoped refusal", role, err)
+		}
+	}
+}
+
+// Non-pipeline roles keep the legacy pool semantics: a NULL task_id is
+// legal there (user/executor/hook rows are task-less by design).
+func TestSpawnFresh_UserRoleAllowsEmptyTaskID(t *testing.T) {
+	// The validation must NOT fire for role "" (defaulted to "user") — we
+	// can't run the full spawn without tmux, but we can assert the guard
+	// predicate directly so the defaulting stays covered.
+	role := ""
+	if role == "" {
+		role = "user"
+	}
+	if pipelineTaskScopedRoles[role] {
+		t.Fatalf("role %q must not be task-scoped", role)
+	}
+	for _, r := range []string{"user", "executor", "hook"} {
+		if pipelineTaskScopedRoles[r] {
+			t.Errorf("role %q must not be task-scoped", r)
+		}
+	}
+}

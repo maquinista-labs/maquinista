@@ -188,10 +188,10 @@ column ids via `TicketProvider.Columns` before pushing (`SetIssueColumn`).
 
 ## Review dispatch (EX-03)
 
-`pipeline.RunDispatch` (in `internal/pipeline/dispatch.go`) runs four passes
-per tick (default 10 s, same cadence as sync). It never talks to the ticket
-system — everything below is `tasks`/`agents` bookkeeping, and the board
-sees the results only through the sync mirror.
+`pipeline.RunDispatch` (in `internal/pipeline/dispatch.go`) runs the passes
+below per tick (default 10 s, same cadence as sync). It never talks to the
+ticket system — everything below is `tasks`/`agents` bookkeeping, and the
+board sees the results only through the sync mirror.
 
 **Entry.** `db.MarkDone` branches: a pipeline task (metadata
 `ticket_issue_id`) marked done by its worker goes to `review`, not `done` —
@@ -367,6 +367,17 @@ session in the SAME worktree/PR:
   (content `round <N>`) commits FIRST and stops re-spawning for the episode;
   that marker is also the exactly-once guard for the MAQ-22
   "fixer round N started" one-liner
+- **the episode claims the task (MAQ-41)**: `tasks.claimed_by` is set to
+  the fixer (guarded on `status='changes_requested'`), because the
+  completion route (`scripts/maquinista-done`) only advances a task whose
+  `claimed_by` matches the finishing agent. A `changes_requested` task
+  carries no live worker claim (the implementor's was released at its own
+  done, or went stale through a park — the MAQ-37 PR #44 incident had the
+  dead implementor's claim still on the row), so without the claim the
+  fixer's done flipped only the agent row and the episode wedged with its
+  fix row consumed. `done` clears the claim again (`claimed_by=NULL`) as
+  the done path always does. The comment-triggered reround arm claims the
+  same way, inside its episode tx (after the pending_approval unpark)
 - the fix prompt (`external_msg_id = fix:<task>:<round>` dedup) embeds the
   reviewer's newest message tail (≤6000 chars — the soul contract puts the
   numbered findings at the top of the final reply); a prompt miss heals on
@@ -374,8 +385,44 @@ session in the SAME worktree/PR:
 - **no zero-author guard by design** — a fixer continuing the previous
   fixer's work is the point; the round N+1 reviewer is always a fresh mint
 - **loop closure needs no new transition code**: the fixer ends with
-  `maquinista-done` → `db.MarkDone` done-path branch → `review` → the
-  reviewer spawn pass mints a fresh reviewer and bumps the round
+  `maquinista-done` — which matches because the episode claimed the task
+  (MAQ-41, above) — done-path branch → `review` → the reviewer spawn pass
+  mints a fresh reviewer and bumps the round
+
+**Orphan sweep (MAQ-41).** The dispatch tick's first pass reconciles live
+(`status <> 'dead'`) pipeline-role rows (`implementor`/`reviewer`/`fixer`/
+`merger`) whose `task_id` went NULL — the completion route releases agents
+worker-pool style (`task_id=NULL, status='idle'`), and a NULL binding makes
+the row invisible to every completion leg (they all JOIN
+`tasks ON agents.task_id`), so the turn's end can never be processed (the
+MAQ-37 wedge). Each row gets exactly one disposition, never silence:
+
+- id parses as the pipeline mint shape `<role>-<task>[-rN]` and the task
+  exists:
+  - mid-flight rows (`running`/`working`): the binding is BACKFILLED (one
+    🩹 observation + notification; guarded against stealing the task's
+    unique-live slot from another live row — on conflict the orphan is
+    retired instead), so the verdict/fixer/watchdog legs resume processing
+    it, still bounded by the freeze watchdog;
+  - post-turn rows (`idle`/`stopped`): binding restored for the record AND
+    row retired dead in one statement (a live row with a binding would
+    hold the task's unique-live slot forever). If the shape says the
+    completion was never processed — a fixer whose task still sits
+    `changes_requested` with the current round's fix row — the episode is
+    RE-ARMED in the same breath (the frozen-fixer arm's transition: fix
+    row released, undriven prompts dropped, one 🆘) so the next fixer pass
+    mints a fresh fixer instead of the task wedging behind a consumed
+    episode. Every other post-turn case (the task advanced) is a benign
+    remnant: retire + log, no alert noise.
+- anything else (no parseable task id, or the task row is gone): retired
+  dead with exactly one 🆘 on the Pipeline topic.
+
+Exactly-once rides the guarded-retire pattern (the single winner of the
+status→dead UPDATE notifies); a backfill is its own dedup
+(`task_id IS NULL` guard). `agentspawn.SpawnFresh` is the upstream guard:
+pipeline-role spawns with an empty TaskID are refused outright, and a
+pre-existing NULL-task_id row that the `ON CONFLICT DO NOTHING` would
+silently keep is explicitly repaired and logged.
 
 **Watchdog (freeze detection, MAQ-31).** The liveness signal is
 `agent_outbox` freshness — the ground-truth activity stream (§3) — with a

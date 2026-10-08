@@ -244,6 +244,9 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 			return
 		case <-ticker.C:
 		}
+		if err := orphanSweepPass(ctx, pool); err != nil {
+			log.Printf("pipeline: dispatch: orphan sweep pass: %v", err)
+		}
 		if err := dispatchPass(ctx, pool, cfg.Gh, spawn, cfg.ImplementorIdleAfter); err != nil {
 			log.Printf("pipeline: dispatch: spawn pass: %v", err)
 		}
@@ -1075,6 +1078,21 @@ func recordFixEpisode(ctx context.Context, pool *pgxpool.Pool, agentID, taskID s
 		VALUES ($1, $2, 'fix', $3)
 	`, taskID, agentID, fmt.Sprintf("round %d", round)); err != nil {
 		return fmt.Errorf("insert fix row: %w", err)
+	}
+	// MAQ-41: the fixer owns this episode — claim the task for it. The
+	// completion route (scripts/maquinista-done) advances the task only
+	// when claimed_by matches the finishing agent; a changes_requested
+	// task carries no live worker claim (the implementor's was released
+	// at its done, or went stale through a park), so without this the
+	// fixer's done flips the agent row but NOT the task — the episode
+	// wedges with the fix row consumed (the MAQ-37 PR #44 shape). The
+	// guard keeps the claim scoped to the fixer's own state; done clears
+	// it again (claimed_by=NULL) exactly as the done-path branch expects.
+	if _, err := pool.Exec(ctx, `
+		UPDATE tasks SET claimed_by = $2, claimed_at = NOW()
+		WHERE id = $1 AND status = 'changes_requested'
+	`, taskID, agentID); err != nil {
+		return fmt.Errorf("claim task for fixer: %w", err)
 	}
 	// MAQ-22: the episode marker above is the exactly-once guard — it is
 	// what fixerCandidatesSQL keys on — so the round-started one-liner

@@ -25,6 +25,19 @@ type AgentSpawner interface {
 	Spawn(agentID string)
 }
 
+// pipelineTaskScopedRoles are the roles whose whole lifecycle is keyed on
+// agents.task_id: the dispatch verdict/fixer/watchdog legs and the merger
+// passes all JOIN tasks ON agents.task_id (MAQ-41). A row with a NULL
+// binding is invisible to every completion leg — the turn's end can never
+// be processed and the state machine wedges silently. SpawnFresh refuses
+// to mint such a row and explicitly repairs a pre-existing NULL one.
+var pipelineTaskScopedRoles = map[string]bool{
+	"implementor": true,
+	"reviewer":    true,
+	"fixer":       true,
+	"merger":      true,
+}
+
 // FreshParams holds the inputs for SpawnFresh.
 type FreshParams struct {
 	// AgentID is the pre-generated agent identifier (caller's responsibility).
@@ -38,7 +51,9 @@ type FreshParams struct {
 	// Role sets agents.role (default "user"). Review dispatch (EX-03) uses
 	// "reviewer"; the unique-live-per-task index (migration 011) applies.
 	Role string
-	// TaskID binds the agent to a tasks row (NULL when empty).
+	// TaskID binds the agent to a tasks row (NULL when empty). Pipeline
+	// roles (MAQ-41) reject empty: their completion legs all JOIN
+	// agents.task_id, so a NULL binding makes the turn unprocessable.
 	TaskID string
 	// ModelOverride, when non-empty, is injected into the pane environment as
 	// MAQUINISTA_PI_MODEL — the pi runner's per-instance resolution chain
@@ -66,6 +81,14 @@ func SpawnFresh(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, p F
 	if role == "" {
 		role = "user"
 	}
+	// MAQ-41: fail loud before anything is minted — a pipeline-role spawn
+	// without its task binding would insert a row no completion leg can
+	// ever see.
+	if pipelineTaskScopedRoles[role] && p.TaskID == "" {
+		return "", fmt.Errorf(
+			"agentspawn: role %q is task-scoped — TaskID is required (refusing to insert agent %s with NULL task_id)",
+			role, p.AgentID)
+	}
 	var taskID *string
 	if p.TaskID != "" {
 		taskID = &p.TaskID
@@ -78,6 +101,26 @@ func SpawnFresh(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, p F
 		ON CONFLICT (id) DO NOTHING
 	`, p.AgentID, cfg.TmuxSessionName, role, taskID, runnerType, p.CWD); err != nil {
 		return "", fmt.Errorf("insert agent row: %w", err)
+	}
+	// MAQ-41: ON CONFLICT DO NOTHING resurrects a pre-existing row as-is —
+	// including one with a NULL task_id, which would silently keep the
+	// spawn unbound no matter what the caller passed. Pipeline roles get an
+	// explicit repair: backfill the binding and say so.
+	if pipelineTaskScopedRoles[role] {
+		var existing *string
+		if err := pool.QueryRow(ctx,
+			`SELECT task_id FROM agents WHERE id = $1`, p.AgentID).Scan(&existing); err == nil && existing == nil {
+			tag, uerr := pool.Exec(ctx, `
+				UPDATE agents SET task_id = $2, last_seen = NOW()
+				WHERE id = $1 AND task_id IS NULL
+			`, p.AgentID, p.TaskID)
+			if uerr != nil {
+				return "", fmt.Errorf("repair NULL-task_id agent row %s: %w", p.AgentID, uerr)
+			}
+			if tag.RowsAffected() > 0 {
+				log.Printf("agentspawn: repaired pre-existing NULL-task_id row %s → task %s (ON CONFLICT would have kept it unbound)", p.AgentID, p.TaskID)
+			}
+		}
 	}
 
 	// 2. Clone soul template.
