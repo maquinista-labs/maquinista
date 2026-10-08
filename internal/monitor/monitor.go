@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,7 +19,6 @@ import (
 // Returns (topicID, chatID) pairs for topics observing the agent that owns this window.
 // Implementations should look up the agent by window, then look up observing topics.
 type ObservationLookup func(windowID string) []ObservingTopic
-
 
 // ObservingTopic represents a topic that is observing an agent's output.
 type ObservingTopic struct {
@@ -48,6 +48,12 @@ type Monitor struct {
 	pollCount           int
 	transcriptTouches   sync.Map      // windowID → time.Time of last liveness write
 	transcriptTouchFreq time.Duration // liveness write throttle (default transcriptTouchInterval; 0 disables)
+
+	// Turn-end shadow signal (ADR-0008 F1, MAQ-43): detection on transcript
+	// growth, emission = journal only. turnEnds dedups per window on the
+	// closing message id; turnEndCount is the boot-cumulative incidence.
+	turnEnds     sync.Map // windowID → last fired closing message id
+	turnEndCount atomic.Uint64
 }
 
 // New creates a new Monitor.
@@ -176,6 +182,10 @@ func (m *Monitor) poll() {
 			// mid-command, metadata lines).
 			if newOffset > offset {
 				m.touchTranscriptLiveness(sess.WindowID)
+				// Growth is also the trigger to re-inspect the transcript
+				// tail for a turn close (ADR-0008 F1, shadow: log + count
+				// only). Unchanged tails cannot produce a new closing.
+				m.detectTurnEnd(src, sess)
 			}
 
 			if len(parsed) == 0 {

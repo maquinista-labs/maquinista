@@ -98,6 +98,13 @@ origin delivery.
    classifier consume (see pipeline.md §Watchdog, turn-end completion
    contract).
 
+   The same growth tick also inspects the transcript tail for a TURN END
+   (assistant message with no pending tool call) on live pipeline agents
+   (ADR-0008 F1, MAQ-43): shadow mode — one structured journal line per
+   detection plus a boot-cumulative incidence count, no outbox row, no DB
+   write, no pipeline action. F2 turns the signal into the completion
+   nudge + cause-aware freeze ledger.
+
 4. **Relay** — `maquinista relay` daemon wakes, claims the outbox row,
    runs `fanoutDeliveries`:
    - **Origin leg** — if `in_reply_to` points to a `telegram` inbox row,
