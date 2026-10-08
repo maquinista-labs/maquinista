@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -60,20 +61,39 @@ type Agent struct {
 
 // MergeQueueEntry represents an entry in the merge queue.
 type MergeQueueEntry struct {
-	ID            int64      `json:"id"`
-	TaskID        string     `json:"task_id"`
-	AgentID       string     `json:"agent_id"`
-	Branch        string     `json:"branch"`
-	WorktreeDir   string     `json:"worktree_dir"`
-	BaseBranch    string     `json:"base_branch"`
-	Status        string     `json:"status"`
-	CommitSHA     *string    `json:"commit_sha,omitempty"`
-	MergeSHA      *string    `json:"merge_sha,omitempty"`
-	ConflictFiles []string   `json:"conflict_files,omitempty"`
-	ErrorMsg      *string    `json:"error_msg,omitempty"`
-	EnqueuedAt    time.Time  `json:"enqueued_at"`
-	StartedAt     *time.Time `json:"started_at,omitempty"`
-	CompletedAt   *time.Time `json:"completed_at,omitempty"`
+	ID             int64      `json:"id"`
+	TaskID         string     `json:"task_id"`
+	AgentID        string     `json:"agent_id"`
+	Branch         string     `json:"branch"`
+	WorktreeDir    string     `json:"worktree_dir"`
+	BaseBranch     string     `json:"base_branch"`
+	Status         string     `json:"status"`
+	CommitSHA      *string    `json:"commit_sha,omitempty"`
+	MergeSHA       *string    `json:"merge_sha,omitempty"`
+	ConflictFiles  []string   `json:"conflict_files,omitempty"`
+	ErrorMsg       *string    `json:"error_msg,omitempty"`
+	MergeupAttempts int       `json:"mergeup_attempts"`
+	EnqueuedAt     time.Time  `json:"enqueued_at"`
+	StartedAt      *time.Time `json:"started_at,omitempty"`
+	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+}
+
+// mergeEntryCols is the canonical SELECT column list for merge_queue rows.
+const mergeEntryCols = `id, task_id, agent_id, branch, worktree_dir, base_branch, status,
+	       commit_sha, merge_sha, conflict_files, error_msg, mergeup_attempts,
+	       enqueued_at, started_at, completed_at`
+
+func scanMergeEntry(row pgx.Row) (*MergeQueueEntry, error) {
+	var e MergeQueueEntry
+	err := row.Scan(
+		&e.ID, &e.TaskID, &e.AgentID, &e.Branch, &e.WorktreeDir, &e.BaseBranch, &e.Status,
+		&e.CommitSHA, &e.MergeSHA, &e.ConflictFiles, &e.ErrorMsg, &e.MergeupAttempts,
+		&e.EnqueuedAt, &e.StartedAt, &e.CompletedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &e, nil
 }
 
 // taskColumns is the canonical SELECT column list for tasks.
@@ -807,7 +827,7 @@ func ClaimMergeEntry(pool *pgxpool.Pool) (*MergeQueueEntry, error) {
 	defer tx.Rollback(ctx)
 
 	var e MergeQueueEntry
-	err = tx.QueryRow(ctx, `
+	entry, err := scanMergeEntry(tx.QueryRow(ctx, `
 		UPDATE merge_queue
 		SET    status     = 'merging',
 		       started_at = NOW()
@@ -818,20 +838,14 @@ func ClaimMergeEntry(pool *pgxpool.Pool) (*MergeQueueEntry, error) {
 			LIMIT  1
 			FOR UPDATE SKIP LOCKED
 		)
-		RETURNING id, task_id, agent_id, branch, worktree_dir, base_branch, status,
-		          commit_sha, merge_sha, conflict_files, error_msg,
-		          enqueued_at, started_at, completed_at
-	`).Scan(
-		&e.ID, &e.TaskID, &e.AgentID, &e.Branch, &e.WorktreeDir, &e.BaseBranch, &e.Status,
-		&e.CommitSHA, &e.MergeSHA, &e.ConflictFiles, &e.ErrorMsg,
-		&e.EnqueuedAt, &e.StartedAt, &e.CompletedAt,
-	)
+		RETURNING `+mergeEntryCols))
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("claiming merge entry: %w", err)
 	}
+	e = *entry
 
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("committing merge claim: %w", err)
@@ -977,31 +991,100 @@ func BumpMergeUpAttempts(pool *pgxpool.Pool, id int64) (int, error) {
 	return attempts, nil
 }
 
+// BumpParkedMergeUpAttempts is the MAQ-42 parked-branch variant of
+// BumpMergeUpAttempts: same budget column, plus the conflicting file list —
+// parked tasks have no rebase probe to name the files, so the merge-up's
+// own discovery rides the bump, and COALESCE keeps earlier (richer) lists
+// when a later API-path attempt reports none. The entry is terminal, so no
+// status guard is needed — the drain/claim paths never touch it.
+func BumpParkedMergeUpAttempts(pool *pgxpool.Pool, id int64, files []string) (int, error) {
+	ctx := context.Background()
+	var attempts int
+	err := pool.QueryRow(ctx, `
+		UPDATE merge_queue
+		SET    mergeup_attempts = mergeup_attempts + 1,
+		       conflict_files   = COALESCE($2, conflict_files)
+		WHERE  id = $1
+		RETURNING mergeup_attempts
+	`, id, files).Scan(&attempts)
+	if err != nil {
+		return 0, fmt.Errorf("bumping parked merge-up attempts for entry %d: %w", id, err)
+	}
+	return attempts, nil
+}
+
+// LatestMergeEntryForTask returns the task's newest merge_queue entry of
+// any status (the task's merge ledger head), or nil if it has none.
+func LatestMergeEntryForTask(pool *pgxpool.Pool, taskID string) (*MergeQueueEntry, error) {
+	entry, err := scanMergeEntry(pool.QueryRow(context.Background(), `
+		SELECT `+mergeEntryCols+`
+		FROM   merge_queue
+		WHERE  task_id = $1
+		ORDER  BY id DESC
+		LIMIT  1
+	`, taskID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("reading merge ledger for %s: %w", taskID, err)
+	}
+	return entry, nil
+}
+
+// EnsureParkedMergeUpLedger returns the merge_queue entry anchoring a parked
+// task's auto merge-up budget (MAQ-42): the task's newest entry — terminal
+// rows keep their mergeup_attempts so a gate-parked conflict stays
+// exhausted — or, when the park never reached the merge gate (review
+// verdicts, watchdog caps: work done, PR open, no queue row ever), a
+// terminal 'conflict' row created on the spot so the budget, the branch and
+// the conflict-file list live in the same place the gate path keeps them
+// (and `maquinista resolve` can read the files). Returns nil when a
+// concurrent path inserted a live entry mid-check — the caller skips and
+// re-reads next tick.
+func EnsureParkedMergeUpLedger(pool *pgxpool.Pool, taskID, branch, worktreeDir, baseBranch string) (*MergeQueueEntry, error) {
+	entry, err := LatestMergeEntryForTask(pool, taskID)
+	if err != nil {
+		return nil, err
+	}
+	if entry != nil {
+		return entry, nil
+	}
+	entry, err = scanMergeEntry(pool.QueryRow(context.Background(), `
+		INSERT INTO merge_queue (task_id, agent_id, branch, worktree_dir, base_branch, status, completed_at)
+		SELECT $1, 'merger', $2, $3, $4, 'conflict', NOW()
+		WHERE  NOT EXISTS (
+		       SELECT 1 FROM merge_queue
+		       WHERE  task_id = $1 AND status IN ('pending', 'merging'))
+		RETURNING `+mergeEntryCols,
+		taskID, branch, worktreeDir, baseBranch))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil // raced a live entry — not ours to ledger
+	}
+	if err != nil {
+		return nil, fmt.Errorf("creating merge ledger for %s: %w", taskID, err)
+	}
+	return entry, nil
+}
+
 // GetPendingMergeEntryByTask returns the oldest pending merge queue entry for
 // a task, or nil if none is queued.
 func GetPendingMergeEntryByTask(pool *pgxpool.Pool, taskID string) (*MergeQueueEntry, error) {
 	ctx := context.Background()
-	var e MergeQueueEntry
-	err := pool.QueryRow(ctx, `
-		SELECT id, task_id, agent_id, branch, worktree_dir, base_branch, status,
-		       commit_sha, merge_sha, conflict_files, error_msg,
-		       enqueued_at, started_at, completed_at
+	entry, err := scanMergeEntry(pool.QueryRow(ctx, `
+		SELECT `+mergeEntryCols+`
 		FROM   merge_queue
 		WHERE  task_id = $1 AND status = 'pending'
 		ORDER  BY enqueued_at ASC
 		LIMIT  1
-	`, taskID).Scan(
-		&e.ID, &e.TaskID, &e.AgentID, &e.Branch, &e.WorktreeDir, &e.BaseBranch, &e.Status,
-		&e.CommitSHA, &e.MergeSHA, &e.ConflictFiles, &e.ErrorMsg,
-		&e.EnqueuedAt, &e.StartedAt, &e.CompletedAt,
-	)
+	`, taskID))
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("getting pending merge entry for %s: %w", taskID, err)
 	}
-	return &e, nil
+	return entry, nil
 }
 
 // ClaimMergeEntryByID claims a specific merge queue entry (status →
@@ -1009,34 +1092,25 @@ func GetPendingMergeEntryByTask(pool *pgxpool.Pool, taskID string) (*MergeQueueE
 // Returns nil if the entry is no longer pending.
 func ClaimMergeEntryByID(pool *pgxpool.Pool, id int64) (*MergeQueueEntry, error) {
 	ctx := context.Background()
-	var e MergeQueueEntry
-	err := pool.QueryRow(ctx, `
+	entry, err := scanMergeEntry(pool.QueryRow(ctx, `
 		UPDATE merge_queue
 		SET    status = 'merging', started_at = NOW()
 		WHERE  id = $1 AND status = 'pending'
-		RETURNING id, task_id, agent_id, branch, worktree_dir, base_branch, status,
-		          commit_sha, merge_sha, conflict_files, error_msg,
-		          enqueued_at, started_at, completed_at
-	`, id).Scan(
-		&e.ID, &e.TaskID, &e.AgentID, &e.Branch, &e.WorktreeDir, &e.BaseBranch, &e.Status,
-		&e.CommitSHA, &e.MergeSHA, &e.ConflictFiles, &e.ErrorMsg,
-		&e.EnqueuedAt, &e.StartedAt, &e.CompletedAt,
-	)
+		RETURNING `+mergeEntryCols,
+		id))
 	if err == pgx.ErrNoRows {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("claiming merge entry %d: %w", id, err)
 	}
-	return &e, nil
+	return entry, nil
 }
 
 // ListMergeQueue returns all merge queue entries, ordered by enqueue time.
 func ListMergeQueue(pool *pgxpool.Pool) ([]*MergeQueueEntry, error) {
 	rows, err := pool.Query(context.Background(), `
-		SELECT id, task_id, agent_id, branch, worktree_dir, base_branch, status,
-		       commit_sha, merge_sha, conflict_files, error_msg,
-		       enqueued_at, started_at, completed_at
+		SELECT `+mergeEntryCols+`
 		FROM merge_queue
 		ORDER BY enqueued_at ASC
 	`)
@@ -1047,15 +1121,11 @@ func ListMergeQueue(pool *pgxpool.Pool) ([]*MergeQueueEntry, error) {
 
 	var entries []*MergeQueueEntry
 	for rows.Next() {
-		var e MergeQueueEntry
-		if err := rows.Scan(
-			&e.ID, &e.TaskID, &e.AgentID, &e.Branch, &e.WorktreeDir, &e.BaseBranch, &e.Status,
-			&e.CommitSHA, &e.MergeSHA, &e.ConflictFiles, &e.ErrorMsg,
-			&e.EnqueuedAt, &e.StartedAt, &e.CompletedAt,
-		); err != nil {
+		e, err := scanMergeEntry(rows)
+		if err != nil {
 			return nil, fmt.Errorf("scanning merge entry: %w", err)
 		}
-		entries = append(entries, &e)
+		entries = append(entries, e)
 	}
 	return entries, rows.Err()
 }

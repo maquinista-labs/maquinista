@@ -277,6 +277,9 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := mergeEnqueuePass(ctx, pool); err != nil {
 			log.Printf("pipeline: dispatch: merge enqueue pass: %v", err)
 		}
+		if err := parkedMergeUpPass(ctx, pool, cfg.Gh); err != nil {
+			log.Printf("pipeline: dispatch: parked merge-up pass: %v", err)
+		}
 	}
 }
 

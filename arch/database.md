@@ -47,7 +47,7 @@ All consumers use `LISTEN` + a poll fallback (10 s) so a missed `NOTIFY`
 | `tasks` | Orchestrator task graph |
 | `ticket_issue_map` | Ticket issue ↔ task mirror; the row is the bridge claim |
 | `ticket_comment_log` | Consumed ticket-comment ids (comment-verb exactly-once) |
-| `merge_queue` | One row per merge attempt (pending → merging → merged\|conflict\|failed) |
+| `merge_queue` | One row per merge attempt (pending → merging → merged\|conflict\|failed); terminal `conflict` rows also ledger parked tasks' merge-up budgets (MAQ-42) |
 | `job_registry` | Scheduled jobs (cron + hooks) |
 | `soul_templates` | Reusable soul templates |
 
