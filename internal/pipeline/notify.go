@@ -249,8 +249,11 @@ func RoleHuman(role, agentID string) string {
 // summary: approve is the merge proposal, request_changes notes the fixer
 // round, needs_human / round-cap are the questions. A task with a PR gets
 // the link on every verdict (MAQ-10). Verdicts landed before EX-06 never
-// re-notify: the emission sits inside the guarded transition.
-func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdict, landed string, round, maxRounds int) {
+// re-notify: the emission sits inside the guarded transition. The two arms
+// that park pending_approval (round cap, needs_human) also fan out to the
+// PR + ticket issue (MAQ-34) — fan is the parkFanout built from the
+// dispatch config; its zero value degrades to the Telegram note alone.
+func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, fan parkFanout, taskID, title, verdict, landed string, round, maxRounds int) {
 	// MAQ-37: the headline is always the canonical `[MAQ-n] <title>` —
 	// the raw title the reviewers query carried is only a fallback for a
 	// task row that vanished mid-pass (better a title than a short id).
@@ -268,6 +271,10 @@ func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdi
 		notifyTaskf(ctx, pool, taskID,
 			"🆘 %s: review hit its round cap (%d rounds without an approval) — parked for you. Decide: reply `approve` or `reject` here, comment the same on the ticket issue, or run `maquinista approve %s` / `maquinista reject %s`.",
 			label, maxRounds, short, short)
+		// MAQ-34: the park also comments the PR + ticket issue (exactly once
+		// per park episode); the summary is the site's wording — the
+		// approval-path block is appended inside the fan-out.
+		fan.notify(ctx, pool, taskID, fmt.Sprintf("Review hit its round cap (%d rounds without an approval) — parked needs-human.", maxRounds))
 	case verdict == VerdictApprove:
 		notifyTaskf(ctx, pool, taskID,
 			"✅ %s: review approved (round %d) — queued for merge. To merge now: reply `approve` here, or comment `approve` on the ticket issue (link below).",
@@ -280,5 +287,7 @@ func notifyVerdict(ctx context.Context, pool *pgxpool.Pool, taskID, title, verdi
 		notifyTaskf(ctx, pool, taskID,
 			"🆘 %s: the reviewer escalated — needs your call. Reply `approve` (merge as-is) or `reject` here, or comment the same on the ticket issue (link below).",
 			label)
+		// MAQ-34: the PR + ticket issue learn about the escalation too.
+		fan.notify(ctx, pool, taskID, "Reviewer escalated — human decision needed.")
 	}
 }

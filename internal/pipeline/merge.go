@@ -357,6 +357,8 @@ func RunMergeDrain(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pro
 // returns nil; only infrastructure errors return an error.
 func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, prov TicketProvider, teamID string, entry *db.MergeQueueEntry) error {
 	taskID := entry.TaskID
+	// MAQ-34: one fan-out instance serves every park/failure arm below.
+	fan := parkFanout{gh: ghPoster(cfg.Gh), prov: prov}
 
 	// Human gate: without auto-merge the entry waits for the approve verb.
 	if !cfg.AutoMerge {
@@ -409,10 +411,10 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		// Bad/unset PR URL: the work is done but the merge machinery
 		// cannot run — record failed so the queue shows it instead of
 		// wedging the entry in 'merging'.
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("cannot resolve PR: %v", err))
+		return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("cannot resolve PR: %v", err))
 	}
 	if info.WorktreePath == "" {
-		return failMerge(ctx, pool, entry.ID, taskID, "task has no worktree to merge from")
+		return failMerge(ctx, pool, fan, entry.ID, taskID, "task has no worktree to merge from")
 	}
 	wt := info.WorktreePath
 
@@ -428,7 +430,7 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 		base = entry.BaseBranch
 	}
 	if err := git.Fetch(wt, "origin"); err != nil {
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("git fetch failed: %v", err))
+		return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("git fetch failed: %v", err))
 	}
 	// Up-to-date fast path (MAQ-26): the remote branch already contains the
 	// base — a prior pass's clean rebase-push, or an auto merge-up waiting
@@ -440,24 +442,24 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 	// fast-path on — the rebase leg runs and the push creates the ref.
 	upToDate := false
 	if exists, err := git.RefExists(wt, "origin/"+entry.Branch); err != nil {
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("mergeability check failed: %v", err))
+		return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("mergeability check failed: %v", err))
 	} else if exists {
 		upToDate, err = git.IsAncestor(wt, "origin/"+base, "origin/"+entry.Branch)
 		if err != nil {
-			return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("mergeability check failed: %v", err))
+			return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("mergeability check failed: %v", err))
 		}
 	}
 	if !upToDate {
 		if _, err := git.Rebase(wt, "origin/"+base); err != nil {
 			conflictErr, ok := err.(*git.ConflictError)
 			if !ok {
-				return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("rebase onto %s failed: %v", base, err))
+				return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("rebase onto %s failed: %v", base, err))
 			}
 			// MAQ-15: under PIPELINE_MERGE_AGENT the conflict arms a merger
 			// episode (marker + released entry; the dispatch loop spawns the
 			// agent) instead of parking needs-human immediately.
 			if cfg.MergeAgent {
-				return armMergeConflictAgent(ctx, pool, cfg, entry, base, conflictErr)
+				return armMergeConflictAgent(ctx, pool, cfg, fan, entry, base, conflictErr)
 			}
 			// MAQ-26: otherwise attempt an automatic merge-up before any
 			// human gets pinged — a stale branch that merges cleanly heals
@@ -467,12 +469,12 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 
 		// 2. Publish the rebased branch (lease-guarded force push).
 		if err := git.PushForceWithLease(wt, entry.Branch, "origin"); err != nil {
-			return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("push failed: %v", err))
+			return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("push failed: %v", err))
 		}
 	}
 
 	// 3–7. Gates, squash, bookkeeping, cleanup.
-	return finishMergeGH(ctx, pool, cfg, prov, teamID, entry, info, wt, base, pr)
+	return finishMergeGH(ctx, pool, cfg, fan, prov, teamID, entry, info, wt, base, pr)
 }
 
 // finishMergeGH runs steps 3–7 of the gh merge flow (CI gate → build gate →
@@ -482,13 +484,13 @@ func ProcessMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pr
 // ref. Every git read targets origin/<branch> — the remote state — never
 // the task worktree copy, which the merge-up path deliberately leaves
 // untouched (a fixer may be working there).
-func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, prov TicketProvider, teamID string, entry *db.MergeQueueEntry, info *taskMergeInfo, wt, base string, pr int) error {
+func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, fan parkFanout, prov TicketProvider, teamID string, entry *db.MergeQueueEntry, info *taskMergeInfo, wt, base string, pr int) error {
 	taskID := entry.TaskID
 
 	// 3. CI gate: pending → release for a later pass; failed → park needs-human.
 	checks, err := cfg.Gh.PRChecks(ctx, pr)
 	if err != nil {
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("gh pr checks failed: %v", err))
+		return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("gh pr checks failed: %v", err))
 	}
 	// Normalize the cap: struct-literal callers (tests, RunMergeOnApprove)
 	// leave MaxAttempts at the zero value, which must mean the default —
@@ -546,6 +548,9 @@ func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pro
 			fmt.Sprintf("CI failed %d times on PR #%d — parked needs-human.", attempts, pr))
 		notifyTaskf(ctx, pool, taskID, "🆘 %s: CI failed %d times on PR #%d — parked for you. Fix and re-push, then approve to retry the merge (reply `approve` here, comment `approve` on the ticket issue, or run `maquinista approve %s`).",
 			taskTitle(ctx, pool, taskID), attempts, pr, shortTaskID(taskID))
+		// MAQ-34: the park also comments the PR + ticket issue (exactly once
+		// per park episode).
+		fan.notify(ctx, pool, taskID, fmt.Sprintf("CI failed %d times on PR #%d — the merge is parked until it passes.", attempts, pr))
 		log.Printf("pipeline: merge %s CI failed %d times on PR #%d — parked needs-human", taskID, attempts, pr)
 		return nil
 	default:
@@ -563,15 +568,15 @@ func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pro
 	// so the gate never builds a stale tree.
 	passed, gateStep, gateCmd, gateOut, err := runMergeGate(ctx, wt, "origin/"+entry.Branch, "origin/"+base)
 	if err != nil {
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("%s gate could not run: %v", gateStep, err))
+		return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("%s gate could not run: %v", gateStep, err))
 	}
 	if !passed {
-		return parkGateFailure(ctx, pool, taskID, entry, gateStep, gateCmd, gateOut)
+		return parkGateFailure(ctx, pool, fan, taskID, entry, gateStep, gateCmd, gateOut)
 	}
 
 	// 4. Squash-merge on the remote.
 	if err := cfg.Gh.PRMergeSquash(ctx, pr); err != nil {
-		return failMerge(ctx, pool, entry.ID, taskID, fmt.Sprintf("gh pr merge failed: %v", err))
+		return failMerge(ctx, pool, fan, entry.ID, taskID, fmt.Sprintf("gh pr merge failed: %v", err))
 	}
 
 	// 5. Record the squash commit SHA (the merged tip of the default branch).
@@ -632,8 +637,8 @@ func finishMergeGH(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, pro
 
 // parkMergeConflict records a rebase conflict: queue entry → conflict, task
 // → pending_approval (a human untangles conflicts), observation with the
-// conflicting files.
-func parkMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID string, entry *db.MergeQueueEntry, conflictErr *git.ConflictError) error {
+// conflicting files, and the MAQ-34 fan-out to the PR + ticket issue.
+func parkMergeConflict(ctx context.Context, pool *pgxpool.Pool, fan parkFanout, taskID string, entry *db.MergeQueueEntry, conflictErr *git.ConflictError) error {
 	if err := db.ConflictMerge(pool, entry.ID, conflictErr.Files); err != nil {
 		return fmt.Errorf("pipeline: recording conflict %d: %w", entry.ID, err)
 	}
@@ -652,6 +657,7 @@ func parkMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID string, e
 	// merger-agent resolution stays deferred; the plan records why.)
 	notifyTaskf(ctx, pool, taskID, "🆘 %s: the merge hit rebase conflicts on branch %s. Conflicting files:\n%s\nParked for you — resolve by hand, or re-approve to send a merge agent.",
 		taskTitle(ctx, pool, taskID), entry.Branch, strings.Join(conflictErr.Files, "\n"))
+	fan.notify(ctx, pool, taskID, fmt.Sprintf("Rebase conflict on branch %s. Conflicting files:\n%s", entry.Branch, strings.Join(conflictErr.Files, "\n")))
 	log.Printf("pipeline: merge %s conflict: %v", taskID, conflictErr)
 	return nil
 }
@@ -659,13 +665,20 @@ func parkMergeConflict(ctx context.Context, pool *pgxpool.Pool, taskID string, e
 // failMerge records an infrastructure failure on the queue entry and leaves
 // the task in ready_to_merge (the work is done; only the merge machinery
 // failed, so a retry can succeed). The entry is terminal — the queue will
-// NOT retry it — so a human gets a note (EX-06); re-approving re-enqueues.
-func failMerge(ctx context.Context, pool *pgxpool.Pool, entryID int64, taskID, msg string) error {
+// NOT retry it — so a human gets a note (EX-06) plus the MAQ-34 fan-out
+// (the PR + issue learn the entry failed and how to re-enqueue); re-approving re-enqueues.
+func failMerge(ctx context.Context, pool *pgxpool.Pool, fan parkFanout, entryID int64, taskID, msg string) error {
 	if err := db.FailMerge(pool, entryID, msg); err != nil {
 		return fmt.Errorf("pipeline: failing merge %d: %w", entryID, err)
 	}
+	// The failure observation is also the MAQ-34 fan-out's episode anchor:
+	// each failed entry moves it, so every failure comments once and a
+	// re-approve + fresh failure comments again (unlike the parks, the task
+	// never left ready_to_merge — nothing else moves the anchor here).
+	db.AddObservation(pool, taskID, "merger", fmt.Sprintf("Merge failed: %s (entry %d terminal — re-approve to re-enqueue).", msg, entryID))
 	notifyTaskf(ctx, pool, taskID, "⚠️ %s: the merge machinery failed — %s. The work is safe. Approve again to retry the merge: reply `approve %s` here or comment `approve` on the ticket issue.",
 		taskTitle(ctx, pool, taskID), msg, shortTaskID(taskID))
+	fan.notify(ctx, pool, taskID, fmt.Sprintf("Merge failed — %s. The queue entry is failed; re-approve to re-enqueue the merge.", msg))
 	log.Printf("pipeline: merge %s failed: %s", taskID, msg)
 	return nil
 }

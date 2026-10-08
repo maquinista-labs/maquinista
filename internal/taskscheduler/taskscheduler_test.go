@@ -633,7 +633,7 @@ func TestParkUnspawnable_GraceAndOnce(t *testing.T) {
 	// Old claimed task WITH worktree → has nothing to do with this pass.
 	pool.Exec(ctx, `INSERT INTO tasks (id, title, status, claimed_at, worktree_path) VALUES ('WT', 'x', 'claimed', NOW() - interval '20 minutes', $1)`, t.TempDir())
 
-	parked, err := ParkUnspawnable(ctx, pool, 10*time.Minute)
+	parked, err := ParkUnspawnable(ctx, pool, 10*time.Minute, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -655,7 +655,7 @@ func TestParkUnspawnable_GraceAndOnce(t *testing.T) {
 	}
 
 	// Exactly once: second pass finds nothing to park.
-	if parked, _ := ParkUnspawnable(ctx, pool, 10*time.Minute); parked != 0 {
+	if parked, _ := ParkUnspawnable(ctx, pool, 10*time.Minute, nil); parked != 0 {
 		t.Errorf("second pass parked=%d, want 0", parked)
 	}
 }

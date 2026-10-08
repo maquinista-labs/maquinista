@@ -137,6 +137,10 @@ type DispatchConfig struct {
 	// and reading human PR comments into the next round's prompt. nil
 	// disables both (flows skip silently — GitHub stays optional).
 	Gh GhRunner
+	// Prov is the ticket provider the MAQ-34 park fan-out comments the
+	// mapped issue through (nil — or a provider without IssueCommenter —
+	// degrades to the Telegram + PR surfaces only).
+	Prov TicketProvider
 }
 
 // DefaultImplementorIdleAfter is the MAQ-14 self-heal bound: an implementor
@@ -236,6 +240,8 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 	if cfg.ImplementorIdleAfter <= 0 {
 		cfg.ImplementorIdleAfter = DefaultImplementorIdleAfter
 	}
+	// MAQ-34: one fan-out instance serves every park arm of the loop.
+	fan := parkFanout{gh: ghPoster(cfg.Gh), prov: cfg.Prov}
 	ticker := time.NewTicker(cfg.Interval)
 	defer ticker.Stop()
 	for {
@@ -250,26 +256,35 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := promptPass(ctx, pool, cfg.Gh); err != nil {
 			log.Printf("pipeline: dispatch: prompt pass: %v", err)
 		}
-		if err := verdictPass(ctx, pool, cfg.Gh, cfg.MaxReviewRounds, cfg.SessionName, killWindow); err != nil {
+		// ADR-0008 F3: one-shot completion nudges for review legs — runs
+		// before the verdict pass so a turn-ended reviewer is re-prompted
+		// within one tick of the signal landing.
+		if err := nudgePass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace); err != nil {
+			log.Printf("pipeline: dispatch: nudge pass: %v", err)
+		}
+		if err := verdictPass(ctx, pool, cfg.Gh, fan, cfg.MaxReviewRounds, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: verdict pass: %v", err)
 		}
 		if err := fixerPass(ctx, pool, cfg.Gh, spawn, cfg.ImplementorIdleAfter); err != nil {
 			log.Printf("pipeline: dispatch: fixer pass: %v", err)
 		}
-		if err := mergerPass(ctx, pool, spawn); err != nil {
+		if err := mergerPass(ctx, pool, spawn, fan); err != nil {
 			log.Printf("pipeline: dispatch: merger spawn pass: %v", err)
 		}
-		if err := mergerVerdictPass(ctx, pool, cfg.SessionName, killWindow); err != nil {
+		if err := mergerVerdictPass(ctx, pool, cfg.SessionName, killWindow, fan); err != nil {
 			log.Printf("pipeline: dispatch: merger verdict pass: %v", err)
 		}
-		if err := mergerWatchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.SessionName, killWindow); err != nil {
+		if err := mergerWatchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.SessionName, killWindow, fan); err != nil {
 			log.Printf("pipeline: dispatch: merger watchdog pass: %v", err)
 		}
-		if err := watchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.RespawnCap, cfg.SessionName, killWindow); err != nil {
+		if err := watchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.RespawnCap, cfg.SessionName, killWindow, fan); err != nil {
 			log.Printf("pipeline: dispatch: watchdog pass: %v", err)
 		}
 		if err := mergeEnqueuePass(ctx, pool); err != nil {
 			log.Printf("pipeline: dispatch: merge enqueue pass: %v", err)
+		}
+		if err := parkedMergeUpPass(ctx, pool, cfg.Gh); err != nil {
+			log.Printf("pipeline: dispatch: parked merge-up pass: %v", err)
 		}
 	}
 }
@@ -705,9 +720,12 @@ func enqueueReviewPrompt(ctx context.Context, pool *pgxpool.Pool, g GhRunner, ag
 }
 
 // liveReviewersSQL drives both the verdict pass and the watchdog: live
-// reviewer agents on pipeline tasks still in 'review'.
+// reviewer agents on pipeline tasks still in 'review'. The trailing cause
+// expression is the ADR-0008 freeze classification — only the watchdog
+// reads it; verdictPass scans past it.
 const liveReviewersSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds,
+       ` + FreezeCauseSelectSQL + `
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE a.role = '` + reviewerRole + `'
@@ -715,7 +733,7 @@ WHERE a.role = '` + reviewerRole + `'
   AND t.status = 'review'
   AND t.metadata->>'ticket_issue_id' IS NOT NULL`
 
-func verdictPass(ctx context.Context, pool *pgxpool.Pool, g GhRunner, maxRounds int, sessionName string, killWindow func(session, windowID string) error) error {
+func verdictPass(ctx context.Context, pool *pgxpool.Pool, g GhRunner, fan parkFanout, maxRounds int, sessionName string, killWindow func(session, windowID string) error) error {
 	var reviewers []liveReviewer
 	if err := scanReviewers(ctx, pool, liveReviewersSQL, nil, &reviewers); err != nil {
 		return err
@@ -755,7 +773,7 @@ func verdictPass(ctx context.Context, pool *pgxpool.Pool, g GhRunner, maxRounds 
 		// EX-06: the verdict summary IS the merge proposal (approve) or
 		// the needs-human question — emitted inside the applied
 		// transition, so exactly once per verdict.
-		notifyVerdict(ctx, pool, r.taskID, r.taskTitle, verdict, landed, r.round, maxRounds)
+		notifyVerdict(ctx, pool, fan, r.taskID, r.taskTitle, verdict, landed, r.round, maxRounds)
 		killReviewerPane(sessionName, r.session, r.window, killWindow)
 	}
 	return nil
@@ -847,17 +865,21 @@ func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verd
 }
 
 // liveReviewer is one live reviewer/fixer pane on a pipeline task. The
-// title/round columns feed the EX-06 Pipeline-topic summaries.
+// title/round columns feed the EX-06 Pipeline-topic summaries; cause is
+// the ADR-0008 freeze classification (empty outside the watchdog).
 type liveReviewer struct {
 	agentID, session, window, taskID string
-	taskTitle                        string
-	round                            int
+	taskTitle                       string
+	round                           int
+	cause                           string
 }
 
 // liveFixersSQL drives the fixer watchdog arm: live fixer agents on
-// pipeline tasks still in changes_requested.
+// pipeline tasks still in changes_requested. Same trailing cause
+// expression as liveReviewersSQL (ADR-0008 watchdog classification).
 const liveFixersSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds,
+       ` + FreezeCauseSelectSQL + `
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE a.role = '` + fixerRole + `'
@@ -1142,7 +1164,7 @@ func scanReviewers(ctx context.Context, pool *pgxpool.Pool, sql string, args []a
 	defer rows.Close()
 	for rows.Next() {
 		var r liveReviewer
-		if err := rows.Scan(&r.agentID, &r.session, &r.window, &r.taskID, &r.taskTitle, &r.round); err != nil {
+		if err := rows.Scan(&r.agentID, &r.session, &r.window, &r.taskID, &r.taskTitle, &r.round, &r.cause); err != nil {
 			return err
 		}
 		*out = append(*out, r)

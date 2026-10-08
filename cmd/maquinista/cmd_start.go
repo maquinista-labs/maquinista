@@ -19,6 +19,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/db"
 	"github.com/maquinista-labs/maquinista/internal/dispatcher"
 	"github.com/maquinista-labs/maquinista/internal/gh"
+	"github.com/maquinista-labs/maquinista/internal/git"
 	"github.com/maquinista-labs/maquinista/internal/inboxecho"
 	"github.com/maquinista-labs/maquinista/internal/jobreg"
 	"github.com/maquinista-labs/maquinista/internal/listener"
@@ -537,13 +538,24 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		})
 	}
 	if tCfg := pipeline.FromEnv(); tCfg.Enabled() && pool != nil {
+		// Ticket provider (ADR-0006): board sync, comment approvals and the
+		// MAQ-34 park fan-out share one instance (client construction only —
+		// no I/O here). A failed NewProvider degrades those surfaces, never
+		// the pipeline itself.
+		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
+		if perr != nil {
+			log.Printf("pipeline: %v", perr)
+			prov = nil
+		}
 		// Review dispatch (EX-03): spawn zero-author reviewers for pipeline
 		// tasks in 'review', parse verdicts, transition tasks. Needs no
-		// provider — runs even if NewProvider fails below.
+		// provider — runs even if NewProvider failed above (the MAQ-34
+		// park fan-out degrades to the PR surface only).
 		go func() {
 			spawner := pipelineReviewerSpawner{pool: pool, cfg: cfg, sidecars: sidecarMgr}
 			dcfg := pipeline.DispatchConfigFromEnv(cfg.TmuxSessionName)
 			dcfg.Gh = gh.New() // MAQ-16: verdict comments + human-comment reads on PRs
+			dcfg.Prov = prov   // MAQ-34: park fan-out comments the mapped issue
 			pipeline.RunDispatch(ctx, pool, dcfg, spawner, tmux.KillWindow)
 		}()
 
@@ -560,6 +572,19 @@ func runOrchestratorSupervised(ctx context.Context) error {
 				// existed for the retired id (name-based probe — panes are
 				// created -n <agentID>, and agent ids are never reused).
 				PaneExists: tmux.WindowNameExists,
+				// ADR-0008: silent-success freeze retires consult the
+				// artifacts question (open PR + branch current) before
+				// requeueing vs straight-to-review. Conservative probe:
+				// git errors read as "not up to date" and never misroute
+				// a half-done branch.
+				BranchUpToDate: func(worktree string) bool {
+					return git.BranchUpToDate(worktree, "main")
+				},
+				// MAQ-34: needs-human parks fan out to the PR + ticket issue
+				// (same gh + provider instances as the dispatch loop).
+				ParkFanout: func(ctx context.Context, taskID, summary string) {
+					pipeline.NotifyParkFanout(ctx, pool, gh.New(), prov, taskID, summary)
+				},
 				// Restart-cohort sweep grace derives from the monitor's
 				// cadence: the sweep must not run before the monitor's first
 				// poll, or the boot-relative transcript veto is dead code.
@@ -570,10 +595,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 		}()
 		log.Println("task-scheduler: started")
 
-		prov, perr := pipeline.NewProvider(tCfg.Provider, tCfg.APIKey)
-		if perr != nil {
-			log.Printf("pipeline: %v", perr)
-		} else {
+		if prov != nil {
 			go func() {
 				if err := pipeline.RunBridge(ctx, pool, prov, tCfg); err != nil && ctx.Err() == nil {
 					log.Printf("pipeline: bridge: %v", err)
@@ -642,7 +664,7 @@ func runOrchestratorSupervised(ctx context.Context) error {
 }
 
 // runDashboardAgentReconcile periodically scans for dashboard-spawned
-// agents (status='stopped', tmux_window='') and provisions their tmux
+// agents (status='stopped', tmux_window=”) and provisions their tmux
 // panes. After each reconcile pass it syncs the sidecar manager so that
 // newly-online agents get their own inbox goroutine within the same tick.
 // Runs as a background goroutine; terminates on ctx cancel.

@@ -91,7 +91,19 @@ origin delivery.
    Independently of assistant text, the tailer also records raw transcript
    growth (any offset advance) as `agents.last_transcript_at` (throttled,
    MAQ-9) — liveness for the pipeline watchdog, which must not read a
-   mid-command agent's outbox silence as stalled.
+   mid-command agent's outbox silence as stalled. And when a batch ends on
+   an assistant text message — the transcript tail closing the turn — it
+   records the sticky `agents.last_turn_end_at` (ADR-0008): the completion
+   signal the pipeline's one-shot nudge legs and the freeze-cause
+   classifier consume (see pipeline.md §Watchdog, turn-end completion
+   contract).
+
+   The same growth tick also inspects the transcript tail for a TURN END
+   (assistant message with no pending tool call) on live pipeline agents
+   (ADR-0008 F1, MAQ-43): shadow mode — one structured journal line per
+   detection plus a boot-cumulative incidence count, no outbox row, no DB
+   write, no pipeline action. F2 turns the signal into the completion
+   nudge + cause-aware freeze ledger.
 
 4. **Relay** — `maquinista relay` daemon wakes, claims the outbox row,
    runs `fanoutDeliveries`:

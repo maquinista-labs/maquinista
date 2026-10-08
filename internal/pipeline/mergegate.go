@@ -430,7 +430,7 @@ func gateEnv() []string {
 // fixer needs no worktree spelunking — the build leg's first lines (the
 // compiler reports the first error first) or the test leg's last lines
 // (--- FAIL blocks print at the end).
-func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, entry *db.MergeQueueEntry, step, gateCmd, output string) error {
+func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, fan parkFanout, taskID string, entry *db.MergeQueueEntry, step, gateCmd, output string) error {
 	cause, outLabel, stepHead := "does not compile",
 		fmt.Sprintf("Compiler output (first %d lines)", maxBuildErrLines), "Build"
 	if step == testGateStep {
@@ -473,6 +473,11 @@ func parkGateFailure(ctx context.Context, pool *pgxpool.Pool, taskID string, ent
 	}
 	notifyTaskf(ctx, pool, taskID, "🆘 %s: the %s gate failed on branch %s — `%s` %s. %s:\n%s\n%s",
 		taskTitle(ctx, pool, taskID), step, entry.Branch, gateCmd, cause, outLabel, output, next)
+	if landed == "pending_approval" {
+		// MAQ-34: the runaway park fans out to the PR + ticket issue
+		// (failures 1..N-1 route back to the fixer — no fan-out there).
+		fan.notify(ctx, pool, taskID, fmt.Sprintf("%s gate failed on branch %s after %d gate failure(s) — parked until a human decides.", step, entry.Branch, failed))
+	}
 	log.Printf("pipeline: merge %s %s gate failed on branch %s → %s", taskID, step, entry.Branch, landed)
 	return nil
 }

@@ -306,7 +306,7 @@ func TestFixerWatchdog_FrozenReArms(t *testing.T) {
 		VALUES ('f9', 'fixer-f9', 'fix', 'round 1')
 	`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "f9", "status"); got != "changes_requested" {
@@ -345,7 +345,7 @@ func TestFixerWatchdog_TranscriptGrowthKeepsAlive(t *testing.T) {
 		                   last_transcript_at = NOW() - interval '5 minutes'
 		WHERE id='fixer-fb'`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "fb", "status"); got != "changes_requested" {
@@ -364,7 +364,7 @@ func TestFixerWatchdog_InsideTimeoutUntouched(t *testing.T) {
 		VALUES ('fixer-fa', '{"text":"fixing finding 1"}'::jsonb)
 	`)
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "fa", "status"); got != "changes_requested" {
@@ -389,13 +389,13 @@ func TestFixerWatchdog_RespawnCapParks(t *testing.T) {
 	`)
 	for i := 0; i < 3; i++ {
 		execOK(t, pool, `
-			INSERT INTO task_context (task_id, agent_id, kind, content)
+			INSERT INTO task_context (task_id, agent_id, kind, content, cause)
 			VALUES ('fc', 'fixer-fc', 'observation',
-			        'watchdog: fixer frozen (round 1) — no outbox activity; auto-retired')
+			        'watchdog: fixer frozen (round 1) — no outbox activity; auto-retired', 'true_freeze')
 		`)
 	}
 
-	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil); err != nil {
+	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {
 		t.Fatalf("watchdogPass: %v", err)
 	}
 	if got := taskCol(t, pool, "fc", "status"); got != "pending_approval" {

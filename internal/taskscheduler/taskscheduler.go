@@ -46,12 +46,24 @@ type Config struct {
 	// KillWindow is best-effort pane cleanup on freeze retires (MAQ-31;
 	// tmux.KillWindow-shaped). nil skips it — the row still retires.
 	KillWindow func(session, windowID string) error
+	// ParkFanout fans a needs-human park out beyond the Pipeline topic
+	// (MAQ-34): the cmd layer wires it to pipeline.NotifyParkFanout with
+	// gh + provider, so the PR and the mapped ticket issue learn the task
+	// is parked and how to approve. nil skips the fan-out (tests).
+	ParkFanout func(ctx context.Context, taskID, summary string)
 	// PaneExists probes whether a tmux pane exists for an agent id
 	// (tmux.WindowNameExists-shaped, name-based — MAQ-38 AC 2). The
 	// implementor freeze arm rides the answer on every retire note so a
 	// freeze with a live pane (the stale-id starvation signature) is
 	// diagnosable from the 🆘 alone. nil → notes say "unknown".
 	PaneExists func(session, name string) bool
+	// BranchUpToDate probes the silent-success artifacts question
+	// (ADR-0008): is the task worktree's branch clean and current with
+	// base? The freeze arm consults it when retiring a silent success —
+	// open PR + branch current sends the task straight to review instead
+	// of respawning. git.BranchUpToDate in production; nil → never
+	// straight-to-review (plain requeue, still no budget burned).
+	BranchUpToDate func(worktree string) bool
 	// MonitorPollInterval mirrors config.Config.MonitorPollInterval (the
 	// transcript monitor's poll cadence, MONITOR_POLL_INTERVAL). The
 	// restart-cohort sweep defers until a few intervals after boot so the
@@ -149,7 +161,7 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		// MAQ-13 backstop: claimed tasks with no worktree_path and no live
 		// agent are unspawnable forever (the scheduler only claims 'ready'
 		// rows, so nothing revisits them). Park past grace, exactly once.
-		if parked, perr := ParkUnspawnable(ctx, pool, cfg.ParkGrace); perr != nil {
+		if parked, perr := ParkUnspawnable(ctx, pool, cfg.ParkGrace, cfg.ParkFanout); perr != nil {
 			log.Printf("taskscheduler: park unspawnable: %v", perr)
 		} else if parked > 0 {
 			log.Printf("taskscheduler: parked %d unspawnable claimed task(s) needs-human", parked)
@@ -163,11 +175,22 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		} else if healed > 0 {
 			log.Printf("taskscheduler: healed %d task(s) with missing inbox prompt", healed)
 		}
+		// ADR-0008 F2: one-shot completion nudges for turn-ended implementor
+		// rounds — BEFORE the freeze arm, which excludes nudged-fresh agents
+		// from its candidates (the arms are disjoint by predicate; at the
+		// boundary the nudge gets one tick to land before the retire).
+		if nudged, nerr := NudgeTurnEndedClaims(ctx, pool, idleAfter, spawnGrace); nerr != nil {
+			log.Printf("taskscheduler: nudge turn-ended claims: %v", nerr)
+		} else if nudged > 0 {
+			log.Printf("taskscheduler: nudged %d turn-ended implementor(s)", nudged)
+		}
 		// MAQ-31: retire implementor-phase freezes (claimed tasks whose live
 		// agent row went silent past the freeze bounds) BEFORE the reaper —
 		// the retire is what lets the reaper's all-rows-non-live check pass
-		// on the next line, same wake.
-		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, respawnCap, cfg.SessionName, cfg.KillWindow, cfg.PaneExists); ferr != nil {
+		// on the next line, same wake. ADR-0008: silent successes (turn end
+		// observed) retire without burning respawn budget; true freezes
+		// keep the cap/park circuit.
+		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, respawnCap, cfg.SessionName, cfg.KillWindow, cfg.PaneExists, cfg.BranchUpToDate); ferr != nil {
 			log.Printf("taskscheduler: retire frozen claims: %v", ferr)
 		} else if retired > 0 {
 			log.Printf("taskscheduler: retired %d frozen claim agent(s)", retired)
@@ -351,6 +374,9 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 		log.Printf("taskscheduler: task %s parked needs-human: no worktree_path (implementor can never spawn)", taskID)
 		pipeline.NotifyTaskf(ctx, pool, taskID, "🆘 %s: no worktree_path — cannot spawn an implementor. Parked needs-human. Provision the worktree, set tasks.worktree_path, flip the task back to 'ready'.",
 			pipeline.TaskTitle(ctx, pool, taskID))
+		if cfg.ParkFanout != nil {
+			cfg.ParkFanout(ctx, taskID, "No worktree_path — cannot spawn an implementor. Provision the worktree, set tasks.worktree_path, flip the task back to 'ready'.")
+		}
 		return true, nil
 	}
 
