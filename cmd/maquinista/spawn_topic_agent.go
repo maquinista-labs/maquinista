@@ -15,6 +15,7 @@ import (
 	"github.com/maquinista-labs/maquinista/internal/agentspawn"
 	"github.com/maquinista-labs/maquinista/internal/config"
 	"github.com/maquinista-labs/maquinista/internal/memory"
+	"github.com/maquinista-labs/maquinista/internal/routing"
 	"github.com/maquinista-labs/maquinista/internal/soul"
 	"github.com/maquinista-labs/maquinista/internal/state"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
@@ -102,6 +103,17 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		cwd := defaultCWD
 		if cwd == "" {
 			return "", errors.New("spawn_topic_agent: no defaultCWD resolved")
+		}
+
+		// Per-user concurrent session cap (MAQ-46): before bringing a new
+		// pane up, reject when the user already runs the configured maximum
+		// of live agents. Checked after the reuse/spawning fast paths above,
+		// so messaging an existing topic is never blocked — only new panes.
+		// The incoming agentID is excluded from the count so respawning a
+		// stopped topic never counts itself.
+		if cerr := routing.CheckSessionCap(ctx, pool, userID, agentID, cfg.MaxAgentsPerUser); cerr != nil {
+			log.Printf("spawn_topic_agent: cap rejected %s for user %s: %v", agentID, userID, cerr)
+			return "", cerr
 		}
 
 		if err := tmux.EnsureSession(cfg.TmuxSessionName); err != nil {

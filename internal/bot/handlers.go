@@ -79,6 +79,13 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 	}
 	if err != nil {
 		log.Printf("routing.Resolve: %v", err)
+		// Session-cap rejections (MAQ-46) are written for humans — show the
+		// reason instead of the generic routing-failure line.
+		var capErr *routing.SessionCapError
+		if errors.As(err, &capErr) {
+			b.reply(chatID, getThreadID(msg), capErr.Error())
+			return
+		}
 		b.reply(chatID, getThreadID(msg), "Error: routing failed. Check server logs.")
 		return
 	}

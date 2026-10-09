@@ -13,6 +13,7 @@ func clearEnv() {
 		"MONITOR_POLL_INTERVAL", "DATABASE_URL",
 		"MAQUINISTA_DASHBOARD_LISTEN", "MAQUINISTA_DASHBOARD_AUTH",
 		"MAQUINISTA_DASHBOARD_THEME", "MAQUINISTA_DASHBOARD_NODE_BIN",
+		"MAQUINISTA_MAX_AGENTS_PER_USER",
 	} {
 		os.Unsetenv(key)
 	}
@@ -63,6 +64,50 @@ func TestLoad_Defaults(t *testing.T) {
 	if cfg.MonitorPollInterval != 2.0 {
 		t.Errorf("poll interval = %f, want 2.0", cfg.MonitorPollInterval)
 	}
+	if cfg.MaxAgentsPerUser != 2 {
+		t.Errorf("MaxAgentsPerUser = %d, want default 2", cfg.MaxAgentsPerUser)
+	}
+}
+
+func TestLoad_MaxAgentsPerUser(t *testing.T) {
+	t.Run("env override", func(t *testing.T) {
+		clearEnv()
+		tmpDir := t.TempDir()
+		os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
+		os.Setenv("ALLOWED_USERS", "1")
+		os.Setenv("MAQUINISTA_DIR", tmpDir)
+		os.Setenv("MAQUINISTA_MAX_AGENTS_PER_USER", "5")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cfg.MaxAgentsPerUser != 5 {
+			t.Errorf("MaxAgentsPerUser = %d, want 5", cfg.MaxAgentsPerUser)
+		}
+	})
+
+	t.Run("invalid value rejected", func(t *testing.T) {
+		for _, bad := range []string{"0", "-3", "two", ""} {
+			clearEnv()
+			tmpDir := t.TempDir()
+			os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
+			os.Setenv("ALLOWED_USERS", "1")
+			os.Setenv("MAQUINISTA_DIR", tmpDir)
+			if bad != "" {
+				os.Setenv("MAQUINISTA_MAX_AGENTS_PER_USER", bad)
+			}
+			_, err := Load()
+			if bad == "" {
+				if err != nil {
+					t.Errorf("unset var should keep default, got %v", err)
+				}
+				continue
+			}
+			if err == nil {
+				t.Errorf("MAQUINISTA_MAX_AGENTS_PER_USER=%q should fail", bad)
+			}
+		}
+	})
 }
 
 func TestLoad_AllowedGroups(t *testing.T) {

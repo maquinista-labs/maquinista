@@ -57,6 +57,66 @@ type SpawnFunc func(ctx context.Context, userID, threadID string, chatID *int64)
 // ErrRequirePicker means no tier resolved — caller must prompt the user.
 var ErrRequirePicker = errors.New("routing: no tier matched; show picker")
 
+// LiveStatuses is the set of agents statuses that count as a live session
+// for the per-user cap: panes that are up or about to come up.
+var LiveStatuses = []string{"running", "working", "idle", "spawning"}
+
+// SessionCapError rejects a tier-3 spawn because the user already runs
+// MaxAgentsPerUser live agents. Callers surface Error() directly to the
+// user — it is written to be readable in a chat window, not a log line.
+type SessionCapError struct {
+	Max   int
+	Count int
+}
+
+func (e *SessionCapError) Error() string {
+	return fmt.Sprintf(
+		"Session cap: you already have %d live agents (max %d). Kill one with /agent_kill <id> (see /agent_list), or send your message in a topic that already has an agent.",
+		e.Count, e.Max)
+}
+
+// CountLiveAgentsForUser counts the user's live agent rows: agents with a
+// live status joined through owner bindings (the user→agent link until a
+// real multi-user ownership model exists). excludeAgentID — typically the
+// agent about to be (re)spawned — is left out so reusing or respawning an
+// existing topic agent never counts itself.
+func CountLiveAgentsForUser(ctx context.Context, pool *pgxpool.Pool, userID, excludeAgentID string) (int, error) {
+	count := 0
+	err := pool.QueryRow(ctx, `
+		SELECT COUNT(DISTINCT b.agent_id)
+		FROM topic_agent_bindings b
+		JOIN agents a ON a.id = b.agent_id
+		WHERE b.user_id = $1
+		  AND b.binding_type = 'owner'
+		  AND a.status = ANY($2)
+		  AND a.id <> $3
+	`, userID, LiveStatuses, excludeAgentID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count live agents for user: %w", err)
+	}
+	return count, nil
+}
+
+// CheckSessionCap enforces the per-user concurrent session cap: when the
+// user already owns max or more live agents (excluding agentID), it
+// returns a *SessionCapError; otherwise nil. max <= 0 disables the cap.
+// Best-effort guard, not an accounting system: two simultaneous spawns in
+// different topics can race past it by one, which is acceptable for a
+// cheap runaway brake.
+func CheckSessionCap(ctx context.Context, pool *pgxpool.Pool, userID, excludeAgentID string, max int) error {
+	if max <= 0 {
+		return nil
+	}
+	count, err := CountLiveAgentsForUser(ctx, pool, userID, excludeAgentID)
+	if err != nil {
+		return err
+	}
+	if count >= max {
+		return &SessionCapError{Max: max, Count: count}
+	}
+	return nil
+}
+
 // mentionPattern matches a leading @<id-or-handle> token.
 var mentionPattern = regexp.MustCompile(`^\s*@([A-Za-z0-9][A-Za-z0-9_-]*)\b\s*`)
 
