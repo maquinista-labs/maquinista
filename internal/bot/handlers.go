@@ -72,9 +72,14 @@ func (b *Bot) handleTextMessage(msg *tgbotapi.Message) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	chatIDCopy := chatID
-	res, err := routing.Resolve(ctx, pool, b.topicAgentSpawner, userID, threadID, &chatIDCopy, text)
+	res, err := routing.Resolve(ctx, pool, b.topicAgentSpawner, b.repoPolicy, userID, threadID, &chatIDCopy, text)
 	if errors.Is(err, routing.ErrRequirePicker) {
 		b.showAgentPicker(chatID, getThreadID(msg), msg.From.ID, text)
+		return
+	}
+	if errors.Is(err, routing.ErrRepoForbidden) {
+		log.Printf("routing.Resolve: repo policy rejection for user %s: %v", userID, err)
+		b.reply(chatID, getThreadID(msg), repoForbiddenText)
 		return
 	}
 	if err != nil {

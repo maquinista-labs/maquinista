@@ -92,6 +92,31 @@ func (b *Bot) handleAgentSpawnCommand(msg *tgbotapi.Message) {
 		r = b.DefaultRunner()
 	}
 
+	// MAQ-45: a user with a repo binding spawns into their own repo, never
+	// the orchestrator process cwd (which is operator-owned). Unbound
+	// users keep the legacy Spawn behavior (cwd = abs(".")).
+	repos, restricted := b.config.ReposFor(msg.From.ID)
+	if restricted {
+		layout, lerr := agent.ResolveLayout(agent.ScopeShared, repos[0], agentName, "")
+		if lerr != nil {
+			log.Printf("agent spawn %s: layout: %v", agentName, lerr)
+			b.reply(chatID, threadID, fmt.Sprintf("Error spawning agent: %v", lerr))
+			return
+		}
+		a, serr := agent.SpawnWithLayout(pool, b.config.TmuxSessionName, agentName, "", env, r, "executor", layout)
+		if serr != nil {
+			log.Printf("Error spawning agent %s: %v", agentName, serr)
+			b.reply(chatID, threadID, fmt.Sprintf("Error spawning agent: %v", serr))
+			return
+		}
+		runnerName := "claude"
+		if r != nil {
+			runnerName = r.Name()
+		}
+		b.reply(chatID, threadID, fmt.Sprintf("Agent spawned: %s (runner: %s, repo: %s)", a.ID, runnerName, repos[0]))
+		return
+	}
+
 	a, err := agent.Spawn(pool, b.config.TmuxSessionName, agentName, "", env, r, "executor")
 
 	if err != nil {

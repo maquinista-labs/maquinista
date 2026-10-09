@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strconv"
@@ -46,11 +47,27 @@ func (b *Bot) showAgentPicker(chatID int64, threadID int, userID int64, pendingT
 	}
 	defer rows.Close()
 
-	var ids []string
+	var all []string
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			log.Printf("agent picker: scan: %v", err)
+			continue
+		}
+		all = append(all, id)
+	}
+
+	// MAQ-45: restricted users only see agents inside their own repos — a
+	// foreign agent must not even appear as a pickable option. Fail-closed:
+	// an agent with an unresolvable repo is hidden from restricted users.
+	var ids []string
+	userStr := strconv.FormatInt(userID, 10)
+	for _, id := range all {
+		if err := routing.CheckAgentPolicy(ctx, pool, b.repoPolicy, userStr, id); err != nil {
+			if errors.Is(err, routing.ErrRepoForbidden) {
+				continue
+			}
+			log.Printf("agent picker: policy check %s: %v", id, err)
 			continue
 		}
 		ids = append(ids, id)
@@ -157,7 +174,12 @@ func (b *Bot) handleAgentPickSel(cq *tgbotapi.CallbackQuery, st *agentPickerStat
 	ctx, cancel := context.WithTimeout(context.Background(), 3e9)
 	defer cancel()
 	chatIDCopy := chatID
-	if _, err := routing.ConfirmPickerChoice(ctx, pool, userIDStr, threadIDStr, &chatIDCopy, agentID); err != nil {
+	if _, err := routing.ConfirmPickerChoice(ctx, pool, b.repoPolicy, userIDStr, threadIDStr, &chatIDCopy, agentID); err != nil {
+		if errors.Is(err, routing.ErrRepoForbidden) {
+			log.Printf("agent picker: policy rejection for user %s: %v", userIDStr, err)
+			b.editMessageText(chatID, messageID, repoForbiddenText)
+			return
+		}
 		log.Printf("agent picker: ConfirmPickerChoice: %v", err)
 		b.editMessageText(chatID, messageID, fmt.Sprintf("Error binding: %v", err))
 		return

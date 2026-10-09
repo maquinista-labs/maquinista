@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strconv"
 	"strings"
 
@@ -34,8 +35,13 @@ func (b *Bot) handleAgentDefaultCommand(msg *tgbotapi.Message) {
 	userID := strconv.FormatInt(msg.From.ID, 10)
 	threadIDStr := strconv.Itoa(threadID)
 	chat := chatID
-	res, err := routing.SetUserDefault(context.Background(), pool, userID, threadIDStr, &chat, token)
+	res, err := routing.SetUserDefault(context.Background(), pool, b.repoPolicy, userID, threadIDStr, &chat, token)
 	if err != nil {
+		if errors.Is(err, routing.ErrRepoForbidden) {
+			log.Printf("agent_default: policy rejection for user %s: %v", userID, err)
+			b.reply(chatID, threadID, repoForbiddenText)
+			return
+		}
 		if errors.Is(err, routing.ErrUnknownAgent) {
 			b.reply(chatID, threadID, fmt.Sprintf(
 				"No agent @%s. Use /agent_list to see existing agents, or send a message in a fresh topic to spawn one (rename afterwards with /agent_rename <handle>).",

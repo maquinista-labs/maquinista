@@ -10,7 +10,7 @@ func clearEnv() {
 	for _, key := range []string{
 		"TELEGRAM_BOT_TOKEN", "ALLOWED_USERS", "ALLOWED_GROUPS",
 		"MAQUINISTA_DIR", "TMUX_SESSION_NAME", "CLAUDE_COMMAND",
-		"MONITOR_POLL_INTERVAL", "DATABASE_URL",
+		"MONITOR_POLL_INTERVAL", "DATABASE_URL", "USER_REPOS",
 		"MAQUINISTA_DASHBOARD_LISTEN", "MAQUINISTA_DASHBOARD_AUTH",
 		"MAQUINISTA_DASHBOARD_THEME", "MAQUINISTA_DASHBOARD_NODE_BIN",
 	} {
@@ -190,6 +190,162 @@ func TestParseIntList(t *testing.T) {
 		if !tt.err && len(got) != len(tt.want) {
 			t.Errorf("parseIntList(%q) = %v, want %v", tt.input, got, tt.want)
 		}
+	}
+}
+
+func TestParseUserRepos(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  map[int64][]string
+		err   bool
+	}{
+		{
+			name:  "empty disables bindings",
+			input: "",
+			want:  nil,
+		},
+		{
+			name:  "single pair",
+			input: "111:/srv/repo-a",
+			want:  map[int64][]string{111: {"/srv/repo-a"}},
+		},
+		{
+			name:  "repeated user accumulates in order",
+			input: "111:/srv/a,222:/srv/b,111:/srv/c",
+			want:  map[int64][]string{111: {"/srv/a", "/srv/c"}, 222: {"/srv/b"}},
+		},
+		{
+			name:  "whitespace tolerated, paths cleaned",
+			input: " 111 : /srv/a/ , 222:/srv/b/../b ",
+			want:  map[int64][]string{111: {"/srv/a"}, 222: {"/srv/b"}},
+		},
+		{
+			name:  "missing colon",
+			input: "111-srv-a",
+			err:   true,
+		},
+		{
+			name:  "bad user id",
+			input: "abc:/srv/a",
+			err:   true,
+		},
+		{
+			name:  "empty repo path",
+			input: "111:",
+			err:   true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseUserRepos(tt.input)
+			if tt.err {
+				if err == nil {
+					t.Fatalf("parseUserRepos(%q) expected error", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseUserRepos(%q): %v", tt.input, err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %v, want %v", got, tt.want)
+			}
+			for id, wantRepos := range tt.want {
+				gotRepos, ok := got[id]
+				if !ok {
+					t.Fatalf("user %d missing from %v", id, got)
+				}
+				if len(gotRepos) != len(wantRepos) {
+					t.Fatalf("user %d repos = %v, want %v", id, gotRepos, wantRepos)
+				}
+				for i := range wantRepos {
+					if gotRepos[i] != wantRepos[i] {
+						t.Errorf("user %d repo[%d] = %q, want %q", id, i, gotRepos[i], wantRepos[i])
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestReposFor(t *testing.T) {
+	cfg := &Config{UserRepos: map[int64][]string{
+		111: {"/srv/a"},
+	}}
+
+	repos, restricted := cfg.ReposFor(111)
+	if !restricted || len(repos) != 1 || repos[0] != "/srv/a" {
+		t.Errorf("ReposFor(111) = %v, %v; want [/srv/a], true", repos, restricted)
+	}
+	repos, restricted = cfg.ReposFor(999)
+	if restricted || repos != nil {
+		t.Errorf("ReposFor(999) = %v, %v; want nil, false (unrestricted)", repos, restricted)
+	}
+}
+
+func TestMayAccessRepo(t *testing.T) {
+	cfg := &Config{UserRepos: map[int64][]string{
+		111: {"/srv/repo-a"},
+	}}
+
+	// Unrestricted user: everything allowed, including unresolvable roots.
+	if !cfg.MayAccessRepo(999, "/anywhere") {
+		t.Error("unrestricted user denied")
+	}
+	if !cfg.MayAccessRepo(999, "") {
+		t.Error("unrestricted user denied for empty root")
+	}
+
+	// Restricted user: exact match after normalization.
+	if !cfg.MayAccessRepo(111, "/srv/repo-a") {
+		t.Error("bound repo denied")
+	}
+	if !cfg.MayAccessRepo(111, "/srv/repo-a/") {
+		t.Error("trailing slash should normalize to a match")
+	}
+	if cfg.MayAccessRepo(111, "/srv/repo-b") {
+		t.Error("foreign repo allowed")
+	}
+	// Prefixes/suffixes must not match.
+	if cfg.MayAccessRepo(111, "/srv/repo-a-sibling") {
+		t.Error("prefix sibling allowed")
+	}
+	// Fail closed on unresolvable roots.
+	if cfg.MayAccessRepo(111, "") {
+		t.Error("empty root allowed for restricted user")
+	}
+}
+
+func TestLoad_UserRepos(t *testing.T) {
+	clearEnv()
+	tmpDir := t.TempDir()
+	os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
+	os.Setenv("ALLOWED_USERS", "111,222")
+	os.Setenv("MAQUINISTA_DIR", tmpDir)
+	os.Setenv("USER_REPOS", "111:"+tmpDir+"/repo-a,222:"+tmpDir+"/repo-b,222:"+tmpDir+"/repo-c")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(cfg.UserRepos[111]) != 1 || len(cfg.UserRepos[222]) != 2 {
+		t.Errorf("UserRepos = %v", cfg.UserRepos)
+	}
+	if !cfg.MayAccessRepo(222, tmpDir+"/repo-b") || cfg.MayAccessRepo(222, tmpDir+"/repo-a") {
+		t.Errorf("MayAccessRepo inconsistent with UserRepos %v", cfg.UserRepos)
+	}
+}
+
+func TestLoad_InvalidUserRepos(t *testing.T) {
+	clearEnv()
+	os.Setenv("TELEGRAM_BOT_TOKEN", "tok")
+	os.Setenv("ALLOWED_USERS", "1")
+	os.Setenv("MAQUINISTA_DIR", t.TempDir())
+	os.Setenv("USER_REPOS", "not-a-pair")
+
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for invalid USER_REPOS")
 	}
 }
 
