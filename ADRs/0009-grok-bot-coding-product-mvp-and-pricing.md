@@ -4,6 +4,7 @@
 - **Date:** 2026-10-09
 - **Amended:** 2026-10-09 — **Rev 2** (Otavio, chat): (1) landscape comparison refocused **Telegram-native**; (2) product surface = **our own IDE/app** — the existing dashboard splits out of the maquinista binary into a standalone web app, composed with the Telegram leg on top of maquinista execution; (3) agent execution isolated in **gVisor/microVM** sandboxes (ADR-0004's sandbox knob gets its concrete first value)
 - **Amended:** 2026-10-09 — **Rev 3** (Otavio, chat): pricing model decided — **BYOK only from day 1** (user's own OpenRouter/z.ai/Claude keys or runner-CLI subscription auth); we charge a **fixed platform subscription (ARR-style) on top of measured infrastructure cost** — never tokens. Predictable for us as we scale, predictable for the user (model spend stays on their own provider plans). Rev 1 pricing ladder marked superseded.
+- **Amended:** 2026-10-09 — **Rev 4** (Otavio, chat): product is **B2C only** — individual developers, no team/enterprise tiers, ever; concrete **price estimates added** (Free / $9.90 / $24.90) derived from the infra-cost formula, pre-F0 calibration. "ARR-style" reads as MRR under B2C.
 - **Deciders:** Otavio
 - **Scope:** Product exploration — "what would a Grok-Bot analog for coding look like built on maquinista". Landscape snapshot (market-analysis type, re-runnable), capability have/miss inventory, priority-rated gap backlog, MVP fases, pricing ladders. NOT a build authorization; each fase that touches the repo state machine gets its own MAQ ticket + spec.
 - **Type:** 9 (market analysis snapshot) + 8 (product/GTM) hybrid; the landscape tables carry their own re-run procedure.
@@ -131,6 +132,18 @@ All OSS stars fetched via api.github.com 2026-10-09.
 - **Tier numbers are a formula, calibrated by F0:** `tier price ≈ measured infra cost per active user × margin factor × concurrency allowance`. The F0 cost-ledger DoD is the calibration input; exact tiers land in the F2 pricing ADR. Free tier: BYOK with a small concurrent-session footprint cap.
 - **Value framing:** the user pays for the platform — pipeline, review gates, self-healing, hard isolation, the app — never for tokens.
 
+### Rev 4 — B2C only + price estimates (Otavio, 2026-10-09)
+
+- **B2C only.** Individual developers on their own repos and their own model plans. No Teams/Enterprise tiers, no per-seat billing, no admin consoles — this product never sells to teams. The Teams rung of every earlier ladder (Rev 1's $40/seat, Copilot-Business-style anchors) is dead; Q1 below narrows accordingly.
+- **Estimated COGS per active BYOK user** (pre-F0, order-of-magnitude): one Hetzner-class dedicated box ≈ $50/mo carrying 30–50 bursty gVisor sessions → ~$1.0–1.7/user in session infra, + ~$0.5–1.0 storage (worktrees, Postgres), + ~$0.5 bandwidth ≈ **$2–3.5 per active user/mo** at launch density, falling as box fill rises. F0's cost-ledger DoD replaces this estimate within ±20%.
+- **Estimated tiers** — monthly, BYOK in all of them; tiers differ ONLY by concurrency, wall-clock quota and priority, never by model access:
+  - **Free — $0** — 1 concurrent session, flash-class runner, ~20 sessions/mo, public repos. COGS ≈ $1–2/user, absorbed as CAC.
+  - **Base — $9.90/mo (≈ R$49)** — 2 concurrent sessions, all runners, fair-use wall clock. ≈ 3–4× COGS at launch density. Anchor: Copilot Pro $10 (verified).
+  - **Pro — $24.90/mo (≈ R$119)** — 3 concurrent, priority queue, long sessions, higher quota. Anchors: ChatGPT Plus $20 / Cursor Pro $20 — priced above them for concurrency + priority, below Devin-tier because the models are the user's bill, not ours.
+  - Annual = 10× monthly on paid tiers.
+- **Rule for the F2 pricing ADR:** price moves with measured wall-clock and concurrency, not model class. If a tier goes underwater, cut quota or price concurrency — never bundle tokens.
+- Currency + rails (USD Stripe vs BRL Pix/Stripe-BR) decided at the F2 ADR; BRL figures above are psychological anchor points (~R$5/USD), not FX quotes.
+
 ### Superseded Rev 1–2 pricing analysis (bundled-token scenario — kept for the record)
 
 **Cost per task arithmetic** (superseded Rev 3 for pricing; kept as the bundled-models scenario record — assumptions: ~80 agent+review turns, ~30k tokens/turn blended, 3:1 in:out → ~1.8M in + 0.6M out; unit prices from LiteLLM aggregator table fetched 2026-10-09 — cross-check against vendor pages before launch):
@@ -158,12 +171,12 @@ All OSS stars fetched via api.github.com 2026-10-09.
 
 ## Still open (gates the fase ADRs — original 8 with Rev 2 status)
 
-1. Target user first: prosumer devs ($20) vs teams ($40–80/seat)? — **open**
+1. Target user first: prosumer devs ($20) vs teams ($40–80/seat)? — **partially answered Rev 4**: **B2C only** — individual developers; teams/enterprise excluded permanently. Remaining: persona + market (BR-first vs global), which gates currency/rails
 2. Model bundling — **ANSWERED Rev 3**: BYOK only from day 1 (OpenRouter/z.ai/Claude keys or runner-CLI subscription auth); no bundled tokens, ever
 3. MVP channel scope — **ANSWERED Rev 2**: Telegram-native wedge + our own web IDE/app (dashboard split); both legs from F1
 4. License split (single-tenant OSS vs hosted closed) — **open**
 5. Infra timing: barceloneta vs Hetzner substrate — **partially answered**: session isolation = gVisor now / microVM on ADR-0003 substrate; box/scale-out timing still open
-6. Pricing shape — **ANSWERED Rev 3**: fixed platform subscription (ARR-style) over measured infra cost; no token/credit billing. Exact tiers land in the F2 pricing ADR, calibrated by the F0 cost ledger
+6. Pricing shape — **ANSWERED Rev 3**: fixed platform subscription (MRR, B2C) over measured infra cost; no token/credit billing. **Rev 4 adds estimates**: Free / $9.90 / $24.90 (≈ R$49 / R$119) on COGS $2–3.5/user/mo, pre-F0. Exact tiers land in the F2 pricing ADR, calibrated by the F0 cost ledger
 7. Product name — **open**
 8. ToS/privacy floor before first charge — **open**
 
