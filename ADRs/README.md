@@ -16,4 +16,4 @@ Status lifecycle: Proposto → Aceito → Depreciado/Substituído.
 | [0006](0006-ticket-provider-abstraction.md) | Ticket-provider abstraction — vendor-neutral pipeline core behind a TicketProvider seam | Proposto |
 | [0007](0007-kagent-benchmark.md) | kagent benchmark — stay the course; adopt OTel tracing, checkpoint/fork, temporal verdict guards | Proposto |
 | [0008](0008-turn-end-completion-contract.md) | Turn-end completion contract for pipeline agents — watchdog demoted to backstop | Aceito |
-| [0009](0009-grok-bot-coding-product-mvp-and-pricing.md) | Grok-bot-style coding product on maquinista — landscape, gaps, MVP, pricing | Proposto |
+| [0009](0009-grok-bot-coding-product-mvp-and-pricing.md) | Grok-bot-style coding product on maquinista — landscape, gaps, MVP, pricing | Aceito (Rev 2) |

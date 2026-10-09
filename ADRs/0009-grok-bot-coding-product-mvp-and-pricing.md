@@ -1,7 +1,8 @@
 # ADR-0009: A Grok-Bot-Style Coding Agent Product on Top of Maquinista — Landscape, Gaps, MVP and Pricing
 
-- **Status:** Proposto (pending Otavio's ok — dedicated feedback session 2026-10-09)
+- **Status:** Aceito (2026-10-09 — Otavio ratified the direction in chat; see Rev 2. Remaining unanswered items moved to §Still open and gate the fase ADRs, not this one)
 - **Date:** 2026-10-09
+- **Amended:** 2026-10-09 — **Rev 2** (Otavio, chat): (1) landscape comparison refocused **Telegram-native**; (2) product surface = **our own IDE/app** — the existing dashboard splits out of the maquinista binary into a standalone web app, composed with the Telegram leg on top of maquinista execution; (3) agent execution isolated in **gVisor/microVM** sandboxes (ADR-0004's sandbox knob gets its concrete first value)
 - **Deciders:** Otavio
 - **Scope:** Product exploration — "what would a Grok-Bot analog for coding look like built on maquinista". Landscape snapshot (market-analysis type, re-runnable), capability have/miss inventory, priority-rated gap backlog, MVP fases, pricing ladders. NOT a build authorization; each fase that touches the repo state machine gets its own MAQ ticket + spec.
 - **Type:** 9 (market analysis snapshot) + 8 (product/GTM) hybrid; the landscape tables carry their own re-run procedure.
@@ -28,6 +29,20 @@ The question this ADR answers: what exists in that category, what maquinista has
 | OpenHands Cloud (All Hands) | Slack + web | Full cloud sessions, OAuth app | Pricing page payload shows $10/$19 anchors + "Free, local" + "providers at-cost" — SINGLE-SOURCE, AMBIGUOUS (openhands.dev/pricing); treat UNVERIFIED |
 | Grok Bot / Team Bots (x.ai) | Grok apps + Slack handles (Team Bots); NOT X mentions | Generalist computer-use teammate — NOT repo/PR-native; GitHub only a plugin | $20 Pro; SuperGrok $30; Teams $40/seat — x.ai/bot, x.ai/news/team-bots (verified) |
 | Grok Build (x.ai) | Terminal CLI | Coding agent, plan mode "every edit blocked until you approve" | Bundled — x.ai/build |
+
+### Rev 2 — the comparison, focused on Telegram-native
+
+| Player | Telegram-native | Hosted multi-user | Full PR pipeline w/ review gates | Hard session isolation | Entry price (verified 2026-10-09) |
+|---|---|---|---|---|---|
+| Grok Bot (x.ai) | ❌ (Grok apps + Slack handles) | ✅ | ❌ computer-use, not repo-native | "own computer" model | $20 |
+| Claude Code in Slack | ❌ Slack | ✅ | ⚠️ 1 PR/session, no review rounds | cloud sessions | Pro/Max (UNVERIFIED today) |
+| Codex in Slack | ❌ Slack | ✅ | ⚠️ task-centric | cloud RBAC | $20 (Plus) |
+| Devin | ❌ Slack/Teams/Linear | ✅ | ✅ triage→PR, event automations | cloud sandboxes | $20 (Pro) |
+| claude-code-telegram (OSS) | ✅ | ❌ single-user self-host | ❌ no PR/review | dir sandboxing + audit log | self-host |
+| openclaw / nanoclaw (OSS) | ✅ (20+ channels) | ❌ personal gateway | ❌ assistant-first | pairing approval + container guide | self-host |
+| **The product (this ADR)** | ✅ **wedge** | ✅ | ✅ **already built** | ✅ **gVisor/microVM (Rev 2)** | §Pricing |
+
+Read: on Telegram specifically, nobody commercial exists at all; the only Telegram-native entries are single-user self-host bridges with no pipeline. We bring the pipeline + hosted multi-user + gVisor/microVM isolation to the empty quadrant.
 
 **Consumer anchors:** GitHub Copilot Free / Pro $10 (base 1,000 AI credits) / Pro+ $39 (3,900) / Business $19 per seat (1,900 credits/user) — docs.github.com/en/copilot/get-started/plans.md (verified 2026-10-09). ChatGPT Plus $20/mo. Claude Pro/Max, Cursor, Amp Sourcegraph, Google Jules tiers: **UNVERIFIED today** (JS-walled after the house 2-attempt time-box; re-check anthropic.com/pricing, cursor.com/pricing, ampcode.com, jules.google).
 
@@ -66,7 +81,7 @@ All OSS stars fetched via api.github.com 2026-10-09.
 **P0 — product-blocking:**
 1. **Multi-tenancy** — zero tenant/org concept in migrations (`rg -in 'tenant|organi[sz]ation' internal/db/migrations/` = empty). Need: tenant-scoped tables, per-user workspaces + credentials, per-tenant agent souls. ADR-0003 (substrate scale-out) becomes load-bearing, not optional.
 2. **Self-serve onboarding** — auth is `ALLOWED_USERS`/`ALLOWED_GROUPS` env allowlist (config.go). Need: GitHub App install → repo picker → Telegram identity link. No OAuth anywhere today.
-3. **Per-user secrets + isolation** — agents run as the box user with broad access; untrusted users need container-per-session (ADR-0004 amendment already made sandbox tech a config knob — Phase 1 of the product IS that knob being turned) + per-user tokens + audit logging.
+3. **Per-user secrets + isolation** — agents run as the box user with broad access; untrusted users need a hard sandbox per session — **tech decided Rev 2: gVisor (runsc) first, microVM scale-out** — plus per-user tokens + audit logging.
 4. **Billing/metering** — zero billing code (`rg stripe|billing|invoice internal/ cmd/` = empty). Need usage ledger, quotas, checkout.
 
 **P1 — needed for chargeable quality:**
@@ -90,10 +105,16 @@ All OSS stars fetched via api.github.com 2026-10-09.
 
 **Recommendation: A, with B as the free moat** (self-host single-tenant edition OSS — it feeds the hosted product and matches the openclaw-era distribution reality; hosted multi-tenant core stays closed). C and D rejected: we lose every differentiation we already own.
 
+### Product shape (Rev 2 — decided by Otavio, 2026-10-09)
+
+1. **Telegram-native wedge** — the comparison and GTM focus stay on Telegram; other channels remain cheap later legs, not the launch story.
+2. **Our own IDE/app** — the existing dashboard splits OUT of the maquinista binary into a standalone web app: repo/session browser, diffs, review verdicts, approvals, cost per task. The Telegram leg and the web app are two faces of the same core (both read `agent_outbox`/Postgres + notify fabric today; a real API seam lands with F1). The embedded dashboard stays as fallback while the split is in flight.
+3. **Execution on gVisor/microVM** — every agent session runs sandboxed: **gVisor (runsc) first** (per-session user, network policy, zero ambient credentials — consistent with mergegate.go's no-ambient-gateEnv rule), **Firecracker-class microVMs as the scale-out path** on the ADR-0003 substrate (gVisor composes with k3s as a RuntimeClass; microVM is the later knob). ADR-0004's amendment made sandbox tech a config knob — Rev 2 picks its first value.
+
 ## MVP (fases; each = MAQ ticket + spec, state-machine-first)
 
 - **F0 — Invite pilot (weeks, zero new infra).** 5–10 hand-invited users on the existing box: allowlist entries + one repo each, flash-class runner, BYO repo via deploy-key. Proves demand + measures real cost/task + breaks the single-user assumptions in the wild. *DoD: 3 external users ship ≥1 merged PR each; cost-per-task ledger (manual) exists.*
-- **F1 — Tenant seam + onboarding.** Tenant column + scoping (state machine untouched), container-per-session sandbox (ADR-0004 knob), GitHub App install + Telegram identity link, per-user audit log. *DoD: a stranger goes from repo URL to first PR without Otavio touching the box.*
+- **F1 — Tenant seam + onboarding.** Tenant column + scoping (state machine untouched), gVisor sandbox per session (Rev 2 tech; microVM later), GitHub App install + Telegram identity link, per-user audit log, dashboard split into the standalone web app (Rev 2 product shape). *DoD: a stranger goes from repo URL to first PR without Otavio touching the box.*
 - **F2 — Metering + billing.** Usage ledger (per task: turns, tokens, runner class, USD), quotas, Stripe checkout, BYOK option (user's Anthropic/OpenAI key for premium runners). *DoD: first $ collected; ledger reconciles with model invoices ±10%.*
 - **F3 — Public launch.** Pricing ladder live, OTel cost tracing per task (ADR-0007 item), verdict guards + benchmark gate on reviewer quality, second runner tier GA. *DoD: public signup; weekly cohort retention reported.*
 
@@ -124,16 +145,16 @@ All OSS stars fetched via api.github.com 2026-10-09.
 - Negative: multi-tenancy cuts across the state machine's assumptions (claimed_by identities, workspaces, souls) — F1 is the riskiest fase and needs its own ADR amendment; sandbox hardening is security work with real downside if rushed.
 - Neutral: Slack/etc. legs stay cheap to add later (architecture already fans out); OSS single-user edition needs a license decision (Q4).
 
-## Open questions for Otavio (the precise feedback this ADR requests)
+## Still open (gates the fase ADRs — original 8 with Rev 2 status)
 
-1. **Target user first:** prosumer devs (B2C, $20) or 2–10-dev teams ($40–80/seat)? (Changes F1 onboarding shape and F3 messaging.)
-2. **Model bundling:** BYOK-first (frictionless margin, power-user filter) vs bundled-credits-first (smooth onboarding, COGS risk)?
-3. **MVP channel:** Telegram-only through F2, or public web dashboard parity required at launch?
-4. **License:** which parts OSS? (Proposal: single-tenant self-host core OSS, multi-tenant/onboarding/billing closed.)
-5. **Infra:** run the product on barceloneta (ADR-0004 owned silicon) through F1–F2, or straight to ADR-0003 Hetzner substrate?
-6. **Pricing shape:** the credits/overage ladder above vs dead-simple task quotas (N tasks/mo, no credit accounting)?
-7. **Name/brand** for the hosted product (repo stays maquinista)?
-8. **Compliance floor for paid tier:** privacy policy + no-training commitment enough at MVP, or is a ToS review needed before first charge?
+1. Target user first: prosumer devs ($20) vs teams ($40–80/seat)? — **open**
+2. Model bundling: BYOK-first vs bundled-credits-first? — **open**
+3. MVP channel scope — **ANSWERED Rev 2**: Telegram-native wedge + our own web IDE/app (dashboard split); both legs from F1
+4. License split (single-tenant OSS vs hosted closed) — **open**
+5. Infra timing: barceloneta vs Hetzner substrate — **partially answered**: session isolation = gVisor now / microVM on ADR-0003 substrate; box/scale-out timing still open
+6. Pricing shape: credits vs task quotas — **open** (F2 pricing ADR input)
+7. Product name — **open**
+8. ToS/privacy floor before first charge — **open**
 
 ## References
 
