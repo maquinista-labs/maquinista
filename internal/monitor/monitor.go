@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -18,7 +19,6 @@ import (
 // Returns (topicID, chatID) pairs for topics observing the agent that owns this window.
 // Implementations should look up the agent by window, then look up observing topics.
 type ObservationLookup func(windowID string) []ObservingTopic
-
 
 // ObservingTopic represents a topic that is observing an agent's output.
 type ObservingTopic struct {
@@ -48,6 +48,12 @@ type Monitor struct {
 	pollCount           int
 	transcriptTouches   sync.Map      // windowID → time.Time of last liveness write
 	transcriptTouchFreq time.Duration // liveness write throttle (default transcriptTouchInterval; 0 disables)
+
+	// Turn-end shadow signal (ADR-0008 F1, MAQ-43): detection on transcript
+	// growth, emission = journal only. turnEnds dedups per window on the
+	// closing message id; turnEndCount is the boot-cumulative incidence.
+	turnEnds     sync.Map // windowID → last fired closing message id
+	turnEndCount atomic.Uint64
 }
 
 // New creates a new Monitor.
@@ -103,6 +109,26 @@ func (m *Monitor) AddSource(src TranscriptSource) {
 	m.sources = append(m.sources, src)
 }
 
+// recordTurnEnd is the ADR-0008 turn-end producer: when a poll batch ends
+// with an assistant text message, the transcript tail shows an assistant
+// message closing the turn (mid-turn batches end on tool calls / tool
+// results; pi's final assistant message is the turn's last entry). Sticky
+// evidence on agents.last_turn_end_at for the pipeline's nudge legs and
+// the freeze-cause classifier — never cleared by consumers. Best-effort,
+// mirrors touchTranscriptLiveness: failures log, never fail the poll;
+// windows that resolve to no agent row are silently skipped.
+func (m *Monitor) recordTurnEnd(agentID string) {
+	if m.pool == nil || agentID == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := m.pool.Exec(ctx,
+		`UPDATE agents SET last_turn_end_at = NOW() WHERE id = $1`, agentID); err != nil {
+		log.Printf("monitor: turn-end update agent=%s: %v", agentID, err)
+	}
+}
+
 // Run starts the monitor poll loop. Blocks until ctx is cancelled.
 func (m *Monitor) Run(ctx context.Context) {
 	log.Println("Session monitor starting...")
@@ -156,6 +182,10 @@ func (m *Monitor) poll() {
 			// mid-command, metadata lines).
 			if newOffset > offset {
 				m.touchTranscriptLiveness(sess.WindowID)
+				// Growth is also the trigger to re-inspect the transcript
+				// tail for a turn close (ADR-0008 F1, shadow: log + count
+				// only). Unchanged tails cannot produce a new closing.
+				m.detectTurnEnd(src, sess)
 			}
 
 			if len(parsed) == 0 {
@@ -175,6 +205,13 @@ func (m *Monitor) poll() {
 
 			// Capture turn costs and strip usage entries before routing.
 			parsed = m.captureAndStripUsage(parsed, agentID, sess.WindowID)
+
+			// ADR-0008: a batch ending on assistant text is a turn end —
+			// record the sticky signal (pipeline nudge legs + freeze-cause
+			// classifier consume it).
+			if batchEndsWithTurnEnd(parsed) {
+				m.recordTurnEnd(agentID)
+			}
 
 			// Prefer active thread; fall back to all bound users.
 			var users []state.UserThread
@@ -306,6 +343,21 @@ func (m *Monitor) captureAndStripUsage(entries []ParsedEntry, agentID, windowID 
 		}(tc)
 	}
 	return filtered
+}
+
+// batchEndsWithTurnEnd reports whether a parsed batch closes a turn
+// (ADR-0008): the transcript tail shows an assistant message with no
+// pending tool call after it. Mid-turn batches end on tool_use,
+// tool_result, or thinking — only a trailing assistant text entry closes a
+// turn. pi's final assistant message is the turn's last entry; the
+// claude/opencode sources' ParseEntries shape matches (assistant text
+// trails, tool calls pair before it).
+func batchEndsWithTurnEnd(parsed []ParsedEntry) bool {
+	if len(parsed) == 0 {
+		return false
+	}
+	last := parsed[len(parsed)-1]
+	return last.Role == "assistant" && last.ContentType == "text"
 }
 
 // SetTurnStart records the start time of a user turn for a window.

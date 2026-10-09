@@ -57,6 +57,13 @@ type Config struct {
 	// freeze with a live pane (the stale-id starvation signature) is
 	// diagnosable from the 🆘 alone. nil → notes say "unknown".
 	PaneExists func(session, name string) bool
+	// BranchUpToDate probes the silent-success artifacts question
+	// (ADR-0008): is the task worktree's branch clean and current with
+	// base? The freeze arm consults it when retiring a silent success —
+	// open PR + branch current sends the task straight to review instead
+	// of respawning. git.BranchUpToDate in production; nil → never
+	// straight-to-review (plain requeue, still no budget burned).
+	BranchUpToDate func(worktree string) bool
 	// MonitorPollInterval mirrors config.Config.MonitorPollInterval (the
 	// transcript monitor's poll cadence, MONITOR_POLL_INTERVAL). The
 	// restart-cohort sweep defers until a few intervals after boot so the
@@ -168,11 +175,22 @@ func Run(ctx context.Context, pool *pgxpool.Pool, cfg Config) error {
 		} else if healed > 0 {
 			log.Printf("taskscheduler: healed %d task(s) with missing inbox prompt", healed)
 		}
+		// ADR-0008 F2: one-shot completion nudges for turn-ended implementor
+		// rounds — BEFORE the freeze arm, which excludes nudged-fresh agents
+		// from its candidates (the arms are disjoint by predicate; at the
+		// boundary the nudge gets one tick to land before the retire).
+		if nudged, nerr := NudgeTurnEndedClaims(ctx, pool, idleAfter, spawnGrace); nerr != nil {
+			log.Printf("taskscheduler: nudge turn-ended claims: %v", nerr)
+		} else if nudged > 0 {
+			log.Printf("taskscheduler: nudged %d turn-ended implementor(s)", nudged)
+		}
 		// MAQ-31: retire implementor-phase freezes (claimed tasks whose live
 		// agent row went silent past the freeze bounds) BEFORE the reaper —
 		// the retire is what lets the reaper's all-rows-non-live check pass
-		// on the next line, same wake.
-		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, respawnCap, cfg.SessionName, cfg.KillWindow, cfg.PaneExists); ferr != nil {
+		// on the next line, same wake. ADR-0008: silent successes (turn end
+		// observed) retire without burning respawn budget; true freezes
+		// keep the cap/park circuit.
+		if retired, ferr := RetireFrozenClaims(ctx, pool, idleAfter, spawnGrace, respawnCap, cfg.SessionName, cfg.KillWindow, cfg.PaneExists, cfg.BranchUpToDate); ferr != nil {
 			log.Printf("taskscheduler: retire frozen claims: %v", ferr)
 		} else if retired > 0 {
 			log.Printf("taskscheduler: retired %d frozen claim agent(s)", retired)
@@ -295,7 +313,8 @@ func ReapStaleClaims(ctx context.Context, pool *pgxpool.Pool) (int, error) {
 	for _, id := range reaped {
 		// MAQ-22: the guarded UPDATE above flips the row exactly once per
 		// release, so the requeue-after-heal one-liner is exactly-once too.
-		pipeline.Notifyf(ctx, pool, "🔄 %s: requeued to ready — stale claim healed (agent died mid-flight).",
+		// Task-stamped (MAQ-37): the issue/PR links ride with the note.
+		pipeline.NotifyTaskf(ctx, pool, id, "🔄 %s: requeued to ready — stale claim healed (the agent died mid-flight); a fresh implementor picks it up. No action needed.",
 			pipeline.TaskTitle(ctx, pool, id))
 	}
 	return len(reaped), nil
@@ -407,8 +426,11 @@ func DispatchOne(ctx context.Context, pool *pgxpool.Pool, cfg Config) (bool, err
 	// are genuine claims and both announce; the empty check below is
 	// defensiveness against a future EnsureAgent change, not the guard.
 	if agentID != "" {
-		pipeline.Notifyf(ctx, pool, "📋 %s: claimed by @%s (%s) — /work-on-task dispatched.",
-			pipeline.TaskTitle(ctx, pool, taskID), agentID, role)
+		// MAQ-37: the claim names the role, never the minted worker id, and
+		// is task-stamped so the issue/PR links + reply-to-task key ride
+		// along.
+		pipeline.NotifyTaskf(ctx, pool, taskID, "📋 %s: claimed by %s — /work-on-task dispatched.",
+			pipeline.TaskTitle(ctx, pool, taskID), pipeline.RoleHuman(role, agentID))
 	}
 
 	// Enqueue the implementor's starting prompt + mark task.claimed_by.

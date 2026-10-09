@@ -60,9 +60,14 @@ import (
 )
 
 // frozenClaimsSQL: live agent rows on claimed pipeline/task tasks that
-// meet the shared freeze predicate ($1 = idle secs, $2 = spawn secs).
+// meet the shared freeze predicate ($1 = idle secs, $2 = spawn secs), with
+// the ADR-0008 cause classified in SQL (FreezeCauseSelectSQL) and the
+// artifacts columns the silent-success path needs (worktree, PR state,
+// ticket mapping — direct-to-review requires all three).
 const frozenClaimsSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title,
+       COALESCE(t.worktree_path, ''), COALESCE(t.pr_state, ''), COALESCE(t.metadata->>'ticket_issue_id', ''),
+       ` + pipeline.FreezeCauseSelectSQL + `
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE t.status = 'claimed'
@@ -71,20 +76,30 @@ WHERE t.status = 'claimed'
 // RetireFrozenClaims retires every frozen agent row on a claimed task.
 // paneExists probes "is there a pane for this agent id" (tmux.WindowNameExists
 // in production; tests inject) and rides the retire note — MAQ-38 AC 2.
-// Returns the number of rows THIS call retired (each one notified exactly
-// once, inside pipeline.RetireFrozenAgent's guarded transition). Episodes
-// whose respawn budget (respawnCap) is spent park needs-human atomically
-// with the retire instead of requeueing.
-func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error, paneExists func(session, name string) bool) (int, error) {
+// branchUpToDate probes the silent-success artifacts question (ADR-0008:
+// open PR + branch current with base — git.BranchUpToDate in production;
+// tests inject). Returns the number of rows THIS call retired (each one
+// notified exactly once, inside pipeline.RetireFrozenAgentCause's guarded
+// transition).
+//
+// ADR-0008 cause ledger: a TRUE freeze (no turn end observed) keeps MAQ-31
+// behavior — respawn budget burns, past the cap the task parks needs-human.
+// A SILENT SUCCESS (turn end observed, no done verb — the r8 incident
+// shape) retires WITHOUT burning budget: normally the same wake's reaper
+// requeues it to ready (a fresh -rN implementor picks it up, nothing
+// lost); when the artifacts allow (open PR + branch up to date + ticket
+// mapping — the fresh-round no-op verification), the retire tx flips the
+// task straight to 'review' and skips the respawn entirely.
+func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error, paneExists func(session, name string) bool, branchUpToDate func(worktree string) bool) (int, error) {
 	rows, err := pool.Query(ctx, frozenClaimsSQL, idle.Seconds(), spawn.Seconds())
 	if err != nil {
 		return 0, err
 	}
-	type frozen struct{ agentID, session, window, taskID, title string }
-	var victims []frozen
+	var victims []frozenVictim
 	for rows.Next() {
-		var f frozen
-		if err := rows.Scan(&f.agentID, &f.session, &f.window, &f.taskID, &f.title); err != nil {
+		var f frozenVictim
+		if err := rows.Scan(&f.agentID, &f.session, &f.window, &f.taskID, &f.title,
+			&f.worktree, &f.prState, &f.ticketIssue, &f.cause); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -96,23 +111,44 @@ func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 	}
 	retired := 0
 	for _, f := range victims {
+		pane := paneStateFor(sessionName, f.session, f.agentID, paneExists)
+		if f.cause == pipeline.CauseSilentSuccess {
+			applied, err := retireSilentSuccess(ctx, pool, f, pane, branchUpToDate)
+			if err != nil {
+				return retired, err
+			}
+			if applied {
+				retired++
+				killFrozenPane(sessionName, f.session, f.window, killWindow)
+			}
+			continue
+		}
+		// true_freeze: unchanged MAQ-31 behavior — budget burns, cap parks.
 		spent, err := pipeline.CountFreezeRetires(ctx, pool, f.taskID, "watchdog: implementor")
 		if err != nil {
 			return retired, err
 		}
-		pane := paneStateFor(sessionName, f.session, f.agentID, paneExists)
 		note := fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; tmux pane for this id: %s; auto-retired, claim requeues to ready for a fresh attempt", f.agentID, idle, spawn, pane)
+		// MAQ-37: the 🆘 carries prose, not the ledger's machine block. The
+		// pane fact stays in the note above; the sentence only surfaces it
+		// when it contradicts the freeze (a live pane over a silent agent is
+		// the stale-id starvation signature an operator should know about).
+		human := fmt.Sprintf("the implementor went silent (~%s with no activity) — retired it; the task requeues for a fresh attempt. No action needed.", pipeline.DurHuman(idle))
+		if pane == "yes" {
+			human = fmt.Sprintf("the implementor went silent (~%s with no activity) even though its terminal pane was still open — retired it; the task requeues for a fresh attempt. No action needed.", pipeline.DurHuman(idle))
+		}
 		var cleanup func(pgx.Tx) error
 		if spent >= respawnCap {
 			// Respawn budget spent — a fresh implementor would freeze the
 			// same way. Park needs-human atomically with the retire (the
 			// guarded retire is still the exactly-once dedup).
 			note = fmt.Sprintf("watchdog: implementor %s frozen — no outbox activity for %s past the %s spawn grace; tmux pane for this id: %s; %d respawns already spent, parking needs-human", f.agentID, idle, spawn, pane, spent)
+			human = fmt.Sprintf("the implementor hung %d times (each ~%s with no activity) — the machine gave up and is waiting for you.", spent, pipeline.DurHuman(idle))
 			cleanup = func(tx pgx.Tx) error {
 				return pipeline.ParkEpisodeTx(ctx, tx, f.taskID, "claimed", note)
 			}
 		}
-		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, f.agentID, f.taskID, note, cleanup)
+		applied, err := pipeline.RetireFrozenAgentCause(ctx, pool, f.agentID, f.taskID, note, human, pipeline.CauseTrueFreeze, cleanup)
 		if err != nil {
 			return retired, err
 		}
@@ -127,6 +163,78 @@ func RetireFrozenClaims(ctx context.Context, pool *pgxpool.Pool, idle, spawn tim
 		}
 	}
 	return retired, nil
+}
+
+// frozenVictim is one row of frozenClaimsSQL: a frozen implementor with
+// its ADR-0008 cause and the silent-success artifacts columns.
+type frozenVictim struct {
+	agentID, session, window, taskID, title string
+	worktree, prState, ticketIssue          string
+	cause                                   string
+}
+
+// silentSuccessHuman is the 🆘 sentence for a silent-success retire
+// (MAQ-37): what happened and that no action is needed, with the outcome
+// (straight to review vs requeue) in plain words.
+func silentSuccessHuman(artifacts bool) string {
+	if artifacts {
+		return "the implementor finished its work but never signalled completion — retired it and sent the finished work straight to review. No action needed."
+	}
+	return "the implementor finished its turn without signalling completion — retired it; the task requeues for a fresh attempt. No action needed."
+}
+
+// retireSilentSuccess retires a turn-ended implementor WITHOUT burning
+// respawn budget (ADR-0008): when the artifacts allow — PR open, branch up
+// to date with base, task ticket-mapped so the dispatch loop can actually
+// pick 'review' up — the retire tx flips the task straight to 'review'
+// (the MarkDone done-path transition, minus the done context row: this is
+// a completed round whose verb went missing, not a completion). Otherwise
+// the plain retire leaves the task 'claimed' for the same wake's reaper to
+// requeue to ready. Either way the observation row carries
+// cause='silent_success', which CountFreezeRetires ignores — silent
+// successes never spend the freeze→respawn budget, so a board full of
+// finished work can no longer park itself needs-human.
+func retireSilentSuccess(ctx context.Context, pool *pgxpool.Pool, f frozenVictim, pane string, branchUpToDate func(worktree string) bool) (bool, error) {
+	note := fmt.Sprintf("watchdog: implementor %s ended its turn without maquinista-done (silent success, ADR-0008) — no outbox activity for the freeze bound past the spawn grace; tmux pane for this id: %s; auto-retired", f.agentID, pane)
+	var cleanup func(pgx.Tx) error
+	artifacts := f.prState == "open" && f.ticketIssue != "" && f.worktree != "" && branchUpToDate != nil && branchUpToDate(f.worktree)
+	if artifacts {
+		note += "; PR open and branch up to date with base — task went straight to review (no respawn burned)"
+		cleanup = func(tx pgx.Tx) error {
+			// MarkDone's done-path transition, guarded on the claim: the
+			// dispatch loop's spawn pass picks the review up next tick.
+			tag, err := tx.Exec(ctx, `
+				UPDATE tasks
+				SET status = 'review', done_at = NOW(), claimed_by = NULL, claimed_at = NULL
+				WHERE id = $1 AND status = 'claimed'
+			`, f.taskID)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return nil // raced out of 'claimed' — the retire alone stands
+			}
+			_, err = tx.Exec(ctx, `
+				INSERT INTO task_context (task_id, agent_id, kind, content)
+				VALUES ($1, $2, 'verdict', $3)
+			`, f.taskID, f.agentID, "silent_success: turn ended without maquinista-done; artifacts complete (PR open, branch current) — task sent straight to review (ADR-0008)")
+			return err
+		}
+	} else {
+		note += "; claim requeues to ready (no respawn budget burned)"
+	}
+	applied, err := pipeline.RetireFrozenAgentCause(ctx, pool, f.agentID, f.taskID, note, silentSuccessHuman(artifacts), pipeline.CauseSilentSuccess, cleanup)
+	if err != nil {
+		return false, err
+	}
+	if applied {
+		if artifacts {
+			log.Printf("taskscheduler: watchdog retired silent-success %s on %s — artifacts complete, straight to review (budget untouched)", f.agentID, f.taskID)
+		} else {
+			log.Printf("taskscheduler: watchdog retired silent-success %s on %s — reaper requeues same wake (budget untouched)", f.agentID, f.taskID)
+		}
+	}
+	return applied, nil
 }
 
 // restartCohortSQL: live task-scoped rows that predate `boot` ($1) and
@@ -186,7 +294,8 @@ func HealRestartCohort(ctx context.Context, pool *pgxpool.Pool, boot time.Time, 
 	var unswept []ghost
 	for _, g := range ghosts {
 		note := fmt.Sprintf("watchdog: restart cohort — %s predates this boot (last_seen before startup) and never streamed; auto-retired, task re-dispatches per its state", g.agentID)
-		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, g.agentID, g.taskID, note, func(tx pgx.Tx) error {
+		human := "a leftover agent from before the restart never produced output — retired it; the task re-dispatches automatically. No action needed."
+		applied, err := pipeline.RetireFrozenAgentCleanup(ctx, pool, g.agentID, g.taskID, note, human, func(tx pgx.Tx) error {
 			// Release a fix episode the ghost was working (same cleanup as
 			// the fixer freeze arm) so fixerPass can re-arm it. No-op for
 			// every other role/status.

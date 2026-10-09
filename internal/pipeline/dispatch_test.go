@@ -109,13 +109,13 @@ func agentStatus(t *testing.T, pool *pgxpool.Pool, agentID string) string {
 	return v
 }
 
-// pipelineNotifications counts pipeline-topic outbox rows mentioning the
-// stuck-implementor auto-retire — the exactly-once notification surface.
+// pipelineNotifications counts pipeline-topic outbox rows announcing the
+// stuck-implementor retire — the exactly-once notification surface.
 func pipelineNotifications(t *testing.T, pool *pgxpool.Pool, taskID string) int {
 	t.Helper()
 	return count(t, pool, `
 		SELECT count(*) FROM agent_outbox
-		WHERE agent_id = 'pipeline' AND content->>'text' LIKE '%auto-retired%'
+		WHERE agent_id = 'pipeline' AND content->>'text' LIKE '%retired it%'
 		  AND content->>'text' LIKE '%' || $1 || '%'
 	`, taskID)
 }
@@ -484,7 +484,7 @@ func TestWatchdog_FrozenReviewerRetired(t *testing.T) {
 	var notifies int
 	if err := pool.QueryRow(ctx, `
 		SELECT COUNT(*) FROM agent_outbox
-		WHERE agent_id = 'pipeline' AND content->>'text' LIKE '%watchdog%'
+		WHERE agent_id = 'pipeline' AND content->>'text' LIKE '%reviewer went silent%'
 	`).Scan(&notifies); err != nil {
 		t.Fatalf("notify count: %v", err)
 	}
@@ -627,9 +627,9 @@ func TestWatchdog_RespawnCapParks(t *testing.T) {
 	// each guarded retire writes are the budget ledger.
 	for i := 0; i < 3; i++ {
 		execOK(t, pool, `
-			INSERT INTO task_context (task_id, agent_id, kind, content)
+			INSERT INTO task_context (task_id, agent_id, kind, content, cause)
 			VALUES ('tc', 'reviewer-tc', 'observation',
-			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired')
+			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired', 'true_freeze')
 		`)
 	}
 
@@ -672,9 +672,9 @@ func TestWatchdog_RespawnCapParks(t *testing.T) {
 	execOK(t, pool, `UPDATE tasks SET review_rounds = 2 WHERE id = 'td'`)
 	for i := 0; i < 3; i++ {
 		execOK(t, pool, `
-			INSERT INTO task_context (task_id, agent_id, kind, content)
+			INSERT INTO task_context (task_id, agent_id, kind, content, cause)
 			VALUES ('td', 'reviewer-td', 'observation',
-			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired')
+			        'watchdog: reviewer frozen (round 1) — no outbox activity; auto-retired', 'true_freeze')
 		`)
 	}
 	if err := watchdogPass(ctx, pool, 30*time.Minute, 10*time.Minute, 3, "sess", nil, parkFanout{}); err != nil {

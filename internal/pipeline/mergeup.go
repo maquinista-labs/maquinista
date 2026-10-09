@@ -97,8 +97,8 @@ func mergeUpAfterConflict(ctx context.Context, pool *pgxpool.Pool, cfg MergeConf
 			db.AddObservation(pool, taskID, "merger",
 				fmt.Sprintf("Auto merge-up healed stale branch %s: origin/%s folded in via %s; re-checked mergeable — proceeding to gates.",
 					entry.Branch, base, method))
-			notifyTaskf(ctx, pool, taskID, "🔀 %s: branch %s was stale — auto merge-up (%s) folded origin/%s in; merge gates re-running.%s",
-				taskTitle(ctx, pool, taskID), entry.Branch, method, base, prLinkSuffix(ctx, pool, taskID))
+			notifyTaskf(ctx, pool, taskID, "🔀 %s: the branch was stale — an automatic merge-up (%s) folded origin/%s in; merge gates re-run. No action needed.",
+				taskTitle(ctx, pool, taskID), method, base)
 			log.Printf("pipeline: merge %s conflict healed by auto merge-up (%s) on branch %s", taskID, method, entry.Branch)
 			return finishMergeGH(ctx, pool, cfg, fan, prov, teamID, entry, info, wt, base, pr)
 		}
@@ -249,16 +249,16 @@ func mergeUpCommentBody(branch, base string, files []string, attempts int, alrea
 	}
 	if alreadyParked {
 		if attempts < maxMergeUps {
-			b.WriteString("\n\nThe parked-branch merge-up will retry on a later pass; after 2 failed merge-ups it goes quiet — the task keeps its needs-human 🆘.")
+			b.WriteString("\n\nThe parked-branch merge-up will retry on a later pass; after 2 failed merge-ups it goes quiet — the task stays parked for you (the 🆘 above asks for your decision).")
 		} else {
-			b.WriteString("\n\nMerge-up budget exhausted — the task stays parked needs-human and this pass goes quiet. Push a resolution, or comment `maquinista resolve` to spawn a merger session.")
+			b.WriteString("\n\nMerge-up budget exhausted — the task stays parked for you and this pass goes quiet. Push a resolution, or comment `maquinista resolve` to spawn a merger session.")
 		}
 		return b.String()
 	}
 	if attempts < maxMergeUps {
-		b.WriteString("\nThe merge gate will retry on the next pass; after 2 failed merge-ups the task parks needs-human.")
+		b.WriteString("\nThe merge gate will retry on the next pass; after 2 failed merge-ups the task parks for a human decision.")
 	} else {
-		b.WriteString("\n\nTask parked needs-human — push a resolution, or comment `maquinista resolve` to spawn a merger session.")
+		b.WriteString("\n\nTask parked for you — push a resolution, or comment `maquinista resolve` to spawn a merger session.")
 	}
 	return b.String()
 }
@@ -429,8 +429,8 @@ func parkedMergeUpOne(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, 
 			db.AddObservation(pool, taskID, "merger",
 				fmt.Sprintf("Parked branch %s was stale — auto merge-up (%s) folded origin/%s in; mergeable again for the next approve.",
 					branch, method, base))
-			notifyTaskf(ctx, pool, taskID, "🔀 %s: parked branch %s was stale — auto merge-up (%s) folded origin/%s in; still parked, but the branch is mergeable again.%s",
-				taskTitle(ctx, pool, taskID), branch, method, base, prLinkSuffix(ctx, pool, taskID))
+			notifyTaskf(ctx, pool, taskID, "🔀 %s: parked branch %s was stale — auto merge-up (%s) folded origin/%s in; still parked, but the branch is mergeable again.",
+				taskTitle(ctx, pool, taskID), branch, method, base)
 			log.Printf("pipeline: parked merge-up healed %s branch %s via %s", taskID, branch, method)
 			return true, nil
 		}
@@ -482,8 +482,8 @@ func parkedMergeUpOne(ctx context.Context, pool *pgxpool.Pool, cfg MergeConfig, 
 		// tick away from this code path.
 		db.AddObservation(pool, taskID, "merger",
 			fmt.Sprintf("Parked branch %s still conflicts with origin/%s after %d merge-up attempts — staying parked, pass goes quiet.", branch, base, attempts))
-		notifyTaskf(ctx, pool, taskID, "🆘 %s: parked branch %s still conflicts with origin/%s after %d merge-up attempts — staying parked needs-human. Push a resolution, or comment `maquinista resolve` on the PR to spawn a merger session.%s",
-			taskTitle(ctx, pool, taskID), branch, base, attempts, prLinkSuffix(ctx, pool, taskID))
+		notifyTaskf(ctx, pool, taskID, "🆘 %s: parked branch %s still conflicts with origin/%s after %d merge-up attempts — parked for you. Push a resolution, or comment `maquinista resolve` on the PR to spawn a merger session.",
+			taskTitle(ctx, pool, taskID), branch, base, attempts)
 	}
 	return true, nil
 }

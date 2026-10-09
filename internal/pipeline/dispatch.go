@@ -259,6 +259,12 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := promptPass(ctx, pool, cfg.Gh); err != nil {
 			log.Printf("pipeline: dispatch: prompt pass: %v", err)
 		}
+		// ADR-0008 F3: one-shot completion nudges for review legs — runs
+		// before the verdict pass so a turn-ended reviewer is re-prompted
+		// within one tick of the signal landing.
+		if err := nudgePass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace); err != nil {
+			log.Printf("pipeline: dispatch: nudge pass: %v", err)
+		}
 		if err := verdictPass(ctx, pool, cfg.Gh, fan, cfg.MaxReviewRounds, cfg.SessionName, killWindow); err != nil {
 			log.Printf("pipeline: dispatch: verdict pass: %v", err)
 		}
@@ -431,8 +437,10 @@ func retireStuckImplementor(ctx context.Context, pool *pgxpool.Pool, taskID stri
 	if tag.RowsAffected() == 0 {
 		return false, true, nil // raced to dead elsewhere — no notification
 	}
-	notifyTaskf(ctx, pool, taskID, "🆘 %s: implementor %s ended its turn without retiring (idle > %s, no completion processed) — auto-retired it; review proceeds. If the PR looks complete this needs no action.%s",
-		taskTitle(ctx, pool, taskID), agentID, idleAfter, prLinkSuffix(ctx, pool, taskID))
+	// MAQ-37: prose, not the internal id — the retired row is identified as
+	// the implementor (role), never as `implementor-<uuid>[-rN]`.
+	notifyTaskf(ctx, pool, taskID, "🆘 %s: %s ended its turn without announcing completion (silent for ~%s) — retired it; review proceeds. If the PR looks complete, no action needed.",
+		taskTitle(ctx, pool, taskID), roleHuman(agentID), DurHuman(idleAfter))
 	return true, true, nil
 }
 
@@ -565,8 +573,9 @@ func recordReviewRound(ctx context.Context, pool *pgxpool.Pool, g GhRunner, agen
 	// MAQ-22: the round's claim announces itself exactly once — this bump
 	// runs once per spawned reviewer (the spawn pass's no-live-reviewer
 	// filter is the guard), so the journey stays visible in the topic
-	// without re-firing on later ticks.
-	notifyf(ctx, pool, "👀 %s: reviewer claimed — review round %d starting.",
+	// without re-firing on later ticks. Task-stamped (MAQ-37): the note is
+	// task-scoped, so it rides the issue/PR links + reply-to-task key.
+	notifyTaskf(ctx, pool, taskID, "👀 %s: code review round %d starting.",
 		TaskTitle(ctx, pool, taskID), round)
 
 	content, err := json.Marshal(map[string]any{
@@ -714,9 +723,12 @@ func enqueueReviewPrompt(ctx context.Context, pool *pgxpool.Pool, g GhRunner, ag
 }
 
 // liveReviewersSQL drives both the verdict pass and the watchdog: live
-// reviewer agents on pipeline tasks still in 'review'.
+// reviewer agents on pipeline tasks still in 'review'. The trailing cause
+// expression is the ADR-0008 freeze classification — only the watchdog
+// reads it; verdictPass scans past it.
 const liveReviewersSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds,
+       ` + FreezeCauseSelectSQL + `
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE a.role = '` + reviewerRole + `'
@@ -856,17 +868,21 @@ func applyVerdict(ctx context.Context, pool *pgxpool.Pool, agentID, taskID, verd
 }
 
 // liveReviewer is one live reviewer/fixer pane on a pipeline task. The
-// title/round columns feed the EX-06 Pipeline-topic summaries.
+// title/round columns feed the EX-06 Pipeline-topic summaries; cause is
+// the ADR-0008 freeze classification (empty outside the watchdog).
 type liveReviewer struct {
 	agentID, session, window, taskID string
-	taskTitle                        string
-	round                            int
+	taskTitle                       string
+	round                           int
+	cause                           string
 }
 
 // liveFixersSQL drives the fixer watchdog arm: live fixer agents on
-// pipeline tasks still in changes_requested.
+// pipeline tasks still in changes_requested. Same trailing cause
+// expression as liveReviewersSQL (ADR-0008 watchdog classification).
 const liveFixersSQL = `
-SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds
+SELECT a.id, a.tmux_session, a.tmux_window, t.id, t.title, t.review_rounds,
+       ` + FreezeCauseSelectSQL + `
 FROM agents a
 JOIN tasks t ON t.id = a.task_id
 WHERE a.role = '` + fixerRole + `'
@@ -1105,8 +1121,9 @@ func recordFixEpisode(ctx context.Context, pool *pgxpool.Pool, agentID, taskID s
 	}
 	// MAQ-22: the episode marker above is the exactly-once guard — it is
 	// what fixerCandidatesSQL keys on — so the round-started one-liner
-	// fires exactly once per fixer episode.
-	notifyf(ctx, pool, "🔧 %s: fixer round %d started — resolving request_changes findings.",
+	// fires exactly once per fixer episode. Task-stamped (MAQ-37): links
+	// + reply-to-task key ride with the note.
+	notifyTaskf(ctx, pool, taskID, "🔧 %s: fixer round %d started — resolving the reviewer's findings.",
 		TaskTitle(ctx, pool, taskID), round)
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -1165,7 +1182,7 @@ func scanReviewers(ctx context.Context, pool *pgxpool.Pool, sql string, args []a
 	defer rows.Close()
 	for rows.Next() {
 		var r liveReviewer
-		if err := rows.Scan(&r.agentID, &r.session, &r.window, &r.taskID, &r.taskTitle, &r.round); err != nil {
+		if err := rows.Scan(&r.agentID, &r.session, &r.window, &r.taskID, &r.taskTitle, &r.round, &r.cause); err != nil {
 			return err
 		}
 		*out = append(*out, r)

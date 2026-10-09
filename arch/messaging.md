@@ -91,7 +91,19 @@ origin delivery.
    Independently of assistant text, the tailer also records raw transcript
    growth (any offset advance) as `agents.last_transcript_at` (throttled,
    MAQ-9) — liveness for the pipeline watchdog, which must not read a
-   mid-command agent's outbox silence as stalled.
+   mid-command agent's outbox silence as stalled. And when a batch ends on
+   an assistant text message — the transcript tail closing the turn — it
+   records the sticky `agents.last_turn_end_at` (ADR-0008): the completion
+   signal the pipeline's one-shot nudge legs and the freeze-cause
+   classifier consume (see pipeline.md §Watchdog, turn-end completion
+   contract).
+
+   The same growth tick also inspects the transcript tail for a TURN END
+   (assistant message with no pending tool call) on live pipeline agents
+   (ADR-0008 F1, MAQ-43): shadow mode — one structured journal line per
+   detection plus a boot-cumulative incidence count, no outbox row, no DB
+   write, no pipeline action. F2 turns the signal into the completion
+   nudge + cause-aware freeze ledger.
 
 4. **Relay** — `maquinista relay` daemon wakes, claims the outbox row,
    runs `fanoutDeliveries`:
@@ -218,7 +230,11 @@ the outbox content — inert for rendering (the dispatcher reads `text`
 only), but it is what makes a notification **reply-commentable** (MAQ-24):
 replied-to Telegram message id → `channel_deliveries` → outbox → task_id,
 and the reply lands as a PR comment (see `arch/pipeline.md`, "Telegram
-reply → PR comment").
+reply → PR comment"). Task-scoping is also the rendering seam (MAQ-37):
+`NotifyTask` decorates every task-scoped note with the Linear issue URL
+and the PR URL when one exists, and notes are written for the human —
+`[MAQ-n] <title>` headlines, worker roles instead of internal agent ids,
+plain-language status sentences (`arch/pipeline.md`, "Telegram plumbing").
 
 ## in_reply_to is a routing hint, not required
 

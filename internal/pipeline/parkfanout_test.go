@@ -50,8 +50,10 @@ func TestNotifyParkFanout_PostsBothSurfaces(t *testing.T) {
 		t.Fatalf("PR comments = %d, want 1 (%v)", len(poster.bodies), poster.bodies)
 	}
 	body := poster.bodies[0]
+	// MAQ-37: the fan-out headline is the canonical `[MAQ-n] <title>` from
+	// ticket_issue_map — the same identifier Linear and the PR title use.
 	for _, want := range []string{
-		"[MAQ-x] fanout task",
+		"[MAQ-99] fanout task",
 		"Review round cap 3 reached (request_changes).",
 		"comment `approve` on the PR",
 		"./maquinista approve " + taskID,

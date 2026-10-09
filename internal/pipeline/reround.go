@@ -219,8 +219,8 @@ func reopenReview(ctx context.Context, d CommentDeps, taskID, worktree string, c
 		return "", err
 	}
 
-	notifyTaskf(ctx, d.Pool, taskID, "💬 %s: @%s commented on the PR — back to review for a fresh round; the objection gates the merge.%s",
-		taskTitle(ctx, d.Pool, taskID), c.Author, prLinkSuffix(ctx, d.Pool, taskID))
+	notifyTaskf(ctx, d.Pool, taskID, "💬 %s: @%s commented on the PR — back to review for a fresh round; the objection gates the merge.",
+		taskTitle(ctx, d.Pool, taskID), c.Author)
 	log.Printf("pipeline: reround: %s flipped ready_to_merge → review by @%s's PR comment (pending merge entry failed)", taskID, c.Author)
 	return "", nil
 }
@@ -335,8 +335,8 @@ func spawnCommentFixer(ctx context.Context, d CommentDeps, taskID string, rounds
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
-	notifyTaskf(ctx, d.Pool, taskID, "🔧 %s: fixer round %d started — re-round on @%s's PR comment.%s",
-		taskTitle(ctx, d.Pool, taskID), rounds, c.Author, prLinkSuffix(ctx, d.Pool, taskID))
+	notifyTaskf(ctx, d.Pool, taskID, "🔧 %s: fixer round %d started — working @%s's PR comment.",
+		taskTitle(ctx, d.Pool, taskID), rounds, c.Author)
 
 	// The fix prompt carries the comment as the work order; a failure logs —
 	// fixerPromptHealSQL heals request_changes episodes on the next tick

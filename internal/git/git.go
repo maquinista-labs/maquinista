@@ -338,6 +338,23 @@ func IsAncestor(dir, ancestorRef, descendantRef string) (bool, error) {
 	}
 }
 
+// BranchUpToDate answers the ADR-0008 silent-success artifacts question:
+// is the worktree's branch clean and current with base (nothing
+// uncommitted, base fully merged in)? Refreshes the remote ref first —
+// "up to date" is only meaningful against a fresh origin. False on any
+// git failure: conservative by design, so a read error can never send a
+// half-done branch straight to review.
+func BranchUpToDate(dir, base string) bool {
+	if err := Fetch(dir, "origin"); err != nil {
+		return false
+	}
+	if dirty, err := HasUncommittedChanges(dir); err != nil || dirty {
+		return false
+	}
+	ok, err := IsAncestor(dir, "origin/"+base, "HEAD")
+	return err == nil && ok
+}
+
 // PushHEAD pushes the current HEAD (typically a detached throwaway worktree)
 // to remote's branch as a strict fast-forward — no force. The auto merge-up
 // uses it to publish a merge commit created on top of the remote branch tip;

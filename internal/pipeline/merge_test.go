@@ -850,7 +850,7 @@ func TestProcessMergeGH_CICapParksNeedsHuman(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("attempt 1 emitted %d notes, want exactly 1 gate-red note", len(texts))
 	}
-	for _, want := range []string{"🟥", "gate red (ci)", "attempt 1/2", "will re-check"} {
+	for _, want := range []string{"🟥", "CI is red on PR #99", "attempt 1/2", "the merge queue re-checks automatically", "No action needed"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("gate-red note %q missing %q", texts[0], want)
 		}
@@ -880,10 +880,15 @@ func TestProcessMergeGH_CICapParksNeedsHuman(t *testing.T) {
 	if len(texts) != 2 {
 		t.Fatalf("attempt 2 emitted %d total notes, want 2 (gate-red + cap question)", len(texts))
 	}
-	for _, want := range []string{"🆘", "CI failed 2 times", "parked needs-human", "maquinista approve " + taskID} {
+	for _, want := range []string{"🆘", "CI failed 2 times", "parked for you", "approve to retry the merge", "maquinista approve " + shortTaskID(taskID)} {
 		if !strings.Contains(texts[1], want) {
 			t.Errorf("note %q missing %q", texts[1], want)
 		}
+	}
+	// MAQ-37: the parked question must not push config toggles at the
+	// operator — that is documentation, not an action.
+	if strings.Contains(texts[1], "PIPELINE_AUTO_MERGE") {
+		t.Errorf("note %q suggests env-var toggling", texts[1])
 	}
 }
 

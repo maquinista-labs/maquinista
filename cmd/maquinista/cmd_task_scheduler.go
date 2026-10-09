@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/maquinista-labs/maquinista/internal/git"
 	"github.com/maquinista-labs/maquinista/internal/orchestrator"
 	"github.com/maquinista-labs/maquinista/internal/taskscheduler"
 	"github.com/maquinista-labs/maquinista/internal/tmux"
@@ -47,6 +48,13 @@ var taskSchedulerCmd = &cobra.Command{
 			// MAQ-38 AC 2: freeze-retire notes state whether a pane existed
 			// for the retired id (name-based probe — panes are -n <agentID>).
 			PaneExists: tmux.WindowNameExists,
+			// ADR-0008: silent-success freeze retires consult the artifacts
+			// question (open PR + branch current) before requeueing vs
+			// straight-to-review. Conservative probe: git errors read as
+			// "not up to date" and never misroute a half-done branch.
+			BranchUpToDate: func(worktree string) bool {
+				return git.BranchUpToDate(worktree, "main")
+			},
 		}
 		return taskscheduler.Run(ctx, pool, cfg)
 	},

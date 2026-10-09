@@ -174,7 +174,7 @@ func TestRunMergeDrainPass_AttemptsCapParksNeedsHuman(t *testing.T) {
 		t.Fatalf("attempt 1: entry = %q, want released to pending", got)
 	}
 	texts := pipelineNotifyTextsPool(t, pool)
-	if len(texts) != 1 || !strings.Contains(texts[0], "gate red (ci)") || !strings.Contains(texts[0], "attempt 1/2") {
+	if len(texts) != 1 || !strings.Contains(texts[0], "CI is red on PR #98") || !strings.Contains(texts[0], "attempt 1/2") {
 		t.Fatalf("attempt 1 notified: %q, want exactly the gate-red one-liner", texts)
 	}
 
@@ -315,7 +315,7 @@ func TestRunMergeDrainPass_TestGateLoopsFixerThenParks(t *testing.T) {
 	if len(texts) != 1 {
 		t.Fatalf("emitted %d notes, want 1: %q", len(texts), texts)
 	}
-	for _, want := range []string{"🆘", "test gate failed", "go test .", "Back to the fixer", "round 1 of 3"} {
+	for _, want := range []string{"🆘", "test gate failed", "go test .", "Sending it back to the fixer", "attempt 1 of 3"} {
 		if !strings.Contains(texts[0], want) {
 			t.Errorf("note %q missing %q", texts[0], want)
 		}
@@ -356,9 +356,9 @@ func TestRunMergeDrainPass_TestGateLoopsFixerThenParks(t *testing.T) {
 		if processed, err := RunMergeDrainPass(context.Background(), pool, cfg, &fakeProvider{}, "team-1"); err != nil || !processed {
 			t.Fatalf("round %d: processed=%v err=%v", round, processed, err)
 		}
-		wantStatus, wantText := "changes_requested", "Back to the fixer"
+		wantStatus, wantText := "changes_requested", "Sending it back to the fixer"
 		if round >= maxGateFixRounds {
-			wantStatus, wantText = "pending_approval", "parked needs-human"
+			wantStatus, wantText = "pending_approval", "Parked for you after 3 gate failures"
 		}
 		if status, _ := taskRow(t, pool, taskID); status != wantStatus {
 			t.Errorf("round %d: task = %s, want %s", round, status, wantStatus)

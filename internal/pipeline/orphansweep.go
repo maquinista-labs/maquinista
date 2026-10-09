@@ -181,8 +181,8 @@ func backfillLiveOrphan(ctx context.Context, pool *pgxpool.Pool, o orphanAgent, 
 	`, taskID, o.id, note); err != nil {
 		log.Printf("pipeline: orphan sweep: observation for %s: %v", o.id, err)
 	}
-	notifyTaskf(ctx, pool, taskID, "🩹 %s: %s — unbound %s row (%s) re-attached to the task; its turn is processable again.%s",
-		TaskTitle(ctx, pool, taskID), note, o.status, o.id, prLinkSuffix(ctx, pool, taskID))
+	notifyTaskf(ctx, pool, taskID, "🩹 %s: %s — unbound %s row (%s) re-attached to the task; its turn is processable again.",
+		TaskTitle(ctx, pool, taskID), note, o.status, o.id)
 	log.Printf("pipeline: orphan sweep: backfilled task_id of live %s row %s → %s", o.role, o.id, taskID)
 }
 
@@ -241,8 +241,8 @@ func retireCompletedOrphan(ctx context.Context, pool *pgxpool.Pool, o orphanAgen
 			`, taskID, o.id, note); err != nil {
 				log.Printf("pipeline: orphan sweep: observation for %s: %v", o.id, err)
 			}
-			notifyTaskf(ctx, pool, taskID, "🆘 %s: %s — a completed fixer's round went unprocessed; the episode was re-armed and a fresh fixer respawns.%s",
-				TaskTitle(ctx, pool, taskID), note, prLinkSuffix(ctx, pool, taskID))
+			notifyTaskf(ctx, pool, taskID, "🆘 %s: %s — a completed fixer's round went unprocessed; the episode was re-armed and a fresh fixer respawns.",
+				TaskTitle(ctx, pool, taskID), note)
 			log.Printf("pipeline: orphan sweep: retired completed fixer %s (task %s still changes_requested) — episode re-armed", o.id, taskID)
 			return
 		}

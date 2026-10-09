@@ -176,7 +176,7 @@ func TestParkedMergeUpPass_ConflictAttemptsCapThenQuiet(t *testing.T) {
 		t.Fatalf("tick 2: comments = %q, want the attempt-2 cap comment", gh.postedBodies)
 	}
 	texts := pipelineNotifyTextsPool(t, pool)
-	if len(texts) != 1 || !strings.Contains(texts[0], "🆘") || !strings.Contains(texts[0], "staying parked needs-human") {
+	if len(texts) != 1 || !strings.Contains(texts[0], "🆘") || !strings.Contains(texts[0], "parked for you") {
 		t.Fatalf("tick 2: notes = %q, want exactly one needs-human question", texts)
 	}
 	if ledger := parkedLedger(t, pool, taskID); ledger.MergeupAttempts != 2 {

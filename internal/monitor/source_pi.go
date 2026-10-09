@@ -90,15 +90,19 @@ type piSessionHeader struct {
 // piEntry is one JSONL line of a pi session file. Only Type "message"
 // carries conversation payload; everything else (session, model_change,
 // thinking_level_change, branch_summary, compaction, ...) is metadata to
-// skip.
+// skip. ID and Timestamp are entry-level — the turn-end detector (ADR-0008)
+// uses ID to dedup firings and Timestamp to freshness-gate them.
 type piEntry struct {
-	Type    string     `json:"type"`
-	Message *piMessage `json:"message"`
+	Type      string     `json:"type"`
+	ID        string     `json:"id"`
+	Timestamp string     `json:"timestamp"`
+	Message   *piMessage `json:"message"`
 }
 
 type piMessage struct {
-	Role    string      `json:"role"`
-	Content []piContent `json:"content"`
+	Role       string      `json:"role"`
+	Content    []piContent `json:"content"`
+	StopReason string      `json:"stopReason"`
 }
 
 type piContent struct {

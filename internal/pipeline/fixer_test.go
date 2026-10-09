@@ -389,9 +389,9 @@ func TestFixerWatchdog_RespawnCapParks(t *testing.T) {
 	`)
 	for i := 0; i < 3; i++ {
 		execOK(t, pool, `
-			INSERT INTO task_context (task_id, agent_id, kind, content)
+			INSERT INTO task_context (task_id, agent_id, kind, content, cause)
 			VALUES ('fc', 'fixer-fc', 'observation',
-			        'watchdog: fixer frozen (round 1) — no outbox activity; auto-retired')
+			        'watchdog: fixer frozen (round 1) — no outbox activity; auto-retired', 'true_freeze')
 		`)
 	}
 
