@@ -3,6 +3,7 @@
 - **Status:** Aceito (2026-10-09 — Otavio ratified the direction in chat; see Rev 2. Remaining unanswered items moved to §Still open and gate the fase ADRs, not this one)
 - **Date:** 2026-10-09
 - **Amended:** 2026-10-09 — **Rev 2** (Otavio, chat): (1) landscape comparison refocused **Telegram-native**; (2) product surface = **our own IDE/app** — the existing dashboard splits out of the maquinista binary into a standalone web app, composed with the Telegram leg on top of maquinista execution; (3) agent execution isolated in **gVisor/microVM** sandboxes (ADR-0004's sandbox knob gets its concrete first value)
+- **Amended:** 2026-10-09 — **Rev 3** (Otavio, chat): pricing model decided — **BYOK only from day 1** (user's own OpenRouter/z.ai/Claude keys or runner-CLI subscription auth); we charge a **fixed platform subscription (ARR-style) on top of measured infrastructure cost** — never tokens. Predictable for us as we scale, predictable for the user (model spend stays on their own provider plans). Rev 1 pricing ladder marked superseded.
 - **Deciders:** Otavio
 - **Scope:** Product exploration — "what would a Grok-Bot analog for coding look like built on maquinista". Landscape snapshot (market-analysis type, re-runnable), capability have/miss inventory, priority-rated gap backlog, MVP fases, pricing ladders. NOT a build authorization; each fase that touches the repo state machine gets its own MAQ ticket + spec.
 - **Type:** 9 (market analysis snapshot) + 8 (product/GTM) hybrid; the landscape tables carry their own re-run procedure.
@@ -114,21 +115,31 @@ All OSS stars fetched via api.github.com 2026-10-09.
 ## MVP (fases; each = MAQ ticket + spec, state-machine-first)
 
 - **F0 — Invite pilot (weeks, zero new infra).** 5–10 hand-invited users on the existing box: allowlist entries + one repo each, flash-class runner, BYO repo via deploy-key. Proves demand + measures real cost/task + breaks the single-user assumptions in the wild. *DoD: 3 external users ship ≥1 merged PR each; cost-per-task ledger (manual) exists.*
-- **F1 — Tenant seam + onboarding.** Tenant column + scoping (state machine untouched), gVisor sandbox per session (Rev 2 tech; microVM later), GitHub App install + Telegram identity link, per-user audit log, dashboard split into the standalone web app (Rev 2 product shape). *DoD: a stranger goes from repo URL to first PR without Otavio touching the box.*
-- **F2 — Metering + billing.** Usage ledger (per task: turns, tokens, runner class, USD), quotas, Stripe checkout, BYOK option (user's Anthropic/OpenAI key for premium runners). *DoD: first $ collected; ledger reconciles with model invoices ±10%.*
+- **F1 — Tenant seam + onboarding.** Tenant column + scoping (state machine untouched), gVisor sandbox per session (Rev 2 tech; microVM later), GitHub App install + Telegram identity link, per-user audit log, dashboard split into the standalone web app (Rev 2 product shape), **per-user credentials vault — BYOK is a day-1 requirement (Rev 3)**: OpenRouter/z.ai/Claude keys or CLI subscription auth, injected only into the owning user's sandbox. *DoD: a stranger goes from repo URL to first PR without Otavio touching the box.*
+- **F2 — Metering + billing.** Fixed platform subscription (Stripe) — **no token billing (Rev 3)**; usage ledger repurposed for infra-cost attribution (session wall-clock, storage, bandwidth) + quotas. *DoD: first $ collected; infra cost per active user measured within ±20% and the tier formula calibrated.*
 - **F3 — Public launch.** Pricing ladder live, OTel cost tracing per task (ADR-0007 item), verdict guards + benchmark gate on reviewer quality, second runner tier GA. *DoD: public signup; weekly cohort retention reported.*
 
 **MVP = end of F2** (chargeable); public at F3.
 
-## Pricing (grounded in verified anchors; unit economics honest)
+## Pricing
 
-**Cost per task arithmetic** (assumptions: ~80 agent+review turns, ~30k tokens/turn blended, 3:1 in:out → ~1.8M in + 0.6M out; unit prices from LiteLLM aggregator table fetched 2026-10-09 — cross-check against vendor pages before launch):
+### Rev 3 — pricing model DECIDED (Otavio, 2026-10-09): BYOK + fixed platform subscription
+
+- **BYOK only from the beginning.** Every session runs on the user's own model access: OpenRouter / z.ai / Anthropic keys — or their existing **subscriptions via runner CLI auth** (the runner seam already spawns `claude`/`codex`/`pi` CLIs, which authenticate natively against Claude Max / ChatGPT / z.ai coding plans). Per-user credentials live in a vault (F1) injected only into that user's sandbox.
+- **We never bill tokens.** No credits, no pass-through, no margin on model spend.
+- **We charge a fixed platform subscription (ARR-style tiers) over measured infrastructure cost.** Our COGS = session wall-clock on gVisor/microVM + storage (worktrees, Postgres) + bandwidth — fixed-ish and forecastable. That is what makes the price predictable for us as we scale AND for the user: their model bill arrives from their own provider, unchanged by us.
+- **Tier numbers are a formula, calibrated by F0:** `tier price ≈ measured infra cost per active user × margin factor × concurrency allowance`. The F0 cost-ledger DoD is the calibration input; exact tiers land in the F2 pricing ADR. Free tier: BYOK with a small concurrent-session footprint cap.
+- **Value framing:** the user pays for the platform — pipeline, review gates, self-healing, hard isolation, the app — never for tokens.
+
+### Superseded Rev 1–2 pricing analysis (bundled-token scenario — kept for the record)
+
+**Cost per task arithmetic** (superseded Rev 3 for pricing; kept as the bundled-models scenario record — assumptions: ~80 agent+review turns, ~30k tokens/turn blended, 3:1 in:out → ~1.8M in + 0.6M out; unit prices from LiteLLM aggregator table fetched 2026-10-09 — cross-check against vendor pages before launch):
 
 - Flash-class (GLM-4.6 proxy $0.60/$2.20 per M; our glm-5.3-flash likely cheaper — UNVERIFIED): ~$2.4/task upper bound, plausibly **$0.3–1.0** with flash pricing + prompt caching.
 - Sonnet-class ($3/$15): 1.8×3 + 0.6×15 = **~$14.4/task** → a flat $20/mo unlimited-Sonnet plan is underwater at ~2 tasks. This is why Devin metered ACUs.
 - Opus-class ($5/$25): **~$24/task** — premium runners must be metered or BYOK, never bundled flat.
 
-**The margin law this implies:** *bundle the cheap runner, meter the premium one.* Any flat plan must be priced on flash-class COGS with premium tasks burning credits or BYOK.
+**The margin law this implies:** *(superseded Rev 3 — applied to the bundled-models scenario only; BYOK removes the model-spend margin problem entirely, our bill is infrastructure.)* *bundle the cheap runner, meter the premium one.* Any flat plan must be priced on flash-class COGS with premium tasks burning credits or BYOK.
 
 **Candidate ladder (feedback targets Q2/Q6 below):**
 
@@ -141,18 +152,18 @@ All OSS stars fetched via api.github.com 2026-10-09.
 
 ## Consequences
 
-- Positive: maquinista's hardest-won machinery (gates, review, self-healing) becomes the moat exactly when chat-native agents are commoditizing; empty verified niche; owned-silicon deploy story (ADR-0004) keeps COGS defensible.
-- Negative: multi-tenancy cuts across the state machine's assumptions (claimed_by identities, workspaces, souls) — F1 is the riskiest fase and needs its own ADR amendment; sandbox hardening is security work with real downside if rushed.
+- Positive: maquinista's hardest-won machinery (gates, review, self-healing) becomes the moat exactly when chat-native agents are commoditizing; empty verified niche; owned-silicon deploy story (ADR-0004) keeps COGS defensible. **Rev 3:** BYOK removes model-COGS risk and vendor margin squeeze entirely — our cost base is infrastructure only, so a fixed price holds as we scale.
+- Negative: multi-tenancy cuts across the state machine's assumptions (claimed_by identities, workspaces, souls) — F1 is the riskiest fase and needs its own ADR amendment; sandbox hardening is security work with real downside if rushed. **Rev 3:** BYOK adds onboarding friction (users need provider keys or CLI-authable subscriptions) and excludes plan-only users unless the runner CLIs' native subscription OAuth covers them.
 - Neutral: Slack/etc. legs stay cheap to add later (architecture already fans out); OSS single-user edition needs a license decision (Q4).
 
 ## Still open (gates the fase ADRs — original 8 with Rev 2 status)
 
 1. Target user first: prosumer devs ($20) vs teams ($40–80/seat)? — **open**
-2. Model bundling: BYOK-first vs bundled-credits-first? — **open**
+2. Model bundling — **ANSWERED Rev 3**: BYOK only from day 1 (OpenRouter/z.ai/Claude keys or runner-CLI subscription auth); no bundled tokens, ever
 3. MVP channel scope — **ANSWERED Rev 2**: Telegram-native wedge + our own web IDE/app (dashboard split); both legs from F1
 4. License split (single-tenant OSS vs hosted closed) — **open**
 5. Infra timing: barceloneta vs Hetzner substrate — **partially answered**: session isolation = gVisor now / microVM on ADR-0003 substrate; box/scale-out timing still open
-6. Pricing shape: credits vs task quotas — **open** (F2 pricing ADR input)
+6. Pricing shape — **ANSWERED Rev 3**: fixed platform subscription (ARR-style) over measured infra cost; no token/credit billing. Exact tiers land in the F2 pricing ADR, calibrated by the F0 cost ledger
 7. Product name — **open**
 8. ToS/privacy floor before first charge — **open**
 
