@@ -52,7 +52,63 @@ type Resolution struct {
 // and returns the new agent's canonical id. Supplied by the caller (the
 // bot) so routing stays DB-focused and the spawn/tmux/runner machinery
 // lives in cmd/maquinista. A nil SpawnFunc forces tier-4 picker fallback.
+//
+// MAQ-45: the SpawnFunc owns tier-3 repo enforcement — it picks the new
+// agent's cwd and must consult the per-user repo binding before creating
+// anything, returning an error that wraps ErrRepoForbidden on a
+// cross-user rejection. The ladder can't check tier 3 itself: the repo
+// only exists once the SpawnFunc has chosen it.
 type SpawnFunc func(ctx context.Context, userID, threadID string, chatID *int64) (string, error)
+
+// RepoPolicy decides whether userID may route to an agent rooted at
+// repoRoot (MAQ-45). It must return an error wrapping ErrRepoForbidden to
+// reject a cross-user route, nil to allow. A nil RepoPolicy allows every
+// user into every repo — the pre-MAQ-45 single-operator behavior.
+// Rejections are routing decisions surfaced to the user, not panics:
+// policy errors must not be DB failures.
+type RepoPolicy func(ctx context.Context, userID, repoRoot string) error
+
+// ErrRepoForbidden is the sentinel wrapped by RepoPolicy rejections (and
+// by tier-3 spawners rejecting a cross-user reuse). Callers check it with
+// errors.Is to render a user-facing rejection instead of a generic error.
+var ErrRepoForbidden = errors.New("routing: repo not allowed for user")
+
+// AgentRepoRoot resolves the repo an agent operates on:
+// agents.workspace_repo_root when set, falling back to the agent's cwd
+// (legacy rows predate the workspace columns). Returns "" for an unknown
+// agent or one with neither column set.
+func AgentRepoRoot(ctx context.Context, pool *pgxpool.Pool, agentID string) (string, error) {
+	if agentID == "" {
+		return "", nil
+	}
+	var root string
+	err := pool.QueryRow(ctx, `
+		SELECT COALESCE(NULLIF(workspace_repo_root,''), NULLIF(cwd,''), '')
+		FROM agents WHERE id=$1
+	`, agentID).Scan(&root)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("agent repo root lookup: %w", err)
+	}
+	return root, nil
+}
+
+// CheckAgentPolicy applies policy to the repo of agentID. Unknown agents
+// pass through so callers keep rendering their own "no such agent"
+// error; a nil policy passes. The policy's error is returned unwrapped so
+// errors.Is(err, ErrRepoForbidden) works at the call site.
+func CheckAgentPolicy(ctx context.Context, pool *pgxpool.Pool, policy RepoPolicy, userID, agentID string) error {
+	if policy == nil || agentID == "" {
+		return nil
+	}
+	root, err := AgentRepoRoot(ctx, pool, agentID)
+	if err != nil {
+		return err
+	}
+	return policy(ctx, userID, root)
+}
 
 // ErrRequirePicker means no tier resolved — caller must prompt the user.
 var ErrRequirePicker = errors.New("routing: no tier matched; show picker")
@@ -92,10 +148,16 @@ func ResolveAgentByToken(ctx context.Context, pool *pgxpool.Pool, token string) 
 	return id, nil
 }
 
-// Resolve walks the §8.1 routing ladder in order. Tiers 1 and 2 don't
+// Resolve walks the §8.1 ladder in order. Tiers 1 and 2 don't
 // mutate state; tier 3 spawns a fresh per-topic agent and writes an owner
 // binding in one go. Tier 4 (picker) is surfaced via ErrRequirePicker when
 // SpawnFunc is nil or returns an error.
+//
+// policy (MAQ-45) is consulted before delivering to an existing agent —
+// tier 1 (resolved mention) and tier 2 (owner binding). Tier 3's repo is
+// chosen by the SpawnFunc, which enforces the binding itself (see
+// SpawnFunc). A policy rejection wraps ErrRepoForbidden; a nil policy
+// allows everything.
 //
 // Concurrent tier-3 writers race cleanly: the partial unique index on
 // (user_id, thread_id) WHERE binding_type='owner' picks a single winner and
@@ -104,6 +166,7 @@ func Resolve(
 	ctx context.Context,
 	pool *pgxpool.Pool,
 	spawnFn SpawnFunc,
+	policy RepoPolicy,
 	userID, threadID string,
 	chatID *int64,
 	text string,
@@ -113,6 +176,11 @@ func Resolve(
 		canonical, err := ResolveAgentByToken(ctx, pool, token)
 		if err != nil {
 			return nil, fmt.Errorf("tier 1 resolve token: %w", err)
+		}
+		if canonical != "" {
+			if perr := CheckAgentPolicy(ctx, pool, policy, userID, canonical); perr != nil {
+				return nil, fmt.Errorf("tier 1 policy: %w", perr)
+			}
 		}
 		resolved := canonical
 		if resolved == "" {
@@ -129,6 +197,9 @@ func Resolve(
 		return nil, fmt.Errorf("tier 2 owner lookup: %w", err)
 	}
 	if ownerID != "" {
+		if perr := CheckAgentPolicy(ctx, pool, policy, userID, ownerID); perr != nil {
+			return nil, fmt.Errorf("tier 2 policy: %w", perr)
+		}
 		return &Resolution{AgentID: ownerID, Tier: TierOwnerBinding, Text: text}, nil
 	}
 
@@ -155,10 +226,15 @@ func Resolve(
 }
 
 // ConfirmPickerChoice is called when the user selects an agent in the tier-4
-// picker. Writes the owner binding and returns the chosen agent.
-func ConfirmPickerChoice(ctx context.Context, pool *pgxpool.Pool, userID, threadID string, chatID *int64, agentID string) (*Resolution, error) {
+// picker. Writes the owner binding and returns the chosen agent. A nil
+// policy allows every choice; a policy rejection wraps ErrRepoForbidden
+// and writes nothing.
+func ConfirmPickerChoice(ctx context.Context, pool *pgxpool.Pool, policy RepoPolicy, userID, threadID string, chatID *int64, agentID string) (*Resolution, error) {
 	if agentID == "" {
 		return nil, errors.New("ConfirmPickerChoice: empty agent_id")
+	}
+	if perr := CheckAgentPolicy(ctx, pool, policy, userID, agentID); perr != nil {
+		return nil, fmt.Errorf("picker policy: %w", perr)
 	}
 	bindingSet, resolvedID, err := writeOwnerBinding(ctx, pool, userID, threadID, chatID, agentID)
 	if err != nil {
@@ -170,14 +246,19 @@ func ConfirmPickerChoice(ctx context.Context, pool *pgxpool.Pool, userID, thread
 // SetUserDefault is the /agent_default slash command: attach (user, thread)
 // to an already-existing agent identified by id or handle. Unknown tokens
 // return an error — creation happens only via tier-3 spawn on a regular
-// message, never from /agent_default.
-func SetUserDefault(ctx context.Context, pool *pgxpool.Pool, userID, threadID string, chatID *int64, token string) (*Resolution, error) {
+// message, never from /agent_default. policy (MAQ-45) rejects attaching a
+// topic to an agent outside the user's repos (ErrRepoForbidden); nil
+// policy allows everything.
+func SetUserDefault(ctx context.Context, pool *pgxpool.Pool, policy RepoPolicy, userID, threadID string, chatID *int64, token string) (*Resolution, error) {
 	canonical, err := ResolveAgentByToken(ctx, pool, token)
 	if err != nil {
 		return nil, err
 	}
 	if canonical == "" {
 		return nil, ErrUnknownAgent
+	}
+	if perr := CheckAgentPolicy(ctx, pool, policy, userID, canonical); perr != nil {
+		return nil, fmt.Errorf("agent_default policy: %w", perr)
 	}
 	tx, err := pool.Begin(ctx)
 	if err != nil {

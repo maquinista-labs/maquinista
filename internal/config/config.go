@@ -18,6 +18,14 @@ type Config struct {
 	QueueTopicID        int64
 	ApprovalsTopicID    int64
 
+	// UserRepos maps a Telegram user id to the repo roots they may drive
+	// (MAQ-45, ADR-0009 F0). Parsed from USER_REPOS as comma-separated
+	// <userID>:<repoRoot> pairs; a user may appear in several pairs to
+	// grant multiple repos. Users without an entry are unrestricted — the
+	// pre-MAQ-45 single-operator behavior. Consulted by the routing
+	// ladder before any spawn or owner-binding write.
+	UserRepos map[int64][]string
+
 	// Directories and sessions
 	MaquinistaDir        string
 	TmuxSessionName string
@@ -147,6 +155,11 @@ func Load(envFile ...string) (*Config, error) {
 		}
 	}
 
+	userRepos, err := parseUserRepos(os.Getenv("USER_REPOS"))
+	if err != nil {
+		return nil, fmt.Errorf("invalid USER_REPOS: %w", err)
+	}
+
 	dir := os.Getenv("MAQUINISTA_DIR")
 	if dir == "" {
 		dir = "~/.maquinista"
@@ -219,6 +232,7 @@ func Load(envFile ...string) (*Config, error) {
 		TelegramBotToken:    token,
 		AllowedUsers:        users,
 		AllowedGroups:       groups,
+		UserRepos:           userRepos,
 		MaquinistaDir:            dir,
 		TmuxSessionName:     sessionName,
 		ClaudeCommand:       claudeCmd,
@@ -302,6 +316,71 @@ func parseBoolEnv(v string) bool {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "1", "true", "yes", "on":
 		return true
+	}
+	return false
+}
+
+// parseUserRepos parses USER_REPOS: comma-separated <userID>:<repoRoot>
+// pairs. A user may appear in several pairs — the repos accumulate in
+// order. Repo roots are ~-expanded and filepath.Clean'ed so config values
+// compare equal to the paths carried by agents.workspace_repo_root.
+// Empty input returns a nil map (every user unrestricted).
+func parseUserRepos(v string) (map[int64][]string, error) {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil, nil
+	}
+	out := make(map[int64][]string)
+	for _, part := range strings.Split(v, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		colon := strings.Index(part, ":")
+		if colon < 0 {
+			return nil, fmt.Errorf("parsing %q: want <userID>:<repoRoot>", part)
+		}
+		id, err := strconv.ParseInt(strings.TrimSpace(part[:colon]), 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("parsing %q: bad user id: %w", part, err)
+		}
+		repo := expandHome(strings.TrimSpace(part[colon+1:]))
+		if repo == "" {
+			return nil, fmt.Errorf("parsing %q: empty repo path", part)
+		}
+		out[id] = append(out[id], filepath.Clean(repo))
+	}
+	return out, nil
+}
+
+// ReposFor returns the repo roots userID is restricted to. restricted is
+// false when the user has no USER_REPOS entry — they may reach any repo,
+// the pre-MAQ-45 single-operator behavior.
+func (c *Config) ReposFor(userID int64) (repos []string, restricted bool) {
+	repos, ok := c.UserRepos[userID]
+	if !ok || len(repos) == 0 {
+		return nil, false
+	}
+	return repos, true
+}
+
+// MayAccessRepo reports whether userID may route to an agent rooted at
+// repoRoot. Unrestricted users (no USER_REPOS entry) always may.
+// Restricted users must match an entry exactly after path normalization;
+// an unresolvable repoRoot (empty) denies — the check fails closed.
+func (c *Config) MayAccessRepo(userID int64, repoRoot string) bool {
+	repos, restricted := c.ReposFor(userID)
+	if !restricted {
+		return true
+	}
+	repoRoot = filepath.Clean(strings.TrimSpace(repoRoot))
+	if repoRoot == "." {
+		return false
+	}
+	for _, r := range repos {
+		if r == repoRoot {
+			return true
+		}
 	}
 	return false
 }
