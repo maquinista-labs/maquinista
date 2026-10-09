@@ -35,6 +35,9 @@ All consumers use `LISTEN` + a poll fallback (10 s) so a missed `NOTIFY`
 | Table | Purpose |
 |-------|---------|
 | `agents` | One row per agent; status, tmux_window, runner_type, workspace, last_transcript_at (liveness, MAQ-9), last_turn_end_at + turn_end_nudged (ADR-0008 completion contract) |
+| `agent_turn_costs` | Per-turn token usage from runner usage events (monitor `CaptureTurn`); usd_cents frozen at insert time from `model_rates` |
+| `model_rates` | USD-cents per million tokens per model, versioned by `effective_from`; `v_model_rates_current` exposes the latest row per model |
+| `cost_ledger` | MAQ-47 cost-per-task ledger (ADR-0009 F0): trigger-maintained session×model rollup of `agent_turn_costs` + turn-end events, with `user_id`/`task_id` snapshotted at turn time so totals survive agent deletion (both raw tables cascade-delete with agents). Read via `maquinista ledger --by session\|task\|user`. No billing |
 | `agent_souls` | Per-agent identity / system prompt fields |
 | `soul_templates` | Reusable soul blueprints |
 | `agent_memory` | Key/value memory blocks appended to soul render |
