@@ -1,6 +1,6 @@
 # ADR-0004: Barceloneta NUC as the Execution Box — Owned Silicon First, Robot as Scale-Out
 
-- **Status:** Proposto (pending Otavio's ok)
+- **Status:** Aceito (2026-10-09, Otavio — de facto live: maquinista runs and deploys on barceloneta since early Oct 2026)
 - **Date:** 2026-10-01
 - **Amended:** 2026-10-02 — Phase 1/2: sandbox technology becomes a config knob
   (template indirection), not a promotion event (Otavio, live discussion)
