@@ -322,6 +322,16 @@ func spawnCommentFixer(ctx context.Context, d CommentDeps, taskID string, rounds
 	`, taskID, agentID, "round "+strconv.Itoa(rounds)); err != nil {
 		return "", fmt.Errorf("pipeline: reround: insert fix row for %s: %w", taskID, err)
 	}
+	// MAQ-41: claim the task for the comment-triggered fixer — same reason
+	// as recordFixEpisode: only a claimed_by match lets the fixer's
+	// maquinista-done advance the task. Runs after the unpark so the
+	// changes_requested guard holds for both arms of the switch above.
+	if _, err := tx.Exec(ctx, `
+		UPDATE tasks SET claimed_by = $2, claimed_at = NOW()
+		WHERE id = $1 AND status = 'changes_requested'
+	`, taskID, agentID); err != nil {
+		return "", fmt.Errorf("pipeline: reround: claim %s for fixer: %w", taskID, err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
