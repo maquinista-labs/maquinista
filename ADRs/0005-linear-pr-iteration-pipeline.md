@@ -1,6 +1,6 @@
 # ADR-0005: Linear-Driven PR Iteration Pipeline — tlc-spec-lean Execution via maquinista Agent Sessions
 
-- **Status:** Proposto (pending Otavio's ok)
+- **Status:** Aceito (2026-10-09, Otavio — de facto live: 43+ issues shipped through the pipeline since late Sep 2026)
 - **Date:** 2026-10-01
 - **Deciders:** Otavio
 - **Scope:** Linear ↔ maquinista bridge (intake + board mirror), tlc-spec-lean execution contract for task agents, reviewer/arbiter/fixer/merger agent roles, PR review-loop state machine, merge path (rebase + GH PR merge)

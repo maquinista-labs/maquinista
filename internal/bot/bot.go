@@ -58,6 +58,11 @@ type Bot struct {
 	// directly. May be nil; a nil spawner forces the routing ladder to
 	// surface the tier-4 picker via ErrRequirePicker.
 	topicAgentSpawner routing.SpawnFunc
+	// repoPolicy enforces the per-user repo binding (MAQ-45, USER_REPOS)
+	// across the ladder: mentions, owner bindings, the tier-4 picker, and
+	// /agent_default. Tier-3 spawn enforcement lives in the SpawnFunc
+	// itself (it owns cwd choice). Built in New; never nil after that.
+	repoPolicy routing.RepoPolicy
 
 	// Cloudflare Quick Tunnel manager (Phase 7 dashboard command).
 	tunnel *tunnel.Manager
@@ -104,6 +109,7 @@ func New(cfg *config.Config) (*Bot, error) {
 		api:                api,
 		config:             cfg,
 		state:              st,
+		repoPolicy:         repoPolicyFromConfig(cfg),
 		browseStates:       make(map[int64]*BrowseState),
 		windowCache:        make(map[int64][]tmux.Window),
 		windowPickerStates: make(map[int64]*windowPickerState),

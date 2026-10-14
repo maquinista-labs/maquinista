@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -60,6 +61,22 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		}
 		agentID := fmt.Sprintf("t-%d-%s", *chatID, threadID)
 
+		// MAQ-45 per-user repo binding: resolve the user's repo constraint
+		// before touching any state. Restricted users (USER_REPOS) root
+		// fresh agents in their first listed repo; reusing this topic's
+		// existing agent additionally requires that agent to sit inside
+		// their repos — a cross-user reuse is a routing rejection (fails
+		// closed), not a trust assumption. Whoever spawned the topic's
+		// agent first fixes the topic's repo.
+		userNum, uerr := strconv.ParseInt(userID, 10, 64)
+		if uerr != nil {
+			return "", fmt.Errorf("spawn_topic_agent: bad user id %q: %w", userID, uerr)
+		}
+		allowedRepos, restricted := cfg.ReposFor(userNum)
+		if restricted && len(allowedRepos) == 0 {
+			return "", fmt.Errorf("spawn_topic_agent: user %s has an empty repo binding", userID)
+		}
+
 		// If the row exists and its tmux window is live, reuse it — same
 		// topic, same agent. Matches "resume on re-send" semantics.
 		var status, existingWindow string
@@ -68,6 +85,17 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		`, agentID).Scan(&status, &existingWindow)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return "", fmt.Errorf("checking existing agent: %w", err)
+		}
+		existingRoot := ""
+		if err == nil {
+			root, rerr := routing.AgentRepoRoot(ctx, pool, agentID)
+			if rerr != nil {
+				return "", fmt.Errorf("spawn_topic_agent: agent repo lookup: %w", rerr)
+			}
+			if restricted && !cfg.MayAccessRepo(userNum, root) {
+				return "", fmt.Errorf("spawn_topic_agent: user %s: %w", userID, routing.ErrRepoForbidden)
+			}
+			existingRoot = root
 		}
 		if err == nil && isLiveStatus(status) && tmuxWindowExists(cfg.TmuxSessionName, existingWindow) {
 			log.Printf("spawn_topic_agent: %s already live at %s:%s; reusing",
@@ -103,6 +131,16 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 		cwd := defaultCWD
 		if cwd == "" {
 			return "", errors.New("spawn_topic_agent: no defaultCWD resolved")
+		}
+		if restricted {
+			// MAQ-45: fresh spawn roots in the user's first allowed repo; a
+			// respawn keeps the existing (already policy-verified) repo so
+			// the recorded workspace_repo_root stays truthful.
+			if existingRoot != "" {
+				cwd = existingRoot
+			} else {
+				cwd = allowedRepos[0]
+			}
 		}
 
 		// Per-user concurrent session cap (MAQ-46): before bringing a new
