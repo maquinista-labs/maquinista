@@ -20,6 +20,7 @@ Tier 2 — Owner binding
 Tier 3 — Spawn
   No binding found
   → call SpawnFunc (newTopicAgentSpawner)
+  → per-user live-session cap check (MAQ-46; see below)
   → creates agent id = t-<chatID>-<threadID>
   → writes owner binding
   → deliver to new agent
@@ -34,6 +35,26 @@ Tier 4 — Picker
 The tier-3 spawn id (`t-<chatID>-<threadID>`) is deterministic so
 re-spawning the same topic always reuses the same agent row and its
 conversation history.
+
+## Per-user concurrent session cap (tier-3 guard)
+
+Before a tier-3 spawn brings a new pane up, `routing.CheckSessionCap`
+counts the user's live agent rows — agents joined through owner bindings
+(`topic_agent_bindings.binding_type='owner'`) whose status is live
+(`running`/`working`/`idle`/`spawning`). At or above the cap, the spawn is
+rejected with a `*routing.SessionCapError` whose message is surfaced to
+the user verbatim (count, max, `/agent_kill` escape hatch).
+
+- Cap comes from `MAQUINISTA_MAX_AGENTS_PER_USER` (default 2); `<= 0`
+  disables the guard.
+- The incoming agent id is excluded from the count, so reusing an
+  already-live topic agent or respawning a stopped one never blocks —
+  only *new* panes are gated. The reuse fast paths in the spawner run
+  before the cap check anyway.
+- Best-effort by design (cheap runaway brake, not an accounting system):
+  two simultaneous spawns in different topics can race past it by one.
+- `agents` has no `user_id` column; owner bindings are the user→agent
+  link until a real multi-user ownership model exists.
 
 ## Per-user repo binding (MAQ-45)
 

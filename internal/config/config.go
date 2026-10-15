@@ -84,6 +84,15 @@ type Config struct {
 	// Configured via MAILBOX_DISPATCHER=1.
 	MailboxDispatcher bool
 
+	// MaxAgentsPerUser caps how many live (running/working/idle/spawning)
+	// agents a single user may own at once. Enforced at tier-3 spawn time:
+	// a spawn that would push the user past the cap is rejected with a
+	// readable message. Reuse of an already-live topic agent is never
+	// blocked. Cheap runaway guard until real quotas — not a billing or
+	// metering system. Configured via MAQUINISTA_MAX_AGENTS_PER_USER;
+	// defaults to 2.
+	MaxAgentsPerUser int
+
 	// Dashboard is the configuration for `maquinista dashboard`. See
 	// plans/active/dashboard.md.
 	Dashboard DashboardConfig
@@ -228,6 +237,15 @@ func Load(envFile ...string) (*Config, error) {
 		defaultAgentCWD = expandHome(defaultAgentCWD)
 	}
 
+	maxAgentsPerUser := 2
+	if v := strings.TrimSpace(os.Getenv("MAQUINISTA_MAX_AGENTS_PER_USER")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("invalid MAQUINISTA_MAX_AGENTS_PER_USER %q: must be an integer >= 1", v)
+		}
+		maxAgentsPerUser = n
+	}
+
 	return &Config{
 		TelegramBotToken:    token,
 		AllowedUsers:        users,
@@ -250,6 +268,7 @@ func Load(envFile ...string) (*Config, error) {
 		MailboxOutbound:      parseBoolEnv(os.Getenv("MAILBOX_OUTBOUND")),
 		MailboxInboundTopics: parseTopicList(os.Getenv("MAILBOX_INBOUND_TOPICS")),
 		MailboxDispatcher:    parseBoolEnv(os.Getenv("MAILBOX_DISPATCHER")),
+		MaxAgentsPerUser:     maxAgentsPerUser,
 		Dashboard:            loadDashboardConfig(),
 	}, nil
 }

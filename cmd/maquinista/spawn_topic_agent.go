@@ -143,6 +143,17 @@ func newTopicAgentSpawner(cfg *config.Config, pool *pgxpool.Pool, botState *stat
 			}
 		}
 
+		// Per-user concurrent session cap (MAQ-46): before bringing a new
+		// pane up, reject when the user already runs the configured maximum
+		// of live agents. Checked after the reuse/spawning fast paths above,
+		// so messaging an existing topic is never blocked — only new panes.
+		// The incoming agentID is excluded from the count so respawning a
+		// stopped topic never counts itself.
+		if cerr := routing.CheckSessionCap(ctx, pool, userID, agentID, cfg.MaxAgentsPerUser); cerr != nil {
+			log.Printf("spawn_topic_agent: cap rejected %s for user %s: %v", agentID, userID, cerr)
+			return "", cerr
+		}
+
 		if err := tmux.EnsureSession(cfg.TmuxSessionName); err != nil {
 			return "", fmt.Errorf("ensuring tmux session: %w", err)
 		}
