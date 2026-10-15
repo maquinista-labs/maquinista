@@ -450,7 +450,16 @@ episode re-armed (the round's fix row is released; task stays
 `changes_requested`), implementor → claim requeued to `ready` by the
 stale-claim reaper (the task scheduler runs the same freeze predicate
 every wake — `taskscheduler.RetireFrozenClaims`). Every auto-retire
-notifies; silence is never a heal.
+notifies; silence is never a heal. The fixer re-arm is role-contract aware
+(MAQ-54): where the fixer pass can re-derive the episode (the newest
+verdict IS `request_changes`) releasing the fix row is the transition; where it
+cannot — a comment-reround episode born from a park, whose newest verdict is
+`approve`/`needs_human`, so `fixerCandidatesSQL`'s LATERAL never re-selects the
+task (the a00c5d33/MAQ-46 wedge: 28 min on `changes_requested`, zero live
+agents, until an operator reset) — the retire tx REQUEUES the task to `ready`
+with the claim released, and the task scheduler re-derives the leg within its
+normal tick. A silent-success fixer therefore never leaves the task parked in
+`changes_requested` with no live agent.
 
 **Turn-end completion contract (ADR-0008).** The watchdog is a BACKSTOP,
 not the completion detector. The monitor records a sticky turn-end signal
@@ -492,8 +501,14 @@ false needs-human park):
   keeps MAQ-31's behavior exactly: budget burns, past the cap the task
   parks. Reviewer/fixer silent successes respawn/re-arm in-round for
   free (salvage still applies — a turn-ended reviewer very likely wrote
-  its findings). Mergers are out of scope: the money path keeps its
-  needs-human park (unclassified cause).
+  its findings) — and since MAQ-54 the fixer re-arm is a state
+  transition, never just a log line: an episode the fixer pass can
+  re-derive (newest verdict `request_changes`) releases its fix row for
+  the next fixerPass; a superseded episode (comment-reround from a park —
+  no `request_changes` verdict behind it) requeues the task to `ready`
+  with the claim released, so the scheduler re-derives the leg instead of
+  the task wedging unclaimed. Mergers are out of scope: the money path
+  keeps its needs-human park (unclassified cause).
 - **Bounds unchanged.** 30m idle / 10m spawn grace / respawn cap 3 — the
   watchdog stops being the primary completion detector and becomes the
   crash/hang safety net it should have been. Rows written before the
@@ -558,6 +573,29 @@ released too, so a human flip back re-arms clean). At the default bounds
 that spans ~2h — the old stall watchdog's accidental circuit-breaker
 window, now deliberate.
 
+**Dispatch-liveness belt (MAQ-54).** Every retire/verdict transition ends
+at a spawn leg owned by another pass — fixerPass mints fixers,
+dispatchPass mints reviewers, the task scheduler claims `ready` rows — and
+a spawn leg that silently fails (a worktree that evaporated between
+transitions, a candidate query that stopped matching the task's shape, a
+dead scheduler) strands the task in a state that EXPECTS a next agent row,
+with no live agent and nothing spawning, forever. `dispatchLivenessPass`
+(`liveness.go`, runs every dispatch tick after the watchdog) is the alarm
+for exactly that: a pipeline task sitting in `ready`/`claimed`/`review`/
+`changes_requested` with NO live agent row and no spawn attempt since the
+last piece of leg activity (anchor = newest of last agent-row start, last
+non-marker `task_context` write, task creation), past the spawn grace
+(`MAQUINISTA_WATCHDOG_SPAWN` — the same window a newborn may legitimately
+take to boot), fires ONE needs-human note on the Pipeline topic. Exactly-once
+per drop episode rides the claimParkFanout anchor-and-marker pattern: the
+single-statement claim inserts a `liveness` marker only when no newer
+marker exists, and any fresh activity re-arms the alarm for the NEXT drop.
+Notify-only by design — the auto-recovery is the transitions' job (MAQ-54
+made the silent-success re-arm one); the belt exists so a dropped dispatch
+is loud, not so it becomes a second dispatcher. `ready_to_merge` and the
+terminal/parked states are excluded: waiting for the approve verb there is
+the designed resting state.
+
 ## State machine first (recovery flows through transitions)
 
 The pipeline is a state machine: builder/fixer → independent review →
@@ -599,7 +637,7 @@ error — the guarded UPDATE's rowcount is the exactly-once guard.
 | `MAQUINISTA_TICKETS_APPROVERS` | ticket-system identities (email or display name, comma-separated) allowed to drive comment verbs; empty = fail-closed | (nobody) |
 | `MAQUINISTA_TICKETS_POLL` | claim-loop interval | `60s` |
 | `MAQUINISTA_WATCHDOG_IDLE` | freeze silence bound: a live pipeline agent with no outbox row AND no transcript growth this long (past the spawn grace) is auto-retired and its work re-dispatched (MAQ-31) | `30m` |
-| `MAQUINISTA_WATCHDOG_SPAWN` | freeze newborn grace: agents younger than this are never frozen (pi cold boot) | `10m` |
+| `MAQUINISTA_WATCHDOG_SPAWN` | freeze newborn grace: agents younger than this are never frozen (pi cold boot); also the dispatch-liveness bound (MAQ-54) — a spawn-expecting task with no live agent past this fires its one needs-human note | `10m` |
 | `MAQUINISTA_WATCHDOG_RESPAWN_CAP` | freeze→respawn circuit breaker: after this many watchdog retires of one episode (task+round for reviewer/fixer, task for implementor) the next freeze parks needs-human instead of re-dispatching | `3` |
 | `MAQUINISTA_IMPLEMENTOR_IDLE_AFTER` | stuck-implementor self-heal bound: outbox idleness past this retires a `uq_agents_task_live`-blocking implementor row | `10m` |
 | `MAQUINISTA_REVIEW_ROUNDS_MAX` | fixer-loop cap: the request_changes landing at/after this review round parks the task | `3` |
