@@ -29,7 +29,8 @@
 // On freeze: retire the row (the guarded UPDATE is the exactly-once 🆘
 // dedup), kill the pane, re-dispatch per role — reviewer → fresh -rN
 // reviewer in-round (task stays 'review'; dispatchPass mints), fixer →
-// episode re-armed (fix row released; fixerPass mints), implementor →
+// episode re-armed (fix row released; fixerPass mints — or, for episodes
+// the fixer pass cannot re-derive, a ready requeue; MAQ-54), implementor →
 // claim requeued to 'ready' (taskscheduler.RetireFrozenClaims + the
 // stale-claim reaper). Mergers keep their needs-human park: the money path
 // keeps a human gate. Every auto-retire notifies; a heal is never silent.
@@ -284,6 +285,53 @@ func insertSalvagedFindingsTx(ctx context.Context, tx pgx.Tx, taskID, agentID, f
 	return err
 }
 
+// fixerEpisodeSuperseded reports whether a fixer episode on a
+// changes_requested task is one the fixer pass can never re-derive: a
+// verdict NEWER than the newest request_changes verdict exists (the MAQ-30
+// comment-reround shape — the episode was born from a human comment on a
+// parked task, so an approve/needs_human verdict or a merge-gate park sits
+// behind it, not a request_changes). fixerCandidatesSQL JOIN-LATERALs on
+// the task's NEWEST verdict being request_changes, so for such an episode
+// a released fix row re-arms nothing — the silent-success re-arm must go
+// through 'ready' instead (MAQ-54: the a00c5d33/MAQ-46 wedge).
+func fixerEpisodeSuperseded(ctx context.Context, pool *pgxpool.Pool, taskID string) (bool, error) {
+	var superseded bool
+	err := pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM task_context v
+			WHERE v.task_id = $1 AND v.kind = 'verdict'
+			  AND v.created_at > COALESCE((
+				        SELECT MAX(rc.created_at) FROM task_context rc
+				        WHERE rc.task_id = $1 AND rc.kind = 'verdict'
+				          AND rc.content LIKE 'VERDICT: request_changes%'), '-infinity'::timestamptz)
+		)
+	`, taskID).Scan(&superseded)
+	return superseded, err
+}
+
+// requeueFixerEpisodeTx is the ready requeue half of a superseded fixer
+// episode's re-arm (MAQ-54): flips the task changes_requested → ready and
+// clears the claim INSIDE the retire tx, so the task scheduler re-derives
+// the leg within its normal tick — the state machine recovers, no operator
+// reset. Guarded on the status: a raced transition writes nothing.
+func requeueFixerEpisodeTx(ctx context.Context, tx pgx.Tx, taskID string) error {
+	tag, err := tx.Exec(ctx, `
+		UPDATE tasks SET status = 'ready', claimed_by = NULL, claimed_at = NULL
+		WHERE id = $1 AND status = 'changes_requested'
+	`, taskID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil // raced out of changes_requested — the retire alone stands
+	}
+	_, err = tx.Exec(ctx, `
+		INSERT INTO task_context (task_id, kind, content)
+		VALUES ($1, 'verdict', $2)
+	`, taskID, "silent_success: fixer turn ended without maquinista-done; the episode has no request_changes verdict for the fixer leg to re-derive — task requeued to ready (MAQ-54)")
+	return err
+}
+
 func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Duration, respawnCap int, sessionName string, killWindow func(session, windowID string) error, fan parkFanout) error {
 	args := []any{idle.Seconds(), spawn.Seconds()}
 
@@ -379,17 +427,46 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 		// ADR-0008: a silent-success fixer (turn ended without done) re-arms
 		// its episode for free — no park, no budget burn. A true freeze
 		// keeps the circuit breaker.
+		//
+		// MAQ-54: the re-arm is a STATE TRANSITION, not a log line. Where the
+		// fixer pass can re-derive the episode (newest verdict =
+		// request_changes), releasing the fix row IS the transition — the
+		// next fixerPass mints a fresh fixer. Where it cannot (a
+		// comment-reround episode born from a park: the newest verdict is
+		// approve/needs_human, so fixerCandidatesSQL never re-selects the
+		// task — the MAQ-46 a00c5d33 wedge that sat 28 min on
+		// changes_requested with zero live agents until an operator reset),
+		// the same tx requeues the task to ready with the claim released, and
+		// the task scheduler re-derives the leg within its normal tick.
 		if r.cause == CauseSilentSuccess {
+			superseded, err := fixerEpisodeSuperseded(ctx, pool, r.taskID)
+			if err != nil {
+				return err
+			}
 			note := fmt.Sprintf("watchdog: fixer turn-ended without done (round %d) — %s; auto-retired, fix episode re-armed (no respawn budget burned)", r.round, freezeCause(idle, spawn))
-			human := fmt.Sprintf("the fixer finished its turn without signalling done — retired it and re-armed the fix round with a fresh fixer. No action needed.")
+			human := "the fixer finished its turn without signalling done — retired it and re-armed the fix round with a fresh fixer. No action needed."
+			if superseded {
+				note = fmt.Sprintf("watchdog: fixer turn-ended without done (round %d) — %s; auto-retired, episode re-armed via ready requeue (no request_changes verdict behind it — the fixer leg cannot re-derive; no respawn budget burned)", r.round, freezeCause(idle, spawn))
+				human = "the fixer finished its turn without signalling done — retired it and returned the task to the ready queue; a fresh worker picks it up and re-derives the round. No action needed."
+			}
 			applied, err := RetireFrozenAgentCause(ctx, pool, r.agentID, r.taskID, note, human, CauseSilentSuccess, func(tx pgx.Tx) error {
-				return releaseFixEpisodeTx(ctx, tx, r.taskID)
+				if err := releaseFixEpisodeTx(ctx, tx, r.taskID); err != nil {
+					return err
+				}
+				if !superseded {
+					return nil
+				}
+				return requeueFixerEpisodeTx(ctx, tx, r.taskID)
 			})
 			if err != nil {
 				return err
 			}
 			if applied {
-				log.Printf("pipeline: dispatch: watchdog retired silent-success fixer %s on %s — episode re-armed (budget untouched)", r.agentID, r.taskID)
+				if superseded {
+					log.Printf("pipeline: dispatch: watchdog retired silent-success fixer %s on %s — episode re-armed via ready (fixer leg cannot re-derive: no request_changes verdict; scheduler re-claims)", r.agentID, r.taskID)
+				} else {
+					log.Printf("pipeline: dispatch: watchdog retired silent-success fixer %s on %s — episode re-armed (budget untouched)", r.agentID, r.taskID)
+				}
 				killReviewerPane(sessionName, r.session, r.window, killWindow)
 			}
 			continue
@@ -422,19 +499,42 @@ func watchdogPass(ctx context.Context, pool *pgxpool.Pool, idle, spawn time.Dura
 		}
 		note := fmt.Sprintf("watchdog: fixer frozen (round %d) — %s; auto-retired, fix episode re-armed", r.round, freezeCause(idle, spawn))
 		human := fmt.Sprintf("the fixer went silent (~%s with no activity) — retired it and re-armed the fix round with a fresh fixer. No action needed.", DurHuman(idle))
+		// MAQ-54: same re-arm contract as the silent-success arm — where the
+		// fixer pass cannot re-derive the episode (superseded: no
+		// request_changes verdict behind it), the requeue to ready IS the
+		// transition. A true freeze still burns its budget either way (the
+		// observation row below carries cause=true_freeze).
+		superseded, err := fixerEpisodeSuperseded(ctx, pool, r.taskID)
+		if err != nil {
+			return err
+		}
+		if superseded {
+			note = fmt.Sprintf("watchdog: fixer frozen (round %d) — %s; auto-retired, episode re-armed via ready requeue (no request_changes verdict behind it — the fixer leg cannot re-derive)", r.round, freezeCause(idle, spawn))
+			human = fmt.Sprintf("the fixer went silent (~%s with no activity) — retired it and returned the task to the ready queue; a fresh worker picks it up and re-derives the round. No action needed.", DurHuman(idle))
+		}
 		applied, err := RetireFrozenAgentCause(ctx, pool, r.agentID, r.taskID, note, human, CauseTrueFreeze, func(tx pgx.Tx) error {
 			// Release the episode: fixerCandidatesSQL keys on the round's
 			// fix row, so deleting it lets the next fixerPass mint a fresh
 			// fixer (-rN) for the SAME round. The frozen agent's own fix
 			// prompt row is already gone (RetireFrozenAgent drops its
 			// undriven prompts), so the re-armed episode re-enqueues clean.
-			return releaseFixEpisodeTx(ctx, tx, r.taskID)
+			if err := releaseFixEpisodeTx(ctx, tx, r.taskID); err != nil {
+				return err
+			}
+			if !superseded {
+				return nil
+			}
+			return requeueFixerEpisodeTx(ctx, tx, r.taskID)
 		})
 		if err != nil {
 			return err
 		}
 		if applied {
-			log.Printf("pipeline: dispatch: watchdog retired frozen fixer %s on %s — episode re-armed", r.agentID, r.taskID)
+			if superseded {
+				log.Printf("pipeline: dispatch: watchdog retired frozen fixer %s on %s — episode re-armed via ready (fixer leg cannot re-derive; scheduler re-claims)", r.agentID, r.taskID)
+			} else {
+				log.Printf("pipeline: dispatch: watchdog retired frozen fixer %s on %s — episode re-armed", r.agentID, r.taskID)
+			}
 			killReviewerPane(sessionName, r.session, r.window, killWindow)
 		}
 	}

@@ -1,6 +1,19 @@
 # ADR-0008: Turn-End Completion Contract for Pipeline Agents — Watchdog Demoted to Backstop
 
 - **Status:** Aceito (2026-10-08, Otavio — implementation tracked in MAQ tickets)
+- **Amended by:** MAQ-54 (2026-10-15) — the silent-success re-arm must be a STATE
+  TRANSITION, not a log line. ADR-0008 classified the cause and freed the budget,
+  but left "re-armed" meaning a released fix row plus hope that an existing pass
+  re-derives the leg. The a00c5d33/MAQ-46 incident (15/10 01:25 CEST) showed the
+  hole: a comment-reround fixer episode born from a merge-conflict park has no
+  `request_changes` verdict behind it, so `fixerCandidatesSQL` never re-selects
+  the task — the re-arm performed no state change and the task sat 28 min on
+  `changes_requested` with zero live agents until an operator reset. MAQ-54:
+  superseded episodes requeue to `ready` inside the retire tx (the scheduler
+  re-derives), standard episodes keep the in-place fixer re-claim, and a
+  dispatch-liveness belt (`pipeline.dispatchLivenessPass`) fires exactly one
+  needs-human note when an expected spawn leg never materializes within the
+  spawn-grace bound.
 - **Date:** 2026-10-08
 - **Deciders:** Otavio
 - **Scope:** implementor/reviewer/fixer completion signaling, freeze watchdog semantics (MAQ-31), respawn-cap ledger, monitor turn-end detection

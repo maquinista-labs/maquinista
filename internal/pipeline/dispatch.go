@@ -283,6 +283,13 @@ func RunDispatch(ctx context.Context, pool *pgxpool.Pool, cfg DispatchConfig, sp
 		if err := watchdogPass(ctx, pool, cfg.IdleAfter, cfg.SpawnGrace, cfg.RespawnCap, cfg.SessionName, killWindow, fan); err != nil {
 			log.Printf("pipeline: dispatch: watchdog pass: %v", err)
 		}
+		// MAQ-54 belt: a spawn-expecting state with no live agent past the
+		// spawn grace is a dropped dispatch — one needs-human note, exactly
+		// once per drop episode. After the watchdog so its transitions land
+		// first; the bound is the same spawn grace newborns may boot in.
+		if err := dispatchLivenessPass(ctx, pool, cfg.SpawnGrace); err != nil {
+			log.Printf("pipeline: dispatch: liveness pass: %v", err)
+		}
 		if err := mergeEnqueuePass(ctx, pool); err != nil {
 			log.Printf("pipeline: dispatch: merge enqueue pass: %v", err)
 		}
