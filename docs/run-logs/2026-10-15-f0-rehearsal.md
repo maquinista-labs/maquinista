@@ -16,7 +16,7 @@ Performed 2026-10-15 ~02:20 by the implementor agent on barceloneta
 
 | Gate | Prerequisite | Landed by | Status at audit | Evidence |
 |---|---|---|---|---|
-| P1 | Per-user repo binding | MAQ-45 (#52) | **RED — code landed, config inert** | `USER_REPOS` absent from runtime `.env`; `config.MayAccessRepo` treats unlisted users as unrestricted, so the guard does nothing until the operator adds `<tg-id>:<repo-root>` pairs and restarts (§2 step 3). |
+| P1 | Per-user repo binding | MAQ-45 (#52) | **GREEN — wired 19/10** | `USER_REPOS=817242359:/home/barceloneta/code/maquinista` in runtime `.env` (prior config backed up to `.env.bak-20261019-p1`); daemon restarted 18:40 UTC; `scripts/rehearsal-gates.sh` exit 0 (P1–P4 all PASS). Unlisted users stay unrestricted by design (`config.MayAccessRepo` fail-open) — cohort users 2–3 get their pair at onboarding (§2 step 3). |
 | P2 | Per-user session cap | MAQ-46 (#54) | GREEN (default active) | `MAQUINISTA_MAX_AGENTS_PER_USER` defaults to 2 (`internal/config/config.go`); unset is valid. |
 | P3 | Cost-per-task ledger | MAQ-47 (#53) | GREEN | `maquinista ledger --by user` runs clean against the live DB. |
 | P4 | This runbook | MAQ-49 (#51) | GREEN | `docs/pilot-onboarding.md` present. |
@@ -25,7 +25,12 @@ Performed 2026-10-15 ~02:20 by the implementor agent on barceloneta
 `origin_user_id` ever (817242359 = operator); the second allowlisted TG id
 (6760585507) has never messaged the box.
 
-**Action before first invite (operator):** set P1 — add to the runtime
+**P1 wired 2026-10-19 (operator):** cohort user 1 = operator
+(817242359 → `maquinista` repo; one user, one repo per §2 step 3). The same
+restart folded in the #56 deploy (`eca415c` → `0f6230b`, MAQ-54 liveness
+belt). Gates green post-restart.
+
+**DONE 2026-10-19 (see P1 wired above).** Original instruction — set P1:
 `.env`, then `./maquinista stop && ./maquinista start`:
 
 ```
@@ -68,11 +73,15 @@ Seeded from pre-flight observations:
   `otaviocarvalho` (`gh auth status`); every cohort PR will be authored by
   it → §4 row 1 → none yet → does F1 need per-user git provenance or is
   PR-comment attribution enough?
-- **Repo binding is config, not state** — P1 lives in `.env` + daemon
-  restart; onboarding a user mid-cohort bounces the whole box (all agents'
-  tmux panes die with the restart?) → §4 row 3 (flat allowlist) adjacent →
-  workaround TBD during cohort → should USER_REPOS move to a DB table with
-  hot reload (F1 tenant-seam question)?
+- **CONFIRMED 19/10: a daemon restart culls idle agent panes** — the P1
+  wiring restart took 9 live panes down to 1 (4 pi + 4 claude panes gone, 1
+  respawned fresh by reconcile, 8 stale window bindings cleared, "Recovery:
+  0 live bindings"); zero tasks running/claimed at the moment, so no
+  in-flight work was lost → §4 row 3 (flat allowlist) adjacent, plus the
+  "repo binding is config, not state" seed above → workaround: restart only
+  when no task is in flight (what this restart did) → should USER_REPOS move
+  to a DB table with hot reload (F1 tenant-seam question), and should
+  reconcile respawn idle panes or is the cull correct?
 - *(fill cohort incidents here, however small)*
 
 ## Offboarding (runbook §6)
