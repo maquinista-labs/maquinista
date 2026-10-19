@@ -28,7 +28,9 @@ Performed 2026-10-15 ~02:20 by the implementor agent on barceloneta
 **P1 wired 2026-10-19 (operator):** cohort user 1 = operator
 (817242359 → `maquinista` repo; one user, one repo per §2 step 3). The same
 restart folded in the #56 deploy (`eca415c` → `0f6230b`, MAQ-54 liveness
-belt). Gates green post-restart.
+belt). Gates green post-restart. Post-heal
+(same day, see what-broke below): zombie respawns killed, user 1 = 1 live
+agent (dashboard) — cap 1/2, ready for §2 steps 5–6.
 
 **DONE 2026-10-19 (see P1 wired above).** Original instruction — set P1:
 `.env`, then `./maquinista stop && ./maquinista start`:
@@ -82,6 +84,31 @@ Seeded from pre-flight observations:
   when no task is in flight (what this restart did) → should USER_REPOS move
   to a DB table with hot reload (F1 tenant-seam question), and should
   reconcile respawn idle panes or is the cull correct?
+- **Boot reconcile respawns stale `running` topic rows → operator capped out
+  at 8/2 before the cohort started** (CONFIRMED 19/10, post-P1-restart): the
+  18:40 cull took 9 panes down, but boot reconcile respawned all 7 `t--*`
+  topic agents (idle since 30/09–02/10) plus the dashboard agent within
+  ~2.5 min. `CountLiveAgentsForUser` counts every live-status row, so user 1
+  sat at 8 live vs cap 2 — the §2 smoke-task spawn in a fresh topic would
+  have bounced on a cap measuring zombies. → §4 row 3 adjacent; **answers
+  this log's own seeded question** ("should reconcile respawn idle panes or
+  is the cull correct?"): with cap counting live, respawn of stale rows is
+  actively harmful. → workaround: operator state heal — `maquinista kill` ×7
+  zombie topic agents (verified none owned tasks first), cap back to 1/2.
+  → F1 question: freshness floor on boot-respawn (only rows with recent
+  `last_seen`), and/or cap counting on heartbeat (`last_seen` within N min)
+  instead of raw status?
+- **Boot reconcile double-spawned one topic → orphan pane sharing the window
+  name** (19/10 18:42): `t--1003896184686-11213` got window @8 from the
+  reconcile and a second spawn created @9 18 s later; the agents row pointed
+  at @9, leaving @8 an orphan `pi` process indistinguishable by name.
+  `maquinista kill` cleaned the row but BOTH panes survived it — window-by-
+  name resolution cannot disambiguate a duplicate — manual `tmux
+  kill-window` ×2 finished the job. → §4 row 2 exactly (shared namespace →
+  "two panes, one name", the 30/09–01/10 incident class). → workaround:
+  manual tmux surgery. → F1 question: enforce unique window names (collision
+  suffix), and `kill` should fall back to pane-id targeting when a name
+  resolves to >1 window.
 - *(fill cohort incidents here, however small)*
 
 ## Offboarding (runbook §6)
